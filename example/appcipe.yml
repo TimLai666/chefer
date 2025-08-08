@@ -1,0 +1,84 @@
+# === 頭部（應用層級） ===
+name: StudioPro                     # 必填：應用名稱；同時用作輸出單檔檔名與父資料夾名
+app_version: "2.3.1"                # 選填：應用版本；可用於檔名顯示/關於視窗（不影響解析）
+version: "0.1"                      # 必填：設定格式版本（目前固定 "0.1"）
+old_names: ["Studio", "StudioBeta"] # 選填：舊資料夾名清單；若新父資料夾不存在，會尋找並自動改名遷移
+data_dir: "D:/Apps/StudioPro"       # 選填：覆蓋預設父資料夾位置；未設定則用系統預設
+                                    #   Windows: %LOCALAPPDATA%/{name}
+                                    #   macOS:   ~/Library/Application Support/{name}
+                                    #   Linux:   ~/.local/share/{name}
+crash_policy: fail_fast             # 選填：崩潰策略；MVP 固定支援 fail_fast（任一服務非 0 退出→整體退出）
+
+# === 服務定義 ===
+services:
+
+  db:                                # 服務名稱（自訂）；將成為持久化子資料夾名的一部分
+    # --- 映像來源 ---
+    image:                           # 必填：容器映像來源（MVP 先支援 tar）
+      source: tar                    # 必填(就此寫法)：tar = Docker/OCI 規格的 .tar 檔
+      file: ./images/postgres16.tar  # 必填：tar 路徑；可相對於 appcipe.yml
+      format: auto                   # 選填：auto | docker-archive | oci-archive（預設 auto）
+      platform: linux/amd64          # 選填：預設 linux/amd64；multi-arch 時用來挑平台
+
+    # --- 執行參數 ---
+    cmd: ["postgres", "-c", "max_connections=200"]  # 選填：覆蓋 CMD/Entrypoint；可字串或陣列
+    workdir: /var/lib/postgresql/data               # 選填：容器內工作目錄
+    env:                                           # 選填：環境變數（key: value）
+      POSTGRES_PASSWORD: "pw"
+      PGDATA: "/var/lib/postgresql/data"
+
+    # --- 持久化（只有設定 persist_path 才會持久化） ---
+    persist_path: /var/lib/postgresql/data         # 選填：容器內需要持久化的路徑
+                                                   #   實際 Host 路徑：{data_dir 或系統預設}/data/db/
+
+    # --- 埠口（host:guest[/proto]；預設 tcp） ---
+    ports: ["5432:5432"]                           # 選填：對外映射；MVP 以 user-mode NAT 映到 localhost
+
+    # --- 終端/GUI ---
+    terminal: false                                # 選填：是否需要顯示終端視窗（關閉終端=整體退出）
+    gui: false                                     # 選填：有無 GUI；true 時以 RemoteApp 直通顯示視窗
+
+  ui:
+    # 短寫示範：image 直接給 tar 路徑（等價於 source: tar + format: auto + platform 預設）
+    image: ./images/studio-ui.tar                  # 必填(就此寫法)：tar 檔路徑
+
+    cmd: ["sh", "-lc", "chmod +x /app/start && /app/start"]  # 選填
+    env:
+      API_URL: "http://localhost:8080"
+    workdir: /app                                  # 選填
+
+    # 綁定資料夾：顯式讓容器看到 Host 的特定資料夾（不等於持久化）
+    mounts:                                        # 選填：每項 "<host_path>:<container_path>"
+      - ./presets:./app/presets                     # 相對於打包後應用執行檔的路徑
+      - /bigdata:/mnt/data                         # Host 絕對路徑（Windows 建議加引號）
+      # 注意：啟動前會驗證 host 路徑存在，不存在則報錯
+
+    ports:
+      - "8080:8080"                                # 多行寫法示範
+      - "9000:9000/udp"                            # UDP 後綴示範
+
+    interface_mode: gui   # 必填（或預設）：terminal | gui | both | none
+
+  worker:
+    image:
+      source: tar
+      file: ./images/worker.tar
+      format: auto
+    cmd: "sh -lc 'echo worker running; sleep 3600'" # 字串寫法示範
+    env:
+      LOG_LEVEL: "info"
+    # 未設定 persist_path → 不持久化（退出即清空）
+    mounts: []                                     # 空清單也合法；等同不綁定
+    ports: []                                      # 無對外埠
+    terminal: true                                 # 需要終端；關掉終端=整體退出
+    gui: false
+
+# === 行為備註 ===
+# 1) 啟動單檔 → 一次性拉起所有 services；任一服務異常退出（exit code ≠ 0）→ 依 crash_policy（MVP: 直接整體退出）
+# 2) 關閉最後一個 GUI 視窗或關掉終端視窗 → 整體退出（銷毀 microVM）
+# 3) 持久化資料夾實際位置：
+#    {data_dir 或系統預設}/{name}/data/{service_name}/...
+#    例如 Linux 預設：~/.local/share/StudioPro/data/db/
+# 4) 資料夾遷移：
+#    若新父資料夾不存在，會依 old_names 順序尋找舊資料夾並自動改名成新 {name}
+# 5) YAML 陣列可用 inline 或多行寫法；解析端一律視為等價
