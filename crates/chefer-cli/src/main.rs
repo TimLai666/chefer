@@ -28,8 +28,9 @@ struct Cli {
 enum Cmd {
     /// 讀取並驗證 appcipe.yml，依格式輸出摘要
     Check {
-        /// 路徑：appcipe.yml
-        file: String,
+        /// 路徑或目錄，預設 appcipe.yml
+        #[arg(value_name = "PATH", required = false)]
+        file: Option<String>,
 
         /// 輸出格式：pretty/json/yaml
         #[arg(long, value_enum, default_value_t = PrintFmt::Pretty)]
@@ -38,8 +39,9 @@ enum Cmd {
 
     /// 依食譜建置（MVP 先放前置邏輯）
     Build {
-        /// 路徑：appcipe.yml
-        file: String,
+        /// 路徑或目錄，預設 appcipe.yml
+        #[arg(value_name = "PATH", required = false)]
+        file: Option<String>,
         /// 只做檢查與前置，不輸出
         #[arg(long)]
         dry_run: bool,
@@ -69,14 +71,38 @@ enum PrintFmt {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Check { file, format } => cmd_check(&file, format),
-        Cmd::Build { file, dry_run } => cmd_build(&file, dry_run),
+        Cmd::Check { file, format } => {
+            let file = resolve_appcipe_path(file);
+            cmd_check(&file, format)
+        }
+        Cmd::Build { file, dry_run } => {
+            let file = resolve_appcipe_path(file);
+            cmd_build(&file, dry_run)
+        }
         Cmd::Version => cmd_version(),
         Cmd::Upgrade {
             channel,
             to,
             check_only,
         } => cmd_upgrade(&channel, to.as_deref(), check_only),
+    }
+}
+
+/// 根據 file 參數自動尋找 appcipe.yml
+fn resolve_appcipe_path(file: Option<String>) -> String {
+    use std::path::{Path, PathBuf};
+    match file {
+        None => "appcipe.yml".to_string(),
+        Some(ref f) if f == "." || Path::new(f).is_dir() => {
+            let dir = if f == "." {
+                PathBuf::from(".")
+            } else {
+                PathBuf::from(f)
+            };
+            let candidate = dir.join("appcipe.yml");
+            candidate.to_string_lossy().to_string()
+        }
+        Some(f) => f,
     }
 }
 
