@@ -11,3 +11,7 @@ then packages them into a **single standalone executable** that runs **without D
 
 With a simple **AppCipe recipe** (`appcipe.yml`),
 you can "cook" your containerized application into a portable single-file app, making container technology truly zero-barrier for end users.
+
+### AppCipe Example
+
+[AppCipe Example](examples/appcipe.yml)
