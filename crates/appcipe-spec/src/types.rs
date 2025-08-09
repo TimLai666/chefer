@@ -77,6 +77,12 @@ pub enum CrashPolicy {
     FailFast,
 }
 
+impl Default for CrashPolicy {
+    fn default() -> Self {
+        CrashPolicy::FailFast
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Cmd {
@@ -91,4 +97,10 @@ pub enum InterfaceMode {
     Terminal,
     Both,
     None, // 如果要顯式表示沒有
+}
+
+impl Default for InterfaceMode {
+    fn default() -> Self {
+        InterfaceMode::None
+    }
 }
