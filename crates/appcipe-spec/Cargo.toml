@@ -1,6 +1,6 @@
 [package]
 name = "appcipe-spec"
-version = "0.1.0"
+version = "0.1.0"     # 這個版本號前兩位跟隨 appcipe.yml 版本
 edition = "2024"
 
 [dependencies]

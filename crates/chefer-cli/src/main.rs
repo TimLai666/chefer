@@ -129,20 +129,44 @@ fn cmd_version() -> Result<()> {
     // 這些環境變數由 build.rs 注入（若沒取到會編譯錯誤，所以請先加 build.rs）
     let chefer_ver = env!("CARGO_PKG_VERSION");
     let spec_ver = APPCIPE_SPEC_VERSION;
-    let git_sha = env!("GIT_SHA");
     let build_time = env!("BUILD_TIME");
     let target = env!("BUILD_TARGET");
 
-    let mut t = Table::new();
-    t.load_preset(UTF8_BORDERS_ONLY);
-    t.set_header(vec!["Key", "Value"]);
-    t.add_row(vec!["Chefer", chefer_ver]);
-    t.add_row(vec!["AppCipe Spec", spec_ver]);
-    t.add_row(vec!["Target", target]);
-    t.add_row(vec!["Git SHA", git_sha]);
-    t.add_row(vec!["Build Time (UTC)", build_time]);
+    let cols = crossterm::terminal::size().map(|(c, _)| c).unwrap_or(80);
 
-    println!("{t}");
+    let mut t = Table::new();
+    t.load_preset(UTF8_BORDERS_ONLY)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_width(cols)
+        .set_constraints(vec![
+            ColumnConstraint::Absolute(Width::Percentage(32)),
+            ColumnConstraint::Absolute(Width::Percentage(68)),
+        ]);
+
+    t.set_header(vec![
+        Cell::new("Key")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Green),
+        Cell::new("Value")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Green),
+    ]);
+    t.add_row(vec![
+        Cell::new("Chefer").fg(Color::Cyan),
+        Cell::new(chefer_ver).fg(Color::Yellow),
+    ]);
+    t.add_row(vec![
+        Cell::new("AppCipe Spec (Latest Supported)").fg(Color::Cyan),
+        Cell::new(spec_ver),
+    ]);
+    t.add_row(vec![Cell::new("Target").fg(Color::Cyan), Cell::new(target)]);
+    t.add_row(vec![
+        Cell::new("Build Time (UTC)").fg(Color::Cyan),
+        Cell::new(build_time),
+    ]);
+
+    println!("\n{}", "▎Version Information".bold());
+    println!("{t}\n");
     Ok(())
 }
 

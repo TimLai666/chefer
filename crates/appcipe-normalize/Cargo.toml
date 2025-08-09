@@ -1,6 +1,6 @@
 [package]
 name = "appcipe-normalize"
-version = "0.1.0"
+version = "0.1.0"          # 這個版本號跟隨 appcipe-spec 版本
 edition = "2024"
 
 [dependencies]
