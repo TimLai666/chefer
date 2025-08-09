@@ -33,7 +33,7 @@ enum Cmd {
         file: Option<String>,
 
         /// 輸出格式：pretty/json/yaml
-        #[arg(long, value_enum, default_value_t = PrintFmt::Pretty)]
+        #[arg(long, short, value_enum, default_value_t = PrintFmt::Pretty)]
         format: PrintFmt,
     },
 
@@ -42,6 +42,7 @@ enum Cmd {
         /// 路徑或目錄，預設 appcipe.yml
         #[arg(value_name = "PATH", required = false)]
         file: Option<String>,
+
         /// 只做檢查與前置，不輸出
         #[arg(long)]
         dry_run: bool,
@@ -54,9 +55,11 @@ enum Cmd {
     Upgrade {
         #[arg(long, default_value = "stable")]
         channel: String,
+
         #[arg(long)]
         to: Option<String>,
-        #[arg(long)]
+
+        #[arg(long, help = "Only check for updates, do not perform upgrade")]
         check_only: bool,
     },
 }
@@ -108,13 +111,13 @@ fn resolve_appcipe_path(file: Option<String>) -> String {
 
 fn cmd_check(file: &str, fmt: PrintFmt) -> Result<()> {
     let app = appcipe_spec::from_file(file).map_err(|e| anyhow!("{e}"))?;
+    println!(
+        "{}  {}",
+        "✔ Verified".green().bold(),
+        format!("{} v{}", app.name.blue().bold(), app.version)
+    );
     match fmt {
         PrintFmt::Pretty => {
-            println!(
-                "{}  {}",
-                "✔ Verified".green().bold(),
-                format!("{} v{}", app.name.blue().bold(), app.version)
-            );
             render_summary_table(&app);
         }
         PrintFmt::Json => {
