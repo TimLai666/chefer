@@ -8,7 +8,7 @@ data_dir: "D:/Apps/StudioPro"       # 選填：覆蓋預設父資料夾位置；
                                     #   Windows: %LOCALAPPDATA%/{name}
                                     #   macOS:   ~/Library/Application Support/{name}
                                     #   Linux:   ~/.local/share/{name}
-crash_policy: fail_fast             # 選填：崩潰策略；MVP 固定支援 fail_fast（任一服務非 0 退出→整體退出）
+crash: fail_fast             # 選填：崩潰策略；MVP 固定支援 fail_fast（任一服務非 0 退出→整體退出）
 
 # === 服務定義 ===
 services:
