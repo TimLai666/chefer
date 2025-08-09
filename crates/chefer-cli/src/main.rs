@@ -6,6 +6,12 @@ use comfy_table::{
 };
 use crossterm::terminal;
 use owo_colors::OwoColorize;
+use self_update::cargo_crate_version;
+
+const REPO_OWNER: &str = "YOUR_GH_OWNER"; // ← 換成你的 GitHub owner
+const REPO_NAME: &str = "YOUR_GH_REPO"; // ← 換成你的 GitHub repo
+const BIN_NAME: &str = "chefer"; // 你的二進位檔名
+const APPCIPE_SPEC_VERSION: &str = "0.1"; // 目前支援的 appcipe 規格版本
 
 #[derive(Parser, Debug)]
 #[command(
@@ -38,6 +44,19 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// 顯示 Chefer 與環境版本資訊
+    Version,
+
+    /// 自動更新到最新版（不依賴 cargo）
+    Upgrade {
+        #[arg(long, default_value = "stable")]
+        channel: String,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long)]
+        check_only: bool,
+    },
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -52,6 +71,12 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Check { file, format } => cmd_check(&file, format),
         Cmd::Build { file, dry_run } => cmd_build(&file, dry_run),
+        Cmd::Version => cmd_version(),
+        Cmd::Upgrade {
+            channel,
+            to,
+            check_only,
+        } => cmd_upgrade(&channel, to.as_deref(), check_only),
     }
 }
 
@@ -96,6 +121,84 @@ fn cmd_build(file: &str, dry_run: bool) -> Result<()> {
     Err(anyhow!(
         "build 還沒實作（下一步會串 chefer-pack 解 tar → 合層 rootfs）"
     ))
+}
+
+fn cmd_version() -> Result<()> {
+    use comfy_table::{Table, presets::UTF8_BORDERS_ONLY};
+
+    // 這些環境變數由 build.rs 注入（若沒取到會編譯錯誤，所以請先加 build.rs）
+    let chefer_ver = env!("CARGO_PKG_VERSION");
+    let spec_ver = APPCIPE_SPEC_VERSION;
+    let git_sha = env!("GIT_SHA");
+    let build_time = env!("BUILD_TIME");
+    let target = env!("BUILD_TARGET");
+
+    let mut t = Table::new();
+    t.load_preset(UTF8_BORDERS_ONLY);
+    t.set_header(vec!["Key", "Value"]);
+    t.add_row(vec!["Chefer", chefer_ver]);
+    t.add_row(vec!["AppCipe Spec", spec_ver]);
+    t.add_row(vec!["Target", target]);
+    t.add_row(vec!["Git SHA", git_sha]);
+    t.add_row(vec!["Build Time (UTC)", build_time]);
+
+    println!("{t}");
+    Ok(())
+}
+
+fn cmd_upgrade(channel: &str, to: Option<&str>, check_only: bool) -> Result<()> {
+    use self_update::Status;
+    use self_update::backends::github::Update;
+    let repo_owner = "YourGitHubUser";
+    let repo_name = "chefer";
+
+    let mut builder = Update::configure();
+    builder
+        .repo_owner(repo_owner)
+        .repo_name(repo_name)
+        .bin_name("chefer")
+        .show_download_progress(true)
+        .current_version(cargo_crate_version!());
+
+    if let Some(ver) = to {
+        builder.target_version_tag(ver);
+    }
+    if channel != "stable" {
+        builder.target_version_tag(channel);
+    }
+
+    if check_only {
+        match builder.build()?.update()? {
+            Status::UpToDate(ver) => {
+                println!("{}  {}", "Already up to date".green().bold(), ver);
+            }
+            Status::Updated(ver) => {
+                println!(
+                    "{}  {} → {} (update available)",
+                    "Update available".yellow().bold(),
+                    cargo_crate_version!(),
+                    ver
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    match builder.build()?.update()? {
+        Status::UpToDate(ver) => {
+            println!("{}  {}", "Already up to date".green().bold(), ver);
+        }
+        Status::Updated(ver) => {
+            println!(
+                "{}  {} → {}",
+                "✔ Updated".green().bold(),
+                cargo_crate_version!(),
+                ver
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /* ---------- UI Helpers ---------- */
