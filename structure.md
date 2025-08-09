@@ -28,5 +28,5 @@ chefer/
 │     └─ src/main.rs
 │
 └─ examples/
-   └─ HelloBox/appcipe.yml
+   └─ appcipe.yml
 ```
