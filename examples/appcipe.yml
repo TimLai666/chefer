@@ -1,7 +1,8 @@
+version: "0.1"                      # 必填：設定格式版本（目前固定 "0.1"）
+
 # === 頭部（應用層級） ===
 name: StudioPro                     # 必填：應用名稱；同時用作輸出單檔檔名與父資料夾名
 app_version: "2.3.1"                # 選填：應用版本；可用於檔名顯示/關於視窗（不影響解析）
-version: "0.1"                      # 必填：設定格式版本（目前固定 "0.1"）
 old_names: ["Studio", "StudioBeta"] # 選填：舊資料夾名清單；若新父資料夾不存在，會尋找並自動改名遷移
 data_dir: "D:/Apps/StudioPro"       # 選填：覆蓋預設父資料夾位置；未設定則用系統預設
                                     #   Windows: %LOCALAPPDATA%/{name}
@@ -35,8 +36,7 @@ services:
     ports: ["5432:5432"]                           # 選填：對外映射；MVP 以 user-mode NAT 映到 localhost
 
     # --- 終端/GUI ---
-    terminal: false                                # 選填：是否需要顯示終端視窗（關閉終端=整體退出）
-    gui: false                                     # 選填：有無 GUI；true 時以 RemoteApp 直通顯示視窗
+    interface_mode: none                                   # 選填：有無 GUI；true 時以 RemoteApp 直通顯示視窗
 
   ui:
     # 短寫示範：image 直接給 tar 路徑（等價於 source: tar + format: auto + platform 預設）
@@ -70,8 +70,7 @@ services:
     # 未設定 persist_path → 不持久化（退出即清空）
     mounts: []                                     # 空清單也合法；等同不綁定
     ports: []                                      # 無對外埠
-    terminal: true                                 # 需要終端；關掉終端=整體退出
-    gui: false
+    interface_mode: none
 
 # === 行為備註 ===
 # 1) 啟動單檔 → 一次性拉起所有 services；任一服務異常退出（exit code ≠ 0）→ 依 crash_policy（MVP: 直接整體退出）
