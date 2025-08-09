@@ -11,7 +11,7 @@ use owo_colors::OwoColorize;
 #[command(
     name = "chefer",
     version,
-    about = "Chefer — 將 AppCipe 食譜烹飪成可攜單檔應用的工具"
+    about = "Chefer — Cook Your Containers into Delicious Apps"
 )]
 struct Cli {
     #[command(subcommand)]
