@@ -343,23 +343,35 @@ fn render_summary_table(app: &appcipe_spec::AppCipe) {
     let total = app.services.len();
     for (idx, (name, svc)) in app.services.iter().enumerate() {
         let image = match &svc.image {
-            appcipe_spec::ImageSourceOrPath::TarPath(p) => format!("tar: {p}"),
-            appcipe_spec::ImageSourceOrPath::Full {
-                source,
-                file,
-                format,
-                platform,
-            } => {
-                let mut s = format!("{:?}:{file}", source);
-                if let Some(f) = format {
-                    s.push_str(&format!(" ({f})"));
-                }
-                if let Some(pf) = platform {
-                    s.push_str(&format!(" [{pf}]"));
-                }
-                s
-            }
+    appcipe_spec::ImageSourceOrPath::TarPath(p) => format!("tar:{p}"),
+    appcipe_spec::ImageSourceOrPath::Full { source, file, format, platform } => {
+        let src = match source {
+            appcipe_spec::ImageSourceType::Tar        => "tar",
+            appcipe_spec::ImageSourceType::Dockerfile => "dockerfile",
+            appcipe_spec::ImageSourceType::Image      => "image",
         };
+        let fmt = match format {
+            appcipe_spec::ImageFormat::Auto           => "auto",
+            appcipe_spec::ImageFormat::DockerArchive  => "docker-archive",
+            appcipe_spec::ImageFormat::OciArchive     => "oci-archive",
+        };
+        let plat = match platform {
+            appcipe_spec::ImagePlatform::LinuxAmd64   => "linux/amd64",
+            appcipe_spec::ImagePlatform::LinuxArm64   => "linux/arm64",
+            appcipe_spec::ImagePlatform::WindowsAmd64 => "windows/amd64",
+        };
+
+        let mut s = format!("{src}:{file}");
+        if !matches!(format, appcipe_spec::ImageFormat::Auto) {
+            s.push_str(&format!(" ({fmt})"));
+        }
+        if !matches!(platform, appcipe_spec::ImagePlatform::LinuxAmd64) {
+            s.push_str(&format!(" [{plat}]"));
+        }
+        s
+    }
+};
+
 
         let mode = format!("{:?}", svc.interface_mode);
         let persist = svc.persist_path.as_deref().unwrap_or("—").to_string();

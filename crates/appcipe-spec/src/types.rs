@@ -60,10 +60,10 @@ pub enum ImageSourceOrPath {
         file: String,
 
         #[serde(default)]
-        format: Option<String>,
+        format: ImageFormat,
 
         #[serde(default)]
-        platform: Option<String>,
+        platform: ImagePlatform,
     },
 }
 
@@ -73,6 +73,40 @@ pub enum ImageSourceType {
     Tar,
     Dockerfile,
     Image, // 直接拉現有 image
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageFormat {
+    Auto,
+    DockerArchive,
+    OciArchive,
+}
+
+impl Default for ImageFormat {
+    fn default() -> Self {
+        ImageFormat::Auto
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImagePlatform {
+    #[serde(rename = "linux/amd64", alias = "linux_amd64", alias = "amd64", alias = "x86_64", alias = "x86-64")]
+    LinuxAmd64,
+
+    #[serde(rename = "linux/arm64", alias = "linux_arm64", alias = "arm64", alias = "aarch64")]
+    LinuxArm64,
+
+    // 如果要打包 Windows image，也支援 windows/amd64
+    #[serde(rename = "windows/amd64", alias = "windows_amd64", alias = "win64", alias = "x86_64-windows")]
+    WindowsAmd64,
+}
+
+impl Default for ImagePlatform {
+    fn default() -> Self {
+        ImagePlatform::LinuxAmd64
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
