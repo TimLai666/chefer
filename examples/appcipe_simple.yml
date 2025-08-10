@@ -3,4 +3,4 @@ name: "My App"
 
 services:
   myservice:
-    image: ./examples/myimage.tar
+    image: myimage.tar
