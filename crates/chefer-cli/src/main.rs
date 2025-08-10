@@ -146,16 +146,22 @@ fn cmd_build(file: &str, dry_run: bool) -> Result<()> {
         return Ok(());
     }
 
-    // 之後這裡會呼叫 chefer-pack：pack_all(&app, &out_dir)
-    Err(anyhow!(
-        "build 還沒實作（下一步會串 chefer-pack 解 tar → 合層 rootfs）"
-    ))
+    let opts = chefer_pack::PackOptions {
+        out_dir: "dist".into(),
+        clean: true,
+        write_original_yml: true,
+        squashfs: false, // 先不做
+    };
+    let res = chefer_pack::pack_all(&app, &opts)?;
+    println!("📦 Bundle: {}", res.bundle_dir.display());
+    // todo: 這裡加入更多後續處理邏輯
+    Ok(())
 }
 
 fn cmd_version() -> Result<()> {
     use comfy_table::{Table, presets::UTF8_BORDERS_ONLY};
 
-    // 這些環境變數由 build.rs 注入（若沒取到會編譯錯誤，所以請先加 build.rs）
+    // 這些環境變數由 build.rs 注入
     let chefer_ver = env!("CARGO_PKG_VERSION");
     let spec_ver = APPCIPE_SPEC_VERSION;
     let build_time = env!("BUILD_TIME");

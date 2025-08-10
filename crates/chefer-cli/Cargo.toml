@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.98"
 appcipe-spec = { path = "../appcipe-spec" }
+chefer-pack = { path = "../chefer-pack" }
 clap = { version = "4.5.43", features = ["derive"] }
 comfy-table = "7.1.4"
 crossterm = "0.29.0"
