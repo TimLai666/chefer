@@ -306,17 +306,19 @@ fn render_summary_table(app: &appcipe_spec::AppCipe) {
     println!();
 
     /* ===== Services（百分比分配；單格換行；彩色；Service 間插入空白列） ===== */
+    /* ===== Services（百分比分配；單格換行；彩色；含 Depends；Service 間插入空白列） ===== */
     let mut t = Table::new();
     t.load_preset(UTF8_BORDERS_ONLY)
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_width(cols)
         .set_constraints(vec![
             ColumnConstraint::Absolute(Width::Percentage(10)), // Service
-            ColumnConstraint::Absolute(Width::Percentage(36)), // Image
+            ColumnConstraint::Absolute(Width::Percentage(30)), // Image
             ColumnConstraint::Absolute(Width::Percentage(8)),  // Mode
-            ColumnConstraint::Absolute(Width::Percentage(18)), // Persist
+            ColumnConstraint::Absolute(Width::Percentage(16)), // Persist
             ColumnConstraint::Absolute(Width::Percentage(12)), // Ports
             ColumnConstraint::Absolute(Width::Percentage(16)), // Mounts
+            ColumnConstraint::Absolute(Width::Percentage(8)),  // Depends
         ]);
 
     t.set_header(vec![
@@ -338,45 +340,65 @@ fn render_summary_table(app: &appcipe_spec::AppCipe) {
         Cell::new("Mounts")
             .add_attribute(Attribute::Bold)
             .fg(Color::Green),
+        Cell::new("Depends")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Green),
     ]);
 
     let total = app.services.len();
     for (idx, (name, svc)) in app.services.iter().enumerate() {
         let image = match &svc.image {
-    appcipe_spec::ImageSourceOrPath::TarPath(p) => format!("tar:{p}"),
-    appcipe_spec::ImageSourceOrPath::Full { source, file, format, platform } => {
-        let src = match source {
-            appcipe_spec::ImageSourceType::Tar        => "tar",
-            appcipe_spec::ImageSourceType::Dockerfile => "dockerfile",
-            appcipe_spec::ImageSourceType::Image      => "image",
-        };
-        let fmt = match format {
-            appcipe_spec::ImageFormat::Auto           => "auto",
-            appcipe_spec::ImageFormat::DockerArchive  => "docker-archive",
-            appcipe_spec::ImageFormat::OciArchive     => "oci-archive",
-        };
-        let plat = match platform {
-            appcipe_spec::ImagePlatform::LinuxAmd64   => "linux/amd64",
-            appcipe_spec::ImagePlatform::LinuxArm64   => "linux/arm64",
-            appcipe_spec::ImagePlatform::WindowsAmd64 => "windows/amd64",
-        };
+            appcipe_spec::ImageSourceOrPath::TarPath(p) => format!("tar:{p}"),
+            appcipe_spec::ImageSourceOrPath::Full {
+                source,
+                file,
+                format,
+                platform,
+            } => {
+                let src = match source {
+                    appcipe_spec::ImageSourceType::Tar => "tar",
+                    appcipe_spec::ImageSourceType::Dockerfile => "dockerfile",
+                    appcipe_spec::ImageSourceType::Image => "image",
+                };
+                let fmt = match format {
+                    appcipe_spec::ImageFormat::Auto => "auto",
+                    appcipe_spec::ImageFormat::DockerArchive => "docker-archive",
+                    appcipe_spec::ImageFormat::OciArchive => "oci-archive",
+                };
+                let plat = match platform {
+                    appcipe_spec::ImagePlatform::LinuxAmd64 => "linux/amd64",
+                    appcipe_spec::ImagePlatform::LinuxArm64 => "linux/arm64",
+                    appcipe_spec::ImagePlatform::WindowsAmd64 => "windows/amd64",
+                };
 
-        let mut s = format!("{src}:{file}");
-        if !matches!(format, appcipe_spec::ImageFormat::Auto) {
-            s.push_str(&format!(" ({fmt})"));
-        }
-        if !matches!(platform, appcipe_spec::ImagePlatform::LinuxAmd64) {
-            s.push_str(&format!(" [{plat}]"));
-        }
-        s
-    }
-};
-
+                let mut s = format!("{src}:{file}");
+                if !matches!(format, appcipe_spec::ImageFormat::Auto) {
+                    s.push_str(&format!(" ({fmt})"));
+                }
+                if !matches!(platform, appcipe_spec::ImagePlatform::LinuxAmd64) {
+                    s.push_str(&format!(" [{plat}]"));
+                }
+                s
+            }
+        };
 
         let mode = format!("{:?}", svc.interface_mode);
         let persist = svc.persist_path.as_deref().unwrap_or("—").to_string();
-        let ports = if svc.ports.is_empty() { "—".into() } else { svc.ports.join(", ") };
-        let mounts = if svc.mounts.is_empty() { "—".into() } else { svc.mounts.join(", ") };
+        let ports = if svc.ports.is_empty() {
+            "—".into()
+        } else {
+            svc.ports.join(", ")
+        };
+        let mounts = if svc.mounts.is_empty() {
+            "—".into()
+        } else {
+            svc.mounts.join(", ")
+        };
+        let depends = if svc.depends_on.is_empty() {
+            "—".into()
+        } else {
+            svc.depends_on.join(", ")
+        };
 
         t.add_row(vec![
             Cell::new(name).fg(Color::Cyan),
@@ -385,11 +407,12 @@ fn render_summary_table(app: &appcipe_spec::AppCipe) {
             Cell::new(persist).fg(Color::Yellow),
             Cell::new(ports).fg(Color::Blue),
             Cell::new(mounts).fg(Color::Blue),
+            Cell::new(depends).fg(Color::Magenta),
         ]);
 
-        // 在每個 service 後面插入一行空白列（最後一個不插）
         if idx + 1 < total {
             t.add_row(vec![
+                Cell::new(""),
                 Cell::new(""),
                 Cell::new(""),
                 Cell::new(""),
