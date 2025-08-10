@@ -1,5 +1,5 @@
 // crates/chefer-pack/src/bundle.rs
-use anyhow::{Result, Context};
+use anyhow::{Result};
 use fs_err as fs;
 use std::path::{PathBuf};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
