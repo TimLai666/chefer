@@ -17,7 +17,7 @@ pub struct AppCipe {
     pub data_dir: Option<String>,
 
     #[serde(default)]
-    pub crash: Option<CrashPolicy>,
+    pub crash: CrashPolicy,
     pub services: HashMap<String, Service>,
 }
 
@@ -29,23 +29,27 @@ pub struct Service {
     pub cmd: Option<Cmd>,
 
     #[serde(default)]
-    pub workdir: Option<String>,
+    pub workdir:  Option<String>,
 
     #[serde(default)]
-    pub env: Option<HashMap<String, String>>,
+    pub env: HashMap<String, String>,
 
     #[serde(default)]
     pub persist_path: Option<String>,
 
     #[serde(default)]
-    pub ports: Option<Vec<String>>,
+    pub ports: Vec<String>,
 
     #[serde(default)]
-    pub mounts: Option<Vec<String>>,
+    pub mounts: Vec<String>,
 
     #[serde(default)]
-    pub interface_mode: Option<InterfaceMode>,
+    pub interface_mode: InterfaceMode,
+
+    #[serde(default)]
+    pub depends_on: Vec<String>,
 }
+
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]

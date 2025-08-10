@@ -58,6 +58,8 @@ services:
       - "9000:9000/udp"                            # UDP 後綴示範
 
     interface_mode: gui   # 必填（或預設）：terminal | gui | both | none
+    depends_on:
+      - db
 
   worker:
     image:
@@ -71,6 +73,9 @@ services:
     mounts: []                                     # 空清單也合法；等同不綁定
     ports: []                                      # 無對外埠
     interface_mode: none
+    depends_on:
+      - db
+      - ui
 
 # === 行為備註 ===
 # 1) 啟動單檔 → 一次性拉起所有 services；任一服務異常退出（exit code ≠ 0）→ 依 crash_policy（MVP: 直接整體退出）

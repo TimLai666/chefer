@@ -288,13 +288,7 @@ fn render_summary_table(app: &appcipe_spec::AppCipe) {
     ]);
     header.add_row(vec![
         Cell::new("Crash Policy").fg(Color::Cyan),
-        Cell::new(
-            app.crash
-                .as_ref()
-                .map(|c| format!("{c:?}"))
-                .unwrap_or_else(|| "default".to_string()),
-        )
-        .fg(Color::Yellow),
+        Cell::new(format!("{:?}", app.crash)).fg(Color::Yellow),
     ]);
     if let Some(dir) = &app.data_dir {
         header.add_row(vec![Cell::new("Data Dir").fg(Color::Cyan), Cell::new(dir)]);
@@ -367,35 +361,10 @@ fn render_summary_table(app: &appcipe_spec::AppCipe) {
             }
         };
 
-        let mode = svc
-            .interface_mode
-            .as_ref()
-            .map(|m| format!("{m:?}"))
-            .unwrap_or_else(|| "default".to_string());
-
+        let mode = format!("{:?}", svc.interface_mode);
         let persist = svc.persist_path.as_deref().unwrap_or("—").to_string();
-        let ports = svc
-            .ports
-            .as_ref()
-            .map(|v| {
-                if v.is_empty() {
-                    "—".into()
-                } else {
-                    v.join(", ")
-                }
-            })
-            .unwrap_or_else(|| "—".into());
-        let mounts = svc
-            .mounts
-            .as_ref()
-            .map(|v| {
-                if v.is_empty() {
-                    "—".into()
-                } else {
-                    v.join(", ")
-                }
-            })
-            .unwrap_or_else(|| "—".into());
+        let ports = if svc.ports.is_empty() { "—".into() } else { svc.ports.join(", ") };
+        let mounts = if svc.mounts.is_empty() { "—".into() } else { svc.mounts.join(", ") };
 
         t.add_row(vec![
             Cell::new(name).fg(Color::Cyan),
