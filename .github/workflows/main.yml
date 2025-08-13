@@ -1,0 +1,140 @@
+name: Rust Build & Attach Binaries on Release
+
+on:
+  release:
+    types: [published]   # 按下 Publish release 後觸發
+
+permissions:
+  contents: write        # 上傳 Release 資產需要
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- Linux ----
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+          # ---- Windows ----
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+          - runner: windows-latest
+            target: aarch64-pc-windows-msvc
+          # ---- macOS ----
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+
+        # 依你的實際 workspace crate 名稱/路徑調整（path 是相對 repo 根目錄）
+        # name 會用來當輸出檔名（如 chefer-cli_v1.2.3_x86_64-unknown-linux-gnu.tar.gz）
+        component:
+          - name=chefer-cli     path=crates/chefer-cli
+          - name=chefer-runtime path=crates/chefer-runtime
+          - name=guest-agent    path=crates/guest-agent
+          # - name=vmm-backend    path=crates/vmm-backend
+          # - name=chefer-assembler path=crates/chefer-assembler
+
+    runs-on: ${{ matrix.runner }}
+    env:
+      RUSTFLAGS: "-C strip=symbols"      # 盡量瘦身（需要 nightly 的話拿掉）
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Derive version from tag
+        id: ver
+        shell: bash
+        run: |
+          RAW="${GITHUB_REF_NAME}"       # 例如 v1.2.3
+          echo "tag=${RAW}" >> $GITHUB_OUTPUT
+          echo "version=${RAW#v}" >> $GITHUB_OUTPUT
+
+      - name: Parse component (name/path)
+        id: comp
+        shell: bash
+        run: |
+          IFS=' ' read -r -a parts <<< "${{ matrix.component }}"
+          for p in "${parts[@]}"; do k="${p%%=*}"; v="${p#*=}"; echo "$k=$v" >> vars.txt; done
+          cat vars.txt
+          NAME=$(grep '^name=' vars.txt | cut -d= -f2)
+          PATH_=$(grep '^path=' vars.txt | cut -d= -f2)
+          echo "name=$NAME"   >> $GITHUB_OUTPUT
+          echo "path=$PATH_"  >> $GITHUB_OUTPUT
+
+      - name: Build (release)
+        env:
+          # 讓程式裡可以讀到版本字串（見文末 build.rs 範例）
+          CHEFER_VERSION: ${{ steps.ver.outputs.tag }}
+        shell: bash
+        run: |
+          cargo build --release \
+            -p ${{ steps.comp.outputs.name }} \
+            --target ${{ matrix.target }}
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          NAME="${{ steps.comp.outputs.name }}"
+          TARGET="${{ matrix.target }}"
+          TAG="${{ steps.ver.outputs.tag }}"
+          EXT=""
+          case "$TARGET" in
+            *windows*) EXT=".exe" ;;
+          esac
+
+          BIN="target/${TARGET}/release/${NAME}${EXT}"
+          OUTDIR="dist/${NAME}/${TARGET}"
+          mkdir -p "$OUTDIR"
+
+          # 檔名：<crate>_<tag>_<target>.(zip|tar.gz)
+          PKG="${NAME}_${TAG}_${TARGET}"
+
+          cp "$BIN" "$OUTDIR/"
+
+          cd "$OUTDIR"
+          if [[ "$TARGET" == *windows* ]]; then
+            7z a -tzip "${PKG}.zip" "${NAME}${EXT}" >/dev/null
+            echo "${PKG}.zip" > artifact_list.txt
+          else
+            tar -czf "${PKG}.tar.gz" "${NAME}${EXT}"
+            echo "${PKG}.tar.gz" > artifact_list.txt
+          fi
+
+          # sha256
+          for f in ${PKG}.tar.gz ${PKG}.zip; do
+            [[ -f "$f" ]] && shasum -a 256 "$f" > "${f}.sha256"
+          done
+
+          echo "artifact_dir=$(pwd)" >> $GITHUB_OUTPUT
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          files: |
+            ${{ steps.pkg.outputs.artifact_dir }}/*.tar.gz
+            ${{ steps.pkg.outputs.artifact_dir }}/*.tar.gz.sha256
+            ${{ steps.pkg.outputs.artifact_dir }}/*.zip
+            ${{ steps.pkg.outputs.artifact_dir }}/*.zip.sha256
