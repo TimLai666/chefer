@@ -6,7 +6,7 @@ members = [
     "crates/chefer-runtime",
     "crates/vmm-backend",
     "crates/guest-agent",
-    "crates/chefer-cli", "crates/chefer-assembler",
+    "crates/chefer-cli", "crates/chefer-assembler", "crates/chefer-bundle",
 ]
 
 # 讓所有 crate 共用同一套依賴版本（可避免衝突）
