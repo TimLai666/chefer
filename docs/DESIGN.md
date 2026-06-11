@@ -156,7 +156,7 @@ bundle/
   - `version` 必須是 `"0.1"`。
   - `name`：`[A-Za-z][A-Za-z0-9_-]*`，長度 ≤ 64。
   - service 名稱：`[a-z][a-z0-9_]*`，長度 ≤ 32。
-  - ports：可被 `PortSpec::parse` 接受；同一 app 內 host port 不得重複。
+  - ports：可被 `PortSpec::parse` 接受；同一 app 內 host port 不得重複（不分協定，從嚴）。
   - mounts：可被 `MountSpec::parse` 接受。
   - `persist_path` 必須以 `/` 開頭。
   - `depends_on`：必須指向存在的 service；不得有循環；不得指向自己。
@@ -175,6 +175,7 @@ bundle/
 - `pub struct PackResult { pub bundle_dir: PathBuf, pub manifest: chefer_bundle::Manifest }`
 - `pub fn pack(app: &AppCipe, opts: &PackOptions) -> anyhow::Result<PackResult>`
 - 行為：
+  0. image tar 先安全解壓到暫存目錄再解析（OCI blobs 需隨機存取）；各層 blob 的解壓/雜湊/重壓全程串流。
   1. 對每個 service 讀 image tar，**自動偵測格式**（看內容不看副檔名）：
      - docker-archive：根目錄有 `manifest.json`（JSON 陣列，元素含 `Config`/`Layers`）。
      - oci-archive：根目錄有 `index.json` + `blobs/`（layout 可含 `oci-layout`）。
@@ -225,7 +226,7 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
 - **Windows**（`wsl2`）：可用性 = `wsl.exe --status` 成功且支援 WSL2。執行：
   1. agent 二進位 = `bundle/agents/guest-agent-<arch>`（缺→明確錯誤）。
   2. distro 名 = `chefer-rt-<agent sha256 前 8 碼>`；不存在時：產生最小 rootfs tar（內含 `/bin/guest-agent` + 空目錄 `/proc /tmp /etc`，`/etc/wsl.conf` 設 `[automount] enabled=true`、`[boot] systemd=false`），`wsl --import <distro> %LOCALAPPDATA%\chefer\wsl\<distro> <tar> --version 2`。
-  3. 以 `wsl -d <distro> --exec /bin/guest-agent run --bundle <wsl路徑> --data <wsl路徑>` 執行；Windows 路徑用 `wslpath -a` 轉換；stdio 直通；exit code 透傳。
+  3. 以 `wsl -d <distro> --user root --exec /bin/guest-agent run --bundle <wsl路徑> --data <wsl路徑>` 執行；Windows 路徑以純函式轉換（`C:\foo` → `/mnt/c/foo`；UNC/相對路徑報錯），不依賴 wslpath；stdio 直通；exit code 透傳。
   4. 注意命令注入：所有外部參數都走 argv 陣列（`std::process::Command` 個別 arg），絕不組 shell 字串。
 - **macOS**（`vz`）：v1 骨架——`availability()` 檢查 OS 版本後仍回 `Unavailable("macOS 後端需要 guest kit（kernel+initrd），將於後續版本提供；目前請於 Linux 或 Windows 執行")`。程式碼結構保留 trait 實作位置。
 
@@ -234,7 +235,7 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
   `pub fn run_bundle(cfg: &RunConfig) -> anyhow::Result<i32>`（非 Linux 回傳明確錯誤）。
 - bin：`guest-agent run --bundle <dir> --data <dir> [--cache <dir>] [--keep-rootfs]`；另提供 `guest-agent assemble-rootfs`（除錯）。
 - rootfs 組裝：
-  - 目的地：`cache_dir`（預設 `<data_dir>/.rootfs-cache`）`/<svc>-<chain_hash12>/`，chain_hash = sha256(diff_id 串接)。已存在且含 `.complete` 標記 → 直接重用。
+  - 目的地：`cache_dir`（預設 `<data_dir>/.rootfs-cache`）`/<svc>-<chain_hash12>/`，chain_hash = sha256(diff_id 以 `\n` 串接)。已存在且含 `.complete` 標記 → 直接重用。
   - 依序解每層 zstd tar：**whiteout 處理**——`.wh.<name>` → 刪除對應項；`.wh..wh..opq` → 清空該目錄既有內容；其餘正常解（保留 symlink/hardlink/權限；路徑安全檢查同 §0）。
   - 解完寫 `.complete`。
 - 服務啟動（Linux）：
@@ -243,7 +244,7 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
   - 網路：**不** unshare netns（共享網路 → ports 直接生效，WSL2 下由 localhost forwarding 對外）。
   - 監控：任一子行程結束且 exit ≠ 0 → 終止其餘全部（SIGTERM → 等 5s → SIGKILL）→ 回傳該 exit code（fail_fast）。全部正常結束 → 0。
   - `interface_mode=terminal/both`：該服務 stdio 直通（v1：所有服務 stdout/stderr 都加 `[svc]` 前綴轉發；terminal 服務 stdin 直通——僅允許一個服務宣告 terminal/both，多個→驗證期報錯）。
-- musl 靜態建置：`cargo build -p guest-agent --target x86_64-unknown-linux-musl --release` 必須可行（避免依賴需要 cc 的 crate；優先 rustix/純 Rust 實作）。
+- musl 靜態建置：`cargo build -p guest-agent --target x86_64-unknown-linux-musl --release` 必須可行（避免依賴需要 cc 的 crate；zstd 解壓用純 Rust 的 ruzstd）。musl 目標的 linker 統一為 rust-lld（`.cargo/config.toml` 已設定，跨 host 一致）。
 
 ### chefer-cli（bin）
 - 子命令：

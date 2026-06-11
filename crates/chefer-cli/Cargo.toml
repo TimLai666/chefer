@@ -5,7 +5,10 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.98"
+appcipe-normalize = { version = "0.1.0", path = "../appcipe-normalize" }
 appcipe-spec = { path = "../appcipe-spec" }
+chefer-assembler = { version = "0.1.0", path = "../chefer-assembler" }
+chefer-bundle = { version = "0.1.0", path = "../chefer-bundle" }
 chefer-pack = { path = "../chefer-pack" }
 clap = { version = "4.5.43", features = ["derive"] }
 comfy-table = "7.1.4"
@@ -14,6 +17,12 @@ owo-colors = "4.2.2"
 self_update = "0.42.0"
 serde_json = "1.0.142"
 serde_yaml = "0.9.34"
+tar = "0.4.46"
+zstd = "0.13.3"
 
 [build-dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+sha2 = "0.11.0"
+tempfile = "3.27.0"

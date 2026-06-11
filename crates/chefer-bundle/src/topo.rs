@@ -60,7 +60,10 @@ pub fn topo_sort(services: &[ServiceEntry]) -> Result<Vec<&ServiceEntry>> {
             .filter(|&(_, &d)| d > 0)
             .map(|(&n, _)| n)
             .collect();
-        bail!("depends_on 存在循環依賴，無法決定啟動順序：{}", stuck.join(", "));
+        bail!(
+            "depends_on 存在循環依賴，無法決定啟動順序：{}",
+            stuck.join(", ")
+        );
     }
     Ok(order)
 }
@@ -90,7 +93,11 @@ mod tests {
 
     #[test]
     fn orders_dependencies_first() {
-        let services = vec![svc("ui", &["db"]), svc("db", &[]), svc("worker", &["db", "ui"])];
+        let services = vec![
+            svc("ui", &["db"]),
+            svc("db", &[]),
+            svc("worker", &["db", "ui"]),
+        ];
         let order: Vec<&str> = topo_sort(&services)
             .unwrap()
             .iter()

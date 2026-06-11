@@ -4,3 +4,9 @@ version = "0.1.0"          # 這個版本號跟隨 appcipe-spec 版本
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.102"
+appcipe-spec = { version = "0.1.0", path = "../appcipe-spec" }
+serde_yaml = "0.9.34"
+
+[dev-dependencies]
+tempfile = "3.27.0"

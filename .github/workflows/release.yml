@@ -1,0 +1,141 @@
+name: Release (build & attach kits)
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── 第一階段：各 target 編譯 chefer-cli / chefer-runtime（musl target 加 guest-agent）──
+  build:
+    name: build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: windows-latest, target: x86_64-pc-windows-msvc,      cross: false, agent: false }
+          - { runner: windows-latest, target: aarch64-pc-windows-msvc,     cross: false, agent: false }
+          - { runner: ubuntu-latest,  target: x86_64-unknown-linux-musl,   cross: true,  agent: true }
+          - { runner: ubuntu-latest,  target: aarch64-unknown-linux-musl,  cross: true,  agent: true }
+          - { runner: macos-latest,   target: x86_64-apple-darwin,         cross: false, agent: false }
+          - { runner: macos-latest,   target: aarch64-apple-darwin,        cross: false, agent: false }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build chefer-cli & chefer-runtime
+        shell: bash
+        run: |
+          if [[ "${{ matrix.cross }}" == "true" ]]; then
+            cross build --release --target ${{ matrix.target }} -p chefer-cli -p chefer-runtime
+          else
+            cargo build --release --target ${{ matrix.target }} -p chefer-cli -p chefer-runtime
+          fi
+
+      - name: Build guest-agent (musl static)
+        if: matrix.agent
+        run: cross build --release --target ${{ matrix.target }} -p guest-agent
+
+      - name: Stage binaries
+        shell: bash
+        run: |
+          T="${{ matrix.target }}"
+          EXT=""
+          [[ "$T" == *windows* ]] && EXT=".exe"
+          mkdir -p stage
+          cp "target/$T/release/chefer-cli$EXT" "stage/chefer-cli-$T$EXT"
+          cp "target/$T/release/chefer-runtime$EXT" "stage/chefer-runtime-$T$EXT"
+          if [[ "${{ matrix.agent }}" == "true" ]]; then
+            ARCH="${T%%-*}"   # x86_64 / aarch64
+            cp "target/$T/release/guest-agent" "stage/guest-agent-$ARCH"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.target }}
+          path: stage/*
+          if-no-files-found: error
+
+  # ── 第二階段：每個 host 平台組一份完整 kit（CLI + 全部 runtime + 兩架構 guest-agent）──
+  package:
+    name: package kit (${{ matrix.host_target }})
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        host_target:
+          - x86_64-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: all
+          merge-multiple: true
+
+      - name: Compose kit
+        shell: bash
+        run: |
+          HT="${{ matrix.host_target }}"
+          TAG="${GITHUB_REF_NAME}"
+          EXT=""
+          [[ "$HT" == *windows* ]] && EXT=".exe"
+
+          PKG="chefer_${TAG}_${HT}"
+          mkdir -p "out/$PKG/kit"
+
+          # host 的 CLI，改名為 chefer
+          cp "all/chefer-cli-$HT$EXT" "out/$PKG/chefer$EXT"
+          # 全部 target 的 runtime（跨平台打包用）
+          cp all/chefer-runtime-* "out/$PKG/kit/"
+          # 兩種 guest 架構的靜態 agent
+          cp all/guest-agent-x86_64 all/guest-agent-aarch64 "out/$PKG/kit/"
+
+          chmod +x "out/$PKG/chefer$EXT" out/$PKG/kit/* || true
+
+          cd out
+          if [[ "$HT" == *windows* ]]; then
+            zip -r "$PKG.zip" "$PKG" >/dev/null
+            sha256sum "$PKG.zip" > "$PKG.zip.sha256"
+          else
+            tar -czf "$PKG.tar.gz" "$PKG"
+            sha256sum "$PKG.tar.gz" > "$PKG.tar.gz.sha256"
+          fi
+          rm -rf "$PKG"
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            out/*.zip
+            out/*.zip.sha256
+            out/*.tar.gz
+            out/*.tar.gz.sha256

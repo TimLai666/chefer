@@ -1,72 +1,124 @@
-use crate::types::*;
+//! appcipe.yml 的解析入口：解析 + 驗證。
+//!
+//! 注意：此處**不**做任何路徑正規化（host 路徑絕對化在 `appcipe-normalize`）。
+//! CLI / pack 等正式流程一律走 `appcipe_normalize::load`。
+
 use std::path::Path;
 
+use anyhow::Context;
+
+use crate::types::AppCipe;
+
+/// 讀取檔案並解析 appcipe.yml，隨後立即執行 `validate()`。
 pub fn from_file<P: AsRef<Path>>(path: P) -> anyhow::Result<AppCipe> {
     let path = path.as_ref();
-    let base = path.parent().unwrap_or_else(|| Path::new("."));
-    let s = std::fs::read_to_string(path)?;
-    from_str_with_base(&s, base)
+    let s = std::fs::read_to_string(path)
+        .with_context(|| format!("無法讀取設定檔 {}（請確認檔案存在且可讀）", path.display()))?;
+    from_str(&s)
 }
 
+/// 解析 appcipe.yml 字串，隨後立即執行 `validate()`。
 pub fn from_str(yaml: &str) -> anyhow::Result<AppCipe> {
-    let cwd = std::env::current_dir()?;
-    from_str_with_base(yaml, &cwd)
-}
-
-pub fn from_str_with_base<P: AsRef<Path>>(yaml: &str, base: P) -> anyhow::Result<AppCipe> {
-    let mut app: AppCipe = serde_yaml::from_str(yaml)?;
-    normalize_paths_in_place(&mut app, base.as_ref())?;
+    let app: AppCipe =
+        serde_yaml::from_str(yaml).context("appcipe.yml 解析失敗（YAML 格式或欄位型別錯誤）")?;
     app.validate()
-        .map_err(|e| anyhow::anyhow!("Validation error: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("appcipe.yml 驗證失敗：\n{e}"))?;
     Ok(app)
 }
 
-fn to_abs(base: &Path, p: &str) -> String {
-    let pb = Path::new(p);
-    if pb.is_absolute() {
-        p.to_string()
-    } else {
-        base.join(pb).to_string_lossy().to_string()
-    }
-}
+#[cfg(test)]
+mod tests {
+    use crate::types::*;
 
-fn normalize_paths_in_place(app: &mut AppCipe, base: &Path) -> anyhow::Result<()> {
-    // data_dir（Host 路徑）
-    if let Some(dir) = &app.data_dir {
-        app.data_dir = Some(to_abs(base, dir));
+    #[test]
+    fn from_str_parses_and_validates() {
+        let app = crate::from_str(
+            r#"
+version: "0.1"
+name: MyApp
+services:
+  db:
+    image: ./db.tar
+"#,
+        )
+        .unwrap();
+        assert_eq!(app.name, "MyApp");
+        assert_eq!(app.services.len(), 1);
     }
 
-    for (_name, svc) in app.services.iter_mut() {
-        // image.file（Host 路徑；僅 source=tar 或 TarPath）
-        match &mut svc.image {
-            ImageSourceOrPath::TarPath(p) => {
-                *p = to_abs(base, p);
-            }
-            ImageSourceOrPath::Full { source, file, .. } => {
-                if matches!(source, ImageSourceType::Tar) {
-                    *file = to_abs(base, file);
-                }
-            }
+    #[test]
+    fn from_str_does_not_normalize_paths() {
+        // 解析層不做路徑絕對化：相對路徑必須原樣保留
+        let app = crate::from_str(
+            r#"
+version: "0.1"
+name: MyApp
+data_dir: ./data
+services:
+  db:
+    image: ./db.tar
+    mounts:
+      - ./host:/mnt/host
+"#,
+        )
+        .unwrap();
+        assert_eq!(app.data_dir.as_deref(), Some("./data"));
+        let svc = &app.services["db"];
+        match &svc.image {
+            ImageSourceOrPath::TarPath(p) => assert_eq!(p, "./db.tar"),
+            other => panic!("非預期的 image 形式：{other:?}"),
         }
-
-        // mounts：只轉左半邊（Host 路徑）。用 rsplitn(2, ':') 以相容 Windows 的 "C:\"
-        // 形如 "host_path:container_path"
-        for m in &mut svc.mounts {
-            if let Some((host, guest)) = split_mount(m) {
-                let new_host = to_abs(base, host);
-                *m = format!("{new_host}:{guest}");
-            }
-        }
-
-        // 注意：persist_path 是容器內路徑，不轉！
+        assert_eq!(svc.mounts[0], "./host:/mnt/host");
     }
-    Ok(())
-}
 
-fn split_mount(s: &str) -> Option<(&str, &str)> {
-    // 從右往左找一次 ':'，避免 Windows drive "C:\"
-    let mut it = s.rsplitn(2, ':');
-    let right = it.next()?;
-    let left = it.next()?;
-    Some((left, right))
+    #[test]
+    fn crash_policy_alias_is_accepted() {
+        // 舊欄位名 crash_policy 必須能映射到 crash
+        let app = crate::from_str(
+            r#"
+version: "0.1"
+name: MyApp
+crash_policy: fail_fast
+services:
+  db:
+    image: ./db.tar
+"#,
+        )
+        .unwrap();
+        assert_eq!(app.crash, CrashPolicy::FailFast);
+    }
+
+    #[test]
+    fn from_str_rejects_invalid_spec() {
+        let err = crate::from_str(
+            r#"
+version: "9.9"
+name: MyApp
+services:
+  db:
+    image: ./db.tar
+"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("驗證失敗"));
+    }
+
+    #[test]
+    fn from_file_reads_and_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("appcipe.yml");
+        std::fs::write(
+            &p,
+            "version: \"0.1\"\nname: MyApp\nservices:\n  db:\n    image: ./db.tar\n",
+        )
+        .unwrap();
+        let app = crate::from_file(&p).unwrap();
+        assert_eq!(app.name, "MyApp");
+    }
+
+    #[test]
+    fn from_file_missing_file_gives_actionable_error() {
+        let err = crate::from_file("Z:/definitely/not/here/appcipe.yml").unwrap_err();
+        assert!(err.to_string().contains("無法讀取設定檔"));
+    }
 }

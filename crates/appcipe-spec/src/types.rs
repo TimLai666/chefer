@@ -2,7 +2,11 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize)]
+/// appcipe.yml 的頂層結構。
+///
+/// 注意：本型別只負責「解析 + 驗證」；host 路徑絕對化等正規化邏輯
+/// 位於 `appcipe-normalize` crate（正式載入入口為 `appcipe_normalize::load`）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppCipe {
     pub version: String,
     pub name: String,
@@ -16,12 +20,13 @@ pub struct AppCipe {
     #[serde(default)]
     pub data_dir: Option<String>,
 
-    #[serde(default)]
+    /// 當機策略；舊欄位名 `crash_policy` 以 serde alias 相容。
+    #[serde(default, alias = "crash_policy")]
     pub crash: CrashPolicy,
     pub services: HashMap<String, Service>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Service {
     pub image: ImageSourceOrPath,
 
@@ -29,7 +34,7 @@ pub struct Service {
     pub cmd: Option<Cmd>,
 
     #[serde(default)]
-    pub workdir:  Option<String>,
+    pub workdir: Option<String>,
 
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -50,8 +55,7 @@ pub struct Service {
     pub depends_on: Vec<String>,
 }
 
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ImageSourceOrPath {
     TarPath(String),
@@ -67,7 +71,7 @@ pub enum ImageSourceOrPath {
     },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageSourceType {
     Tar,
@@ -75,70 +79,70 @@ pub enum ImageSourceType {
     Image, // 直接拉現有 image
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ImageFormat {
+    #[default]
     Auto,
     DockerArchive,
     OciArchive,
 }
 
-impl Default for ImageFormat {
-    fn default() -> Self {
-        ImageFormat::Auto
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ImagePlatform {
-    #[serde(rename = "linux/amd64", alias = "linux_amd64", alias = "amd64", alias = "x86_64", alias = "x86-64")]
+    #[serde(
+        rename = "linux/amd64",
+        alias = "linux_amd64",
+        alias = "amd64",
+        alias = "x86_64",
+        alias = "x86-64"
+    )]
+    #[default]
     LinuxAmd64,
 
-    #[serde(rename = "linux/arm64", alias = "linux_arm64", alias = "arm64", alias = "aarch64")]
+    #[serde(
+        rename = "linux/arm64",
+        alias = "linux_arm64",
+        alias = "arm64",
+        alias = "aarch64"
+    )]
     LinuxArm64,
 
     // 如果要打包 Windows image，也支援 windows/amd64
-    #[serde(rename = "windows/amd64", alias = "windows_amd64", alias = "win64", alias = "x86_64-windows")]
+    #[serde(
+        rename = "windows/amd64",
+        alias = "windows_amd64",
+        alias = "win64",
+        alias = "x86_64-windows"
+    )]
     WindowsAmd64,
 }
 
-impl Default for ImagePlatform {
-    fn default() -> Self {
-        ImagePlatform::LinuxAmd64
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum CrashPolicy {
+    #[default]
     FailFast,
 }
 
-impl Default for CrashPolicy {
-    fn default() -> Self {
-        CrashPolicy::FailFast
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Cmd {
     String(String),
     Array(Vec<String>),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum InterfaceMode {
     Gui,
     Terminal,
     Both,
+    #[default]
     None, // 如果要顯式表示沒有
-}
-
-impl Default for InterfaceMode {
-    fn default() -> Self {
-        InterfaceMode::None
-    }
 }

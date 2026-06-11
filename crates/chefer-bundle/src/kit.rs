@@ -1,7 +1,7 @@
 //! Runtime kit（預編譯二進位）探索（規格見 docs/DESIGN.md §5）。
 //! pack（找 guest-agent）、assembler/cli（找 runtime）共用。
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// 依優先序回傳 kit 搜尋目錄：
 /// `CHEFER_KIT_DIR` > `<exe 所在目錄>/kit` > `<exe 所在目錄>`。

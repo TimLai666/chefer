@@ -63,9 +63,7 @@ impl Footer {
         let version = buf[8];
         if version != FOOTER_VERSION {
             bail!(
-                "不支援的 footer 版本 {}（本版支援 {}）；請更新 Chefer 或以相同版本重新打包",
-                version,
-                FOOTER_VERSION
+                "不支援的 footer 版本 {version}（本版支援 {FOOTER_VERSION}）；請更新 Chefer 或以相同版本重新打包"
             );
         }
         let flags = buf[9];

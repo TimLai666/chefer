@@ -1,25 +1,674 @@
+//! appcipe 驗證規則（DESIGN.md §6 appcipe-spec 節）。
+//!
+//! `validate()` 會**收集所有錯誤一次回報**（多行訊息、每行一條），
+//! 不會只回傳第一個錯誤；訊息順序具確定性（service 依名稱排序）。
+
+use std::collections::{BTreeMap, HashMap, VecDeque};
+
+use chefer_bundle::{MountSpec, PortSpec};
+
 use crate::types::*;
 
+/// 目前唯一支援的 spec 版本。
+const SUPPORTED_VERSION: &str = "0.1";
+/// app name 最大長度。
+const MAX_APP_NAME_LEN: usize = 64;
+/// service 名稱最大長度。
+const MAX_SERVICE_NAME_LEN: usize = 32;
+
 impl AppCipe {
+    /// 驗證整份 appcipe 設定；回傳所有錯誤的彙整（多行），而非只有第一個。
     pub fn validate(&self) -> Result<(), String> {
-        match self.version.as_str() {
-            "0.1" => {
-                // 檢查 name 是否只包含英文或底線且不含空格
-                if !self.name.chars().all(|c| c.is_ascii_alphabetic() || c == '_') {
-                    return Err("name can only contain English letters and underscores, and cannot have spaces".to_string());
-                }
-                self.services.iter().try_for_each(|(name, _)| {
-                    if name.is_empty() {
-                        return Err("Service name cannot be empty".to_string());
-                    }
-                    if name.chars().any(|c| !c.is_ascii_alphanumeric() && c != '_') {
-                        return Err(format!("Service name '{}' can only contain alphanumeric characters and underscores", name));
-                    }
-                    Ok(())
-                })?;
-                Ok(())
-            },
-            other => Err(format!("Unsupported version: {}", other)),
+        let mut errs: Vec<String> = Vec::new();
+
+        // --- version ---
+        if self.version != SUPPORTED_VERSION {
+            errs.push(format!(
+                "不支援的 version：`{}`（目前僅支援 \"{SUPPORTED_VERSION}\"，請將 version 改為 \"{SUPPORTED_VERSION}\"）",
+                self.version
+            ));
         }
+
+        // --- app name ---
+        if let Err(e) = check_app_name(&self.name) {
+            errs.push(e);
+        }
+
+        // service 依名稱排序，確保錯誤訊息順序確定
+        let mut names: Vec<&String> = self.services.keys().collect();
+        names.sort();
+
+        // host port 全 app 不得重複：port -> 第一個使用者的描述
+        let mut host_ports: BTreeMap<u16, String> = BTreeMap::new();
+        // interface_mode 為 terminal/both 的服務（全 app 最多一個）
+        let mut terminal_svcs: Vec<&str> = Vec::new();
+
+        for name in names {
+            let svc = &self.services[name];
+
+            // --- service 名稱 ---
+            if let Err(e) = check_service_name(name) {
+                errs.push(e);
+            }
+
+            // --- image.source 僅支援 tar ---
+            match &svc.image {
+                ImageSourceOrPath::TarPath(p) => {
+                    if p.trim().is_empty() {
+                        errs.push(format!(
+                            "service `{name}`：image 路徑不可為空（請填入 image tar 檔路徑）"
+                        ));
+                    }
+                }
+                ImageSourceOrPath::Full { source, file, .. } => match source {
+                    ImageSourceType::Tar => {
+                        if file.trim().is_empty() {
+                            errs.push(format!(
+                                "service `{name}`：image.file 不可為空（請填入 image tar 檔路徑）"
+                            ));
+                        }
+                    }
+                    ImageSourceType::Dockerfile => errs.push(format!(
+                        "service `{name}`：image.source = dockerfile 尚未支援（目前僅支援 tar；\
+                         請先以 `docker build` + `docker save` 產生 tar 後改用 source: tar）"
+                    )),
+                    ImageSourceType::Image => errs.push(format!(
+                        "service `{name}`：image.source = image 尚未支援（目前僅支援 tar；\
+                         請先以 `docker pull` + `docker save` 產生 tar 後改用 source: tar）"
+                    )),
+                },
+            }
+
+            // --- ports ---
+            for p in &svc.ports {
+                match PortSpec::parse(p) {
+                    Ok(spec) => {
+                        if let Some(prev) = host_ports.get(&spec.host) {
+                            errs.push(format!(
+                                "service `{name}` 的 ports \"{p}\"：host 埠 {} 與 {prev} 重複\
+                                 （同一 app 內 host 埠不得重複，請改用其他 host 埠）",
+                                spec.host
+                            ));
+                        } else {
+                            host_ports.insert(spec.host, format!("service `{name}` 的 \"{p}\""));
+                        }
+                    }
+                    Err(e) => errs.push(format!("service `{name}` 的 ports \"{p}\" 無效：{e}")),
+                }
+            }
+
+            // --- mounts ---
+            for m in &svc.mounts {
+                if let Err(e) = MountSpec::parse(m) {
+                    errs.push(format!("service `{name}` 的 mounts \"{m}\" 無效：{e}"));
+                }
+            }
+
+            // --- persist_path ---
+            if let Some(pp) = &svc.persist_path
+                && !pp.starts_with('/')
+            {
+                errs.push(format!(
+                    "service `{name}` 的 persist_path `{pp}` 無效：必須以 '/' 開頭（容器內絕對路徑）"
+                ));
+            }
+
+            // --- env key ---
+            let mut keys: Vec<&String> = svc.env.keys().collect();
+            keys.sort();
+            for k in keys {
+                if !is_valid_env_key(k) {
+                    errs.push(format!(
+                        "service `{name}` 的環境變數名稱 `{k}` 無效：必須符合 [A-Za-z_][A-Za-z0-9_]*\
+                         （以英文字母或底線開頭，僅含英數與底線）"
+                    ));
+                }
+            }
+
+            // --- depends_on：必須存在、不得自指 ---
+            for d in &svc.depends_on {
+                if d == name {
+                    errs.push(format!("service `{name}` 的 depends_on 不可指向自己"));
+                } else if !self.services.contains_key(d) {
+                    errs.push(format!(
+                        "service `{name}` 依賴不存在的 service `{d}`（請確認 services 中已定義該名稱）"
+                    ));
+                }
+            }
+
+            // --- interface_mode 統計 ---
+            if matches!(
+                svc.interface_mode,
+                InterfaceMode::Terminal | InterfaceMode::Both
+            ) {
+                terminal_svcs.push(name.as_str());
+            }
+        }
+
+        // --- depends_on：不得有循環（缺失/自指邊已各自報錯，這裡忽略它們）---
+        if let Some(stuck) = find_cycle(&self.services) {
+            errs.push(format!(
+                "depends_on 存在循環依賴，無法決定啟動順序：{stuck}（請移除循環中的某條依賴）"
+            ));
+        }
+
+        // --- terminal/both 全 app 最多一個 ---
+        if terminal_svcs.len() > 1 {
+            errs.push(format!(
+                "interface_mode 為 terminal/both 的服務全 app 最多只能有一個，目前有 {} 個：{}\
+                 （請將其餘改為 gui 或 none）",
+                terminal_svcs.len(),
+                terminal_svcs.join(", ")
+            ));
+        }
+
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            Err(errs
+                .iter()
+                .map(|e| format!("- {e}"))
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+    }
+}
+
+/// app name 規則：[A-Za-z][A-Za-z0-9_-]*，長度 ≤ 64。
+fn check_app_name(name: &str) -> Result<(), String> {
+    let mut chars = name.chars();
+    let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic());
+    let rest_ok = chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if !first_ok || !rest_ok {
+        return Err(format!(
+            "name `{name}` 無效：必須符合 [A-Za-z][A-Za-z0-9_-]*\
+             （以英文字母開頭，僅含英數、底線、連字號，不可有空格）"
+        ));
+    }
+    let len = name.chars().count();
+    if len > MAX_APP_NAME_LEN {
+        return Err(format!(
+            "name `{name}` 過長：最多 {MAX_APP_NAME_LEN} 字元（目前 {len} 字元）"
+        ));
+    }
+    Ok(())
+}
+
+/// service 名稱規則：[a-z][a-z0-9_]*，長度 ≤ 32。
+fn check_service_name(name: &str) -> Result<(), String> {
+    let mut chars = name.chars();
+    let first_ok = chars.next().is_some_and(|c| c.is_ascii_lowercase());
+    let rest_ok = chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if !first_ok || !rest_ok {
+        return Err(format!(
+            "service 名稱 `{name}` 無效：必須符合 [a-z][a-z0-9_]*\
+             （以小寫英文字母開頭，僅含小寫英數與底線）"
+        ));
+    }
+    let len = name.chars().count();
+    if len > MAX_SERVICE_NAME_LEN {
+        return Err(format!(
+            "service 名稱 `{name}` 過長：最多 {MAX_SERVICE_NAME_LEN} 字元（目前 {len} 字元）"
+        ));
+    }
+    Ok(())
+}
+
+/// env key 規則：[A-Za-z_][A-Za-z0-9_]*。
+fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    let first_ok = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    first_ok && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// 以 Kahn 演算法偵測 depends_on 循環；忽略缺失依賴與自指（它們有獨立錯誤）。
+/// 回傳卡在循環中的 service 名稱清單（依名稱排序），無循環則回 None。
+fn find_cycle(services: &HashMap<String, Service>) -> Option<String> {
+    let mut indeg: BTreeMap<&str, usize> = services.keys().map(|n| (n.as_str(), 0)).collect();
+    let mut rdeps: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (name, svc) in services {
+        for d in &svc.depends_on {
+            if d != name && services.contains_key(d) {
+                *indeg.get_mut(name.as_str()).unwrap() += 1;
+                rdeps.entry(d.as_str()).or_default().push(name.as_str());
+            }
+        }
+    }
+
+    let mut queue: VecDeque<&str> = indeg
+        .iter()
+        .filter(|&(_, &d)| d == 0)
+        .map(|(&n, _)| n)
+        .collect();
+    let mut done = 0usize;
+    while let Some(n) = queue.pop_front() {
+        done += 1;
+        if let Some(ms) = rdeps.get(n) {
+            for &m in ms {
+                let d = indeg.get_mut(m).unwrap();
+                *d -= 1;
+                if *d == 0 {
+                    queue.push_back(m);
+                }
+            }
+        }
+    }
+
+    if done == services.len() {
+        None
+    } else {
+        let stuck: Vec<&str> = indeg
+            .iter()
+            .filter(|&(_, &d)| d > 0)
+            .map(|(&n, _)| n)
+            .collect();
+        Some(stuck.join(", "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// 解析 YAML（不經 validate），回傳 AppCipe 供直接呼叫 validate() 測試。
+    fn parse_raw(yaml: &str) -> crate::AppCipe {
+        serde_yaml::from_str(yaml).expect("測試 YAML 應可解析")
+    }
+
+    /// 驗證並取出彙整後的錯誤訊息。
+    fn validate_err(yaml: &str) -> String {
+        parse_raw(yaml).validate().expect_err("預期驗證失敗")
+    }
+
+    // ---------- 通過案例 ----------
+
+    #[test]
+    fn full_valid_config_passes() {
+        let app = parse_raw(
+            r#"
+version: "0.1"
+name: Studio-Pro_2
+app_version: "2.3.1"
+old_names: [Studio]
+data_dir: D:/Apps/StudioPro
+crash: fail_fast
+services:
+  db:
+    image:
+      source: tar
+      file: ./db.tar
+      platform: linux/amd64
+    env:
+      POSTGRES_PASSWORD: pw
+      _PRIVATE: "1"
+    persist_path: /var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+  app1:
+    image: ./app.tar
+    ports:
+      - "8080:80/tcp"
+      - "9000:9000/udp"
+    mounts:
+      - ./data:/mnt/data
+    interface_mode: terminal
+    depends_on: [db]
+"#,
+        );
+        assert!(app.validate().is_ok(), "{:?}", app.validate());
+    }
+
+    // ---------- version ----------
+
+    #[test]
+    fn rejects_unsupported_version() {
+        let e = validate_err(
+            r#"
+version: "9.9"
+name: App
+services:
+  db: { image: ./db.tar }
+"#,
+        );
+        assert!(e.contains("不支援的 version"), "{e}");
+    }
+
+    // ---------- app name ----------
+
+    #[test]
+    fn app_name_rules() {
+        let ok = ["App", "a", "App-Name_01", "Z9"];
+        for n in ok {
+            let app = parse_raw(&format!(
+                "version: \"0.1\"\nname: {n}\nservices:\n  db: {{ image: ./db.tar }}\n"
+            ));
+            assert!(app.validate().is_ok(), "name `{n}` 應通過");
+        }
+        let bad = ["1app", "_app", "-app", "app name", "中文名"];
+        for n in bad {
+            let e = validate_err(&format!(
+                "version: \"0.1\"\nname: \"{n}\"\nservices:\n  db: {{ image: ./db.tar }}\n"
+            ));
+            assert!(e.contains("name"), "name `{n}` 應被拒：{e}");
+        }
+    }
+
+    #[test]
+    fn app_name_length_limit() {
+        let ok = format!("A{}", "x".repeat(63)); // 64 字元：通過
+        let app = parse_raw(&format!(
+            "version: \"0.1\"\nname: {ok}\nservices:\n  db: {{ image: ./db.tar }}\n"
+        ));
+        assert!(app.validate().is_ok());
+
+        let too_long = format!("A{}", "x".repeat(64)); // 65 字元：拒絕
+        let e = validate_err(&format!(
+            "version: \"0.1\"\nname: {too_long}\nservices:\n  db: {{ image: ./db.tar }}\n"
+        ));
+        assert!(e.contains("過長"), "{e}");
+    }
+
+    // ---------- service 名稱 ----------
+
+    #[test]
+    fn service_name_rules() {
+        let ok = ["db", "web_1", "a0_z"];
+        for n in ok {
+            let app = parse_raw(&format!(
+                "version: \"0.1\"\nname: App\nservices:\n  {n}: {{ image: ./db.tar }}\n"
+            ));
+            assert!(app.validate().is_ok(), "service `{n}` 應通過");
+        }
+        let bad = ["Db", "1db", "db-x", "_db"];
+        for n in bad {
+            let e = validate_err(&format!(
+                "version: \"0.1\"\nname: App\nservices:\n  \"{n}\": {{ image: ./db.tar }}\n"
+            ));
+            assert!(e.contains("service 名稱"), "service `{n}` 應被拒：{e}");
+        }
+    }
+
+    #[test]
+    fn service_name_length_limit() {
+        let ok = "a".repeat(32);
+        let app = parse_raw(&format!(
+            "version: \"0.1\"\nname: App\nservices:\n  {ok}: {{ image: ./db.tar }}\n"
+        ));
+        assert!(app.validate().is_ok());
+
+        let too_long = "a".repeat(33);
+        let e = validate_err(&format!(
+            "version: \"0.1\"\nname: App\nservices:\n  {too_long}: {{ image: ./db.tar }}\n"
+        ));
+        assert!(e.contains("過長"), "{e}");
+    }
+
+    // ---------- ports ----------
+
+    #[test]
+    fn rejects_invalid_port_format() {
+        let e = validate_err(
+            r#"
+version: "0.1"
+name: App
+services:
+  db:
+    image: ./db.tar
+    ports: ["abc:80", "0:80", "5432"]
+"#,
+        );
+        assert!(e.contains("ports"), "{e}");
+        // 三條 port 錯誤都要被收集
+        assert_eq!(e.lines().count(), 3, "{e}");
+    }
+
+    #[test]
+    fn rejects_duplicate_host_ports_across_services() {
+        let e = validate_err(
+            r#"
+version: "0.1"
+name: App
+services:
+  db:
+    image: ./db.tar
+    ports: ["8080:5432"]
+  web:
+    image: ./web.tar
+    ports: ["8080:80"]
+"#,
+        );
+        assert!(e.contains("host 埠 8080") && e.contains("重複"), "{e}");
+    }
+
+    #[test]
+    fn rejects_duplicate_host_ports_within_one_service() {
+        let e = validate_err(
+            r#"
+version: "0.1"
+name: App
+services:
+  db:
+    image: ./db.tar
+    ports: ["8080:80", "8080:81"]
+"#,
+        );
+        assert!(e.contains("host 埠 8080"), "{e}");
+    }
+
+    // ---------- mounts ----------
+
+    #[test]
+    fn rejects_invalid_mounts() {
+        let e = validate_err(
+            r#"
+version: "0.1"
+name: App
+services:
+  db:
+    image: ./db.tar
+    mounts: ["no-colon", "/host:relative/guest"]
+"#,
+        );
+        assert!(e.contains("mounts"), "{e}");
+        assert_eq!(e.lines().count(), 2, "{e}");
+    }
+
+    #[test]
+    fn accepts_windows_drive_mount() {
+        let app = parse_raw(
+            "version: \"0.1\"\nname: App\nservices:\n  db:\n    image: ./db.tar\n    mounts: [\"C:\\\\data:/mnt/data\"]\n",
+        );
+        assert!(app.validate().is_ok(), "{:?}", app.validate());
+    }
+
+    // ---------- persist_path ----------
+
+    #[test]
+    fn rejects_relative_persist_path() {
+        let e = validate_err(
+            r#"
+version: "0.1"
+name: App
+services:
+  db:
+    image: ./db.tar
+    persist_path: var/lib/data
+"#,
+        );
+        assert!(e.contains("persist_path"), "{e}");
+    }
+
+    // ---------- depends_on ----------
+
+    #[test]
+    fn rejects_missing_dependency() {
+        let e = validate_err(
+            r#"
+version: "0.1"
+name: App
+services:
+  db:
+    image: ./db.tar
+    depends_on: [nope]
+"#,
+        );
+        assert!(e.contains("不存在的 service `nope`"), "{e}");
+    }
+
+    #[test]
+    fn rejects_self_dependency() {
+        let e = validate_err(
+            r#"
+version: "0.1"
+name: App
+services:
+  db:
+    image: ./db.tar
+    depends_on: [db]
+"#,
+        );
+        assert!(e.contains("不可指向自己"), "{e}");
+    }
+
+    #[test]
+    fn rejects_dependency_cycle() {
+        let e = validate_err(
+            r#"
+version: "0.1"
+name: App
+services:
+  a:
+    image: ./a.tar
+    depends_on: [b]
+  b:
+    image: ./b.tar
+    depends_on: [c]
+  c:
+    image: ./c.tar
+    depends_on: [a]
+"#,
+        );
+        assert!(e.contains("循環依賴"), "{e}");
+    }
+
+    // ---------- env key ----------
+
+    #[test]
+    fn rejects_invalid_env_keys() {
+        let e = validate_err(
+            r#"
+version: "0.1"
+name: App
+services:
+  db:
+    image: ./db.tar
+    env:
+      1BAD: x
+      BAD-KEY: y
+      GOOD_KEY: z
+"#,
+        );
+        assert!(e.contains("`1BAD`"), "{e}");
+        assert!(e.contains("`BAD-KEY`"), "{e}");
+        assert!(!e.contains("GOOD_KEY"), "{e}");
+    }
+
+    // ---------- image.source ----------
+
+    #[test]
+    fn rejects_dockerfile_and_image_sources() {
+        let e = validate_err(
+            r#"
+version: "0.1"
+name: App
+services:
+  a:
+    image:
+      source: dockerfile
+      file: ./Dockerfile
+  b:
+    image:
+      source: image
+      file: postgres:16
+"#,
+        );
+        assert!(e.contains("dockerfile 尚未支援"), "{e}");
+        assert!(e.contains("image 尚未支援"), "{e}");
+    }
+
+    #[test]
+    fn rejects_empty_image_file() {
+        let e = validate_err(
+            r#"
+version: "0.1"
+name: App
+services:
+  db:
+    image: ""
+"#,
+        );
+        assert!(e.contains("不可為空"), "{e}");
+    }
+
+    // ---------- interface_mode ----------
+
+    #[test]
+    fn rejects_multiple_terminal_services() {
+        let e = validate_err(
+            r#"
+version: "0.1"
+name: App
+services:
+  a:
+    image: ./a.tar
+    interface_mode: terminal
+  b:
+    image: ./b.tar
+    interface_mode: both
+"#,
+        );
+        assert!(e.contains("最多只能有一個"), "{e}");
+        assert!(e.contains("a, b"), "{e}");
+    }
+
+    #[test]
+    fn single_terminal_service_is_ok() {
+        let app = parse_raw(
+            r#"
+version: "0.1"
+name: App
+services:
+  a:
+    image: ./a.tar
+    interface_mode: both
+  b:
+    image: ./b.tar
+    interface_mode: gui
+"#,
+        );
+        assert!(app.validate().is_ok());
+    }
+
+    // ---------- 錯誤彙整 ----------
+
+    #[test]
+    fn collects_all_errors_at_once() {
+        let e = validate_err(
+            r#"
+version: "9.9"
+name: "1bad name"
+services:
+  Db:
+    image: ./db.tar
+    ports: ["abc:80"]
+    persist_path: not/absolute
+"#,
+        );
+        assert!(e.contains("不支援的 version"), "{e}");
+        assert!(e.contains("name"), "{e}");
+        assert!(e.contains("service 名稱"), "{e}");
+        assert!(e.contains("ports"), "{e}");
+        assert!(e.contains("persist_path"), "{e}");
+        assert!(e.lines().count() >= 5, "應收集所有錯誤：{e}");
     }
 }

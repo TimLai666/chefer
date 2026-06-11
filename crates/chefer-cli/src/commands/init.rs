@@ -1,0 +1,125 @@
+//! `chefer init [dir]` — 產生帶繁中註解的 appcipe.yml 範本（不覆蓋既有檔案）。
+
+use std::path::Path;
+
+use anyhow::{Context, Result, bail};
+use owo_colors::OwoColorize;
+
+/// appcipe.yml 範本（精簡可執行；風格參考 examples/appcipe_simple.yml / appcipe.yml）。
+/// 範本本身必須可被 `appcipe_normalize::load` 解析通過（image 路徑允許尚不存在，
+/// load 不讀 image 檔，build 時才會讀）。
+pub const APPCIPE_TEMPLATE: &str = r#"# ============================================================
+#  appcipe.yml — Chefer 應用食譜（由 `chefer init` 產生）
+#  下一步：
+#    1) 以 `docker save -o images/app.tar <image>` 匯出 image tar
+#    2) `chefer check` 驗證設定
+#    3) `chefer build` 打包成單一執行檔
+# ============================================================
+
+version: "0.1"          # 必填：設定格式版本（目前固定 "0.1"）
+
+name: MyApp             # 必填：應用名稱；同時用作輸出單檔檔名與資料夾名
+                        #   規則：[A-Za-z][A-Za-z0-9_-]*，最長 64 字元
+app_version: "0.1.0"    # 選填：應用版本（顯示用，不影響打包）
+
+# data_dir: "D:/Apps/MyApp"   # 選填：覆蓋預設資料目錄位置
+# old_names: ["MyOldApp"]     # 選填：舊資料夾名清單；首次啟動會自動遷移
+
+services:
+
+  app:                  # 服務名稱；規則：[a-z][a-z0-9_]*，最長 32 字元
+    # 必填：容器映像來源（Docker/OCI image tar，可相對於本檔）
+    image: ./images/app.tar
+
+    # cmd: ["./start"]              # 選填：覆蓋 image 的 Cmd（字串或陣列）
+    # workdir: /app                 # 選填：容器內工作目錄
+    # env:                          # 選填：環境變數
+    #   LOG_LEVEL: "info"
+
+    # persist_path: /var/lib/app    # 選填：容器內要持久化的路徑（絕對路徑）
+
+    ports: ["8080:8080"]            # 選填：埠映射 "host:guest[/proto]"（預設 tcp）
+
+    # mounts:                       # 選填：綁定 host 資料夾 "<host路徑>:<容器內路徑>"
+    #   - ./data:/mnt/data
+
+    interface_mode: none            # 選填：gui | terminal | both | none（預設 none）
+
+    # depends_on: []                # 選填：依賴的其他服務（決定啟動順序）
+"#;
+
+/// 在 `dir`（預設目前目錄）產生 appcipe.yml 範本；檔案已存在時報錯不覆蓋。
+pub fn cmd_init(dir: Option<&Path>) -> Result<()> {
+    let dir = dir.unwrap_or_else(|| Path::new("."));
+    let path = dir.join("appcipe.yml");
+    if path.exists() {
+        bail!(
+            "檔案已存在：{}；`chefer init` 不會覆蓋既有檔案。\
+             若要重新產生範本，請先移除或改名該檔案",
+            path.display()
+        );
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("建立目錄失敗：{}", dir.display()))?;
+    std::fs::write(&path, APPCIPE_TEMPLATE)
+        .with_context(|| format!("寫入範本失敗：{}", path.display()))?;
+
+    println!(
+        "{}  {}",
+        "✔ 已產生範本".green().bold(),
+        path.display().to_string().blue()
+    );
+    println!(
+        "{}",
+        "下一步：編輯 appcipe.yml（更新 name 與 image 路徑）→ `chefer check` → `chefer build`"
+            .dimmed()
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 範本必須可被正式載入入口（appcipe_normalize::load）解析與驗證通過。
+    /// load 不讀 image 檔，故範本中指向不存在的 tar 路徑沒有問題。
+    #[test]
+    fn template_passes_normalize_load() {
+        let dir = tempfile::tempdir().unwrap();
+        cmd_init(Some(dir.path())).unwrap();
+
+        let path = dir.path().join("appcipe.yml");
+        let app = appcipe_normalize::load(&path).expect("init 範本應通過 load");
+        assert_eq!(app.name, "MyApp");
+        assert_eq!(app.version, "0.1");
+        assert!(app.services.contains_key("app"));
+        // host 路徑應已被 normalize 絕對化
+        match &app.services["app"].image {
+            appcipe_spec::ImageSourceOrPath::TarPath(p) => {
+                assert!(Path::new(p).is_absolute(), "image 路徑應為絕對：{p}");
+            }
+            other => panic!("非預期的 image 形式：{other:?}"),
+        }
+    }
+
+    /// 已存在的 appcipe.yml 不可被覆蓋。
+    #[test]
+    fn refuses_to_overwrite_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("appcipe.yml");
+        std::fs::write(&path, "original").unwrap();
+
+        let err = cmd_init(Some(dir.path())).unwrap_err().to_string();
+        assert!(err.contains("已存在"), "{err}");
+        // 原內容不可被動到
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+    }
+
+    /// 目標目錄不存在時會自動建立。
+    #[test]
+    fn creates_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("a/b");
+        cmd_init(Some(&sub)).unwrap();
+        assert!(sub.join("appcipe.yml").is_file());
+    }
+}

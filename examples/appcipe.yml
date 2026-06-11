@@ -49,7 +49,7 @@ services:
 
     # 綁定資料夾：顯式讓容器看到 Host 的特定資料夾（不等於持久化）
     mounts:                                        # 選填：每項 "<host_path>:<container_path>"
-      - ./presets:./app/presets                     # 相對於打包後應用執行檔的路徑
+      - ./presets:/app/presets                      # host 相對路徑（相對 appcipe.yml）：容器內絕對路徑
       - /bigdata:/mnt/data                         # Host 絕對路徑（Windows 建議加引號）
       # 注意：啟動前會驗證 host 路徑存在，不存在則報錯
 
