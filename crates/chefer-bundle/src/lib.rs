@@ -7,12 +7,14 @@
 pub mod footer;
 pub mod kit;
 pub mod layout;
+pub mod limit;
 pub mod manifest;
 pub mod mounts;
 pub mod ports;
 pub mod topo;
 
 pub use footer::{FLAG_ZSTD, FOOTER_LEN, Footer, MAGIC};
+pub use limit::{LimitedReader, bomb_limit_for};
 pub use manifest::{
     AppMeta, CmdSpec, CrashPolicy, ImageConfig, InterfaceMode, LayerRef, MANIFEST_FORMAT_VERSION,
     Manifest, ServiceEntry,

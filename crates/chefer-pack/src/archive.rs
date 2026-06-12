@@ -2,7 +2,17 @@
 //!
 //! 安全規則（docs/DESIGN.md §0）：
 //! - 拒絕絕對路徑、`..`、Windows 磁碟前綴。
-//! - symlink/hardlink 目標必須限制在解壓根目錄內。
+//! - **直接拒絕 symlink 與 hardlink entry**。
+//!
+//! 為何拒絕而非「限制目標在根內」：純詞法的目標深度檢查可被
+//! `d -> .` 這類「深度放大器」繞過——先建一個指向自身目錄的 symlink，
+//! 再讓後續 entry 的路徑成分穿過它，落地時 `create_dir_all`/`File::create`
+//! 會跟隨磁碟上已建立的 symlink 而寫到解壓根之外（build 機任意檔案寫入）。
+//! 要正確防護需逐成分以 O_NOFOLLOW 重新解析（如 guest-agent::rootfs::secure_resolve）。
+//! 但合法的 docker-archive / oci-archive 頂層只有 manifest.json / index.json /
+//! blobs / oci-layout / repositories（皆為一般檔案與目錄），本就不含 symlink/hardlink；
+//! 層內的 symlink 位於 blob 的巢狀 tar，由容器內的 rootfs 組裝處理。
+//! 因此此處直接拒絕，攻擊面歸零且不影響任何合法輸入。
 
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
@@ -41,46 +51,13 @@ pub(crate) fn extract_tar_reader<R: Read>(reader: R, dest_root: &Path) -> Result
             EntryType::Directory => {
                 fs::create_dir_all(&dest)?;
             }
-            EntryType::Symlink => {
-                let Some(target) = entry.link_name()? else {
-                    bail!("tar 內 symlink 缺少目標：{}", rel.display());
-                };
-                if !symlink_target_is_safe(&rel, &target) {
-                    bail!(
-                        "tar 內 symlink 目標越界（不在解壓根目錄內）：{} -> {}",
-                        rel.display(),
-                        target.display()
-                    );
-                }
-                if let Some(parent) = dest.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                create_symlink(&target, &dest).with_context(|| {
-                    format!(
-                        "建立 symlink 失敗：{} -> {}（Windows 上需要開發人員模式或系統管理員權限）",
-                        dest.display(),
-                        target.display()
-                    )
-                })?;
-            }
-            EntryType::Link => {
-                let Some(target) = entry.link_name()? else {
-                    bail!("tar 內 hardlink 缺少目標：{}", rel.display());
-                };
-                // hardlink 目標是相對 tar 根目錄的路徑，套用同一套安全檢查。
-                let target_rel = sanitize_rel_path(&target)
-                    .with_context(|| format!("tar 內 hardlink 目標不安全：{}", target.display()))?;
-                let src = dest_root.join(&target_rel);
-                if let Some(parent) = dest.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::hard_link(&src, &dest).with_context(|| {
-                    format!(
-                        "建立 hardlink 失敗：{} -> {}",
-                        dest.display(),
-                        src.display()
-                    )
-                })?;
+            // symlink / hardlink：合法 image archive 頂層不含這兩種，
+            // 且純詞法目標檢查無法防 on-disk symlink 重導，故一律拒絕。
+            EntryType::Symlink | EntryType::Link => {
+                bail!(
+                    "image archive 頂層不允許 symlink/hardlink（可能是惡意 image 的路徑逃逸嘗試）：{}",
+                    rel.display()
+                );
             }
             EntryType::Regular | EntryType::Continuous | EntryType::GNUSparse => {
                 if let Some(parent) = dest.parent() {
@@ -123,48 +100,6 @@ pub(crate) fn sanitize_rel_path(p: &Path) -> Result<PathBuf> {
     Ok(buf)
 }
 
-/// 檢查 symlink 目標（相對於 symlink 所在位置）是否仍在解壓根目錄內。
-fn symlink_target_is_safe(link_rel: &Path, target: &Path) -> bool {
-    // symlink 目標以 symlink 所在目錄為基準解析。
-    let mut depth: i64 = link_rel
-        .parent()
-        .map(|p| p.components().count() as i64)
-        .unwrap_or(0);
-    for comp in target.components() {
-        match comp {
-            Component::Prefix(_) | Component::RootDir => return false,
-            Component::CurDir => {}
-            Component::ParentDir => {
-                depth -= 1;
-                if depth < 0 {
-                    return false;
-                }
-            }
-            Component::Normal(_) => depth += 1,
-        }
-    }
-    true
-}
-
-#[cfg(unix)]
-fn create_symlink(target: &Path, dest: &Path) -> io::Result<()> {
-    std::os::unix::fs::symlink(target, dest)
-}
-
-#[cfg(windows)]
-fn create_symlink(target: &Path, dest: &Path) -> io::Result<()> {
-    // image archive 頂層極少出現 symlink；Windows 上需要特權，失敗時由呼叫端給出可行動訊息。
-    std::os::windows::fs::symlink_file(target, dest)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn create_symlink(_target: &Path, _dest: &Path) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "此平台不支援建立 symlink",
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,28 +125,45 @@ mod tests {
         assert!(sanitize_rel_path(Path::new("C:\\evil")).is_err());
     }
 
+    /// 建一個含單一 entry 的最小 tar（手刻 header 以繞過 tar::Builder 的防護）。
+    fn tar_with_entry(name: &[u8], entry_type: EntryType, link: Option<&[u8]>) -> Vec<u8> {
+        let mut h = tar::Header::new_gnu();
+        h.set_size(0);
+        h.set_mode(0o644);
+        h.set_entry_type(entry_type);
+        h.as_old_mut().name[..name.len()].copy_from_slice(name);
+        if let Some(l) = link {
+            h.as_old_mut().linkname[..l.len()].copy_from_slice(l);
+        }
+        h.set_cksum();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(h.as_bytes());
+        bytes.extend_from_slice(&[0u8; 1024]); // tar 結尾的兩個零區塊
+        bytes
+    }
+
     #[test]
-    fn symlink_target_depth_check() {
-        // dir/link -> sibling（安全）
-        assert!(symlink_target_is_safe(
-            Path::new("dir/link"),
-            Path::new("sibling")
-        ));
-        // dir/link -> ../top（安全：仍在根內）
-        assert!(symlink_target_is_safe(
-            Path::new("dir/link"),
-            Path::new("../top")
-        ));
-        // link -> ../escape（越界）
-        assert!(!symlink_target_is_safe(
-            Path::new("link"),
-            Path::new("../escape")
-        ));
-        // 絕對目標
-        assert!(!symlink_target_is_safe(
-            Path::new("dir/link"),
-            Path::new("/etc/passwd")
-        ));
+    fn extract_rejects_symlink_entries() {
+        // `d -> .` 深度放大器的第一步——直接被拒，逃逸不可能成立。
+        let bytes = tar_with_entry(b"d", EntryType::Symlink, Some(b"."));
+        let tmp = tempfile::tempdir().unwrap();
+        let err = extract_tar_reader(bytes.as_slice(), tmp.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("不允許 symlink/hardlink"),
+            "{err:#}"
+        );
+        assert!(!tmp.path().join("d").exists());
+    }
+
+    #[test]
+    fn extract_rejects_hardlink_entries() {
+        let bytes = tar_with_entry(b"h", EntryType::Link, Some(b"../../etc/passwd"));
+        let tmp = tempfile::tempdir().unwrap();
+        let err = extract_tar_reader(bytes.as_slice(), tmp.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("不允許 symlink/hardlink"),
+            "{err:#}"
+        );
     }
 
     #[test]

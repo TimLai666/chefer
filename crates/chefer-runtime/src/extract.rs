@@ -68,7 +68,12 @@ pub fn extract_bundle(exe: &Path, ft: &Footer, opts: &ExtractOptions<'_>) -> Res
     if ft.is_zstd() {
         let decoder = zstd::stream::read::Decoder::new(&mut tee)
             .context("建立 zstd 解碼器失敗（payload 開頭可能已損毀）")?;
-        unpack_tar(decoder, dest)?;
+        // 解壓「輸出」總量限制器：以壓縮輸入長度的合理倍數為上限，擋下
+        // 長檔名/pax 標頭撐爆 read_to_end 的解壓炸彈（此讀取發生在 sha 驗證之前）。
+        // 非 zstd 路徑的輸出 = 輸入，已被 take(length) 自然限制，無需再包。
+        let guarded =
+            chefer_bundle::LimitedReader::new(decoder, chefer_bundle::bomb_limit_for(ft.length));
+        unpack_tar(guarded, dest)?;
     } else {
         unpack_tar(&mut tee, dest)?;
     }

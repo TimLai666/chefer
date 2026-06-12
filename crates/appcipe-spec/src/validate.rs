@@ -34,6 +34,19 @@ impl AppCipe {
             errs.push(e);
         }
 
+        // --- old_names：每一項都必須是「單一目錄名」(同 app name 規則) ---
+        // 安全關鍵：執行期 runtime 會在 host 端（沙箱外）把 parent.join(old)
+        // rename 成 data_dir。若放任 old 含路徑分隔/`..`/絕對路徑，惡意 appcipe
+        // 可讓終端使用者首次執行時改名任意 host 目錄（DESIGN §0 路徑安全）。
+        for old in &self.old_names {
+            if let Err(e) = check_app_name(old) {
+                errs.push(format!(
+                    "old_names `{old}` 無效：必須是單一目錄名（與 name 同規則，\
+                     不可含路徑分隔、`..` 或絕對路徑）；底層原因：{e}"
+                ));
+            }
+        }
+
         // service 依名稱排序，確保錯誤訊息順序確定
         let mut names: Vec<&String> = self.services.keys().collect();
         names.sort();
@@ -319,6 +332,35 @@ services:
     }
 
     // ---------- version ----------
+
+    #[test]
+    fn rejects_unsafe_old_names() {
+        // 路徑穿越（相對）、絕對路徑、Windows 磁碟、含分隔符——全部要拒
+        for bad in [
+            "../../etc",
+            "..\\\\..\\\\windows",
+            "/etc/passwd",
+            "D:\\\\victim",
+            "a/b",
+            "name with space",
+        ] {
+            let e = validate_err(&format!(
+                "version: \"0.1\"\nname: App\nold_names: [\"{bad}\"]\nservices:\n  db: {{ image: ./db.tar }}\n"
+            ));
+            assert!(e.contains("old_names"), "old_names `{bad}` 應被拒：{e}");
+        }
+    }
+
+    #[test]
+    fn accepts_safe_old_names() {
+        let app = parse_raw(
+            "version: \"0.1\"\nname: App\nold_names: [Studio, Studio-Beta_2]\nservices:\n  db: {{ image: ./db.tar }}\n"
+                .replace("{{", "{")
+                .replace("}}", "}")
+                .as_str(),
+        );
+        assert!(app.validate().is_ok(), "{:?}", app.validate());
+    }
 
     #[test]
     fn rejects_unsupported_version() {

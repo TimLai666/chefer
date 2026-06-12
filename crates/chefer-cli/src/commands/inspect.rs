@@ -17,6 +17,11 @@ use crate::ui;
 /// manifest.json 的大小上限（防禦損毀檔案宣告超大 entry 導致 OOM）。
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 
+/// 解壓輸出總量上限：bundle 佈局中 manifest.json 之前只有 agents/（數 MB）
+/// 與 appcipe.yml，256 MiB 足以涵蓋並讀到 manifest，遠低於 OOM 門檻。
+/// 套在 tar 之前以擋下長檔名/pax 標頭撐爆 read_to_end 的解壓炸彈。
+const MAX_INSPECT_INFLATE_BYTES: u64 = 256 * 1024 * 1024;
+
 pub fn cmd_inspect(file: &Path) -> Result<()> {
     let footer = chefer_bundle::Footer::read_from_file(file)?;
     let file_size = std::fs::metadata(file)
@@ -93,7 +98,10 @@ fn read_embedded_manifest(
     let limited = BufReader::new(f).take(footer.length);
     let decoder = zstd::stream::read::Decoder::new(limited)
         .context("建立 zstd 解碼器失敗（payload 可能損毀）")?;
-    let mut archive = tar::Archive::new(decoder);
+    // 在 tar 之前限制解壓「輸出」總量：擋下長檔名/pax 標頭撐爆 read_to_end 的炸彈，
+    // 以及把 manifest 排在超大 entry 之後的 DoS。take(footer.length) 只限壓縮輸入，無法防此。
+    let guarded = chefer_bundle::LimitedReader::new(decoder, MAX_INSPECT_INFLATE_BYTES);
+    let mut archive = tar::Archive::new(guarded);
 
     for entry in archive.entries().context("讀取 payload tar 失敗")? {
         let mut entry = entry.context("讀取 payload tar entry 失敗")?;
@@ -319,5 +327,59 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let single = make_single_file(tmp.path());
         cmd_inspect(&single).unwrap();
+    }
+
+    /// 解壓炸彈：GNU 長檔名標頭宣告超大 size + 零位元組內容，
+    /// 壓縮後僅數 KB，解壓會膨脹到數 GB。限制器必須在 OOM 前報錯。
+    #[test]
+    fn rejects_decompression_bomb_via_long_name_header() {
+        use std::io::Write;
+
+        // 手刻一個 GNU 長檔名（'L'）entry，宣告 size 略高於 inspect 上限，內容為零。
+        // 真實攻擊可宣告數 GB；此處取剛好超過上限即足以證明限制器在 OOM 前生效。
+        let bomb_size: u64 = MAX_INSPECT_INFLATE_BYTES + 16 * 1024 * 1024;
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::GNULongName);
+        h.set_mode(0);
+        h.set_size(bomb_size);
+        h.set_cksum();
+        let mut tar_buf = Vec::new();
+        tar_buf.extend_from_slice(h.as_bytes());
+        // body：4 GiB 的零，但用 zstd 壓縮後極小。直接餵零給 encoder，不在記憶體展開。
+        let payload = {
+            let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+            enc.write_all(&tar_buf).unwrap();
+            // 串流寫入零 body（分塊，避免在測試端配置 4GiB）
+            let zeros = vec![0u8; 1024 * 1024];
+            let mut remaining = bomb_size;
+            while remaining > 0 {
+                let n = remaining.min(zeros.len() as u64) as usize;
+                enc.write_all(&zeros[..n]).unwrap();
+                remaining -= n as u64;
+            }
+            enc.finish().unwrap()
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("bomb.exe");
+        let sha: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(&payload).into()
+        };
+        let ft = chefer_bundle::Footer::new_zstd(8, payload.len() as u64, sha);
+        {
+            let mut f = std::fs::File::create(&exe).unwrap();
+            f.write_all(&[0xABu8; 8]).unwrap();
+            f.write_all(&payload).unwrap();
+            f.write_all(&ft.to_bytes()).unwrap();
+        }
+
+        // 限制器須在配置數 GB 之前回錯，而非 OOM。
+        let err = read_embedded_manifest(&exe, &ft).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("超過上限") || msg.contains("manifest.json"),
+            "應因超過解壓上限而報錯：{msg}"
+        );
     }
 }

@@ -143,6 +143,14 @@ pub(crate) fn migrate_old_names(data_dir: &Path, old_names: &[String]) -> Result
         return Ok(());
     };
     for old in old_names {
+        // 縱深防禦：old_names 雖已於 appcipe-spec 驗證為單一目錄名，
+        // 但此遷移在 host 端（沙箱外）執行，仍對每一項再做一次硬性檢查——
+        // 拒絕含路徑分隔、`..`、絕對路徑或磁碟前綴者，確保 parent.join(old)
+        // 必落在 parent 之下，杜絕任意 host 目錄改名（見 docs/DESIGN.md §0）。
+        if !is_single_path_segment(old) {
+            tracing::warn!("略過不安全的 old_names 項目（非單一目錄名）：{old}");
+            continue;
+        }
         let old_path = parent.join(old);
         if old_path.is_dir() {
             fs_err::rename(&old_path, data_dir).with_context(|| {
@@ -162,6 +170,19 @@ pub(crate) fn migrate_old_names(data_dir: &Path, old_names: &[String]) -> Result
         }
     }
     Ok(())
+}
+
+/// old 是否為「單一安全目錄名」：非空、不含任何路徑分隔成分、
+/// 不是 `.`/`..`、不含磁碟前綴。用 std::path::Component 判定以涵蓋兩種分隔符。
+fn is_single_path_segment(old: &str) -> bool {
+    if old.is_empty() || old.contains('/') || old.contains('\\') || old.contains(':') {
+        return false;
+    }
+    let mut comps = Path::new(old).components();
+    match (comps.next(), comps.next()) {
+        (Some(std::path::Component::Normal(_)), None) => true,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -260,5 +281,46 @@ mod tests {
         let data_dir = tmp.path().join("New");
         migrate_old_names(&data_dir, &[]).unwrap();
         assert!(!data_dir.exists(), "無 old_names 時不應建立任何目錄");
+    }
+
+    #[test]
+    fn single_segment_check_rejects_unsafe() {
+        for ok in ["Studio", "Studio-Beta_2", "a"] {
+            assert!(is_single_path_segment(ok), "{ok} 應為安全單一目錄名");
+        }
+        for bad in [
+            "",
+            "..",
+            ".",
+            "a/b",
+            "a\\b",
+            "/abs",
+            "C:\\x",
+            "D:victim",
+            "../escape",
+        ] {
+            assert!(!is_single_path_segment(bad), "{bad} 應被拒");
+        }
+    }
+
+    /// 縱深防禦：即使惡意 manifest 夾帶路徑穿越的 old_names，
+    /// 遷移也絕不會去動父目錄以外的目錄。
+    #[test]
+    fn migration_ignores_unsafe_old_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path();
+        // 在「父目錄之外」放一個誘餌目錄（模擬受害者的敏感目錄）
+        let outside = tmp.path().join("outside_victim");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), b"x").unwrap();
+
+        let nested_parent = parent.join("approot");
+        fs::create_dir(&nested_parent).unwrap();
+        let data_dir = nested_parent.join("New");
+
+        // old 指向 ../outside_victim：必須被忽略，誘餌目錄原封不動
+        migrate_old_names(&data_dir, &["../outside_victim".into()]).unwrap();
+        assert!(outside.join("secret.txt").is_file(), "沙箱外目錄不可被改名");
+        assert!(!data_dir.exists(), "不安全項目被略過，不應產生 data_dir");
     }
 }
