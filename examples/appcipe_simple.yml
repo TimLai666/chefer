@@ -1,6 +1,8 @@
+# 最小可用的 appcipe.yml：一個服務、image 用短寫（直接給 tar 路徑）。
+# 其餘欄位（cmd/env/ports/persist_path/...）皆選填，完整說明見 appcipe.yml。
 version: "0.1"
 name: "MyApp"
 
 services:
   myservice:
-    image: myimage.tar
+    image: myimage.tar    # docker save / OCI archive 皆可；路徑可相對於本檔
