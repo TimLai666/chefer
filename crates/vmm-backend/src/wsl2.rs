@@ -74,7 +74,10 @@ impl ExecBackend for Wsl2Backend {
         let data_wsl = to_wsl_path(ctx.data_dir)
             .with_context(|| format!("轉換資料目錄路徑失敗：{}", ctx.data_dir.display()))?;
 
-        // e. 在 distro 內執行 guest-agent；stdio 直通，exit code 透傳
+        // e. 在 distro 內執行 guest-agent；stdio 直通，exit code 透傳。
+        //    rootfs 快取一律放 distro 內的 ext4（/var/lib/chefer/cache）：
+        //    /mnt/c（drvfs）上 symlink/hardlink/權限不可靠且 I/O 慢，
+        //    不能在那裡組 rootfs。
         let mut cmd = wsl_command();
         cmd.arg("-d")
             .arg(&distro)
@@ -86,7 +89,9 @@ impl ExecBackend for Wsl2Backend {
             .arg("--bundle")
             .arg(&bundle_wsl)
             .arg("--data")
-            .arg(&data_wsl);
+            .arg(&data_wsl)
+            .arg("--cache")
+            .arg("/var/lib/chefer/cache");
         if ctx.opts.keep_tmp {
             cmd.arg("--keep-rootfs");
         }

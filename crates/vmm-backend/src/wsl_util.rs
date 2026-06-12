@@ -9,8 +9,10 @@ use sha2::{Digest, Sha256};
 /// chefer 專用 WSL distro 的名稱前綴。
 pub const DISTRO_PREFIX: &str = "chefer-rt-";
 
-/// `/etc/wsl.conf` 內容：啟用 automount（讓 /mnt/<drive> 可用）、不啟動 systemd。
-pub const WSL_CONF: &str = "[automount]\nenabled=true\nmountFsTab=false\n[boot]\nsystemd=false\n";
+/// `/etc/wsl.conf` 內容：啟用 automount（讓 /mnt/<drive> 可用）並開 metadata
+/// （drvfs 上支援 chmod/chown/symlink，persist 目錄需要）、不啟動 systemd。
+pub const WSL_CONF: &str =
+    "[automount]\nenabled=true\nmountFsTab=false\noptions=\"metadata\"\n[boot]\nsystemd=false\n";
 
 /// `/etc/passwd` 內容：僅 root 一個使用者。
 pub const ETC_PASSWD: &str = "root:x:0:0:root:/root:/bin/false\n";
@@ -80,12 +82,16 @@ pub fn decode_wsl_output(bytes: &[u8]) -> String {
 }
 
 /// 在記憶體產生 `wsl --import` 用的最小 rootfs tar：
-/// 目錄 /bin /proc /tmp /etc /dev /root /var、
+/// 標準 FHS 目錄（含 /mnt、/sys、/usr、/run——WSL init 的 automount 與
+/// interop 需要這些掛載點存在，缺 /mnt 會導致 /mnt/<drive> 掛載失敗）、
 /// 檔案 /bin/guest-agent（mode 0o755）、/etc/wsl.conf、/etc/passwd。
 pub fn build_min_rootfs_tar(agent_bytes: &[u8]) -> Result<Vec<u8>> {
     let mut builder = tar::Builder::new(Vec::new());
 
-    for dir in ["bin/", "proc/", "tmp/", "etc/", "dev/", "root/", "var/"] {
+    for dir in [
+        "bin/", "proc/", "tmp/", "etc/", "dev/", "root/", "var/", "mnt/", "sys/", "usr/", "run/",
+        "home/",
+    ] {
         let mut h = tar::Header::new_gnu();
         h.set_entry_type(tar::EntryType::Directory);
         h.set_mode(0o755);
@@ -100,7 +106,31 @@ pub fn build_min_rootfs_tar(agent_bytes: &[u8]) -> Result<Vec<u8>> {
     append_file(&mut builder, "etc/wsl.conf", WSL_CONF.as_bytes(), 0o644)?;
     append_file(&mut builder, "etc/passwd", ETC_PASSWD.as_bytes(), 0o644)?;
 
+    // WSL init 啟動 distro 時會執行 distro 內的 /bin/mount 來掛載 drvfs（/mnt/c），
+    // 缺少時 automount 與 interop 整個失效——以 symlink 指向 guest-agent，
+    // 由其 applet 模式（argv[0] 派發）提供 mount/umount 實作。
+    for applet in ["mount", "umount"] {
+        append_symlink(&mut builder, &format!("bin/{applet}"), "guest-agent")?;
+    }
+
     Ok(builder.into_inner()?)
+}
+
+/// 在 tar 內加入 symlink entry。
+fn append_symlink(
+    builder: &mut tar::Builder<Vec<u8>>,
+    path: &str,
+    link_target: &str,
+) -> Result<()> {
+    let mut h = tar::Header::new_gnu();
+    h.set_entry_type(tar::EntryType::Symlink);
+    h.set_mode(0o777);
+    h.set_uid(0);
+    h.set_gid(0);
+    h.set_mtime(0);
+    h.set_size(0);
+    builder.append_link(&mut h, path, link_target)?;
+    Ok(())
 }
 
 fn append_file(
@@ -224,6 +254,7 @@ mod tests {
         let mut archive = tar::Archive::new(&tar_bytes[..]);
         let mut dirs: Vec<String> = Vec::new();
         let mut files: BTreeMap<String, (u32, Vec<u8>)> = BTreeMap::new();
+        let mut symlinks: BTreeMap<String, String> = BTreeMap::new();
         for entry in archive.entries().unwrap() {
             let mut entry = entry.unwrap();
             let path = entry
@@ -243,13 +274,27 @@ mod tests {
                     entry.read_to_end(&mut buf).unwrap();
                     files.insert(path, (mode, buf));
                 }
+                tar::EntryType::Symlink => {
+                    let target = entry
+                        .link_name()
+                        .unwrap()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    symlinks.insert(path, target);
+                }
                 other => panic!("rootfs tar 不應含 {other:?} 類型的 entry"),
             }
         }
 
-        for d in ["bin", "proc", "tmp", "etc", "dev", "root", "var"] {
+        for d in [
+            "bin", "proc", "tmp", "etc", "dev", "root", "var", "mnt", "sys", "usr", "run", "home",
+        ] {
             assert!(dirs.iter().any(|p| p == d), "缺少目錄 {d}（有：{dirs:?}）");
         }
+
+        // WSL init 需要 distro 內的 mount/umount（automount 用）
+        assert_eq!(symlinks["bin/mount"], "guest-agent");
+        assert_eq!(symlinks["bin/umount"], "guest-agent");
 
         let (mode, content) = &files["bin/guest-agent"];
         assert_eq!(*mode, 0o755, "/bin/guest-agent 必須可執行");

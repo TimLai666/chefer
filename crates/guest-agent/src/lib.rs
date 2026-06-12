@@ -8,6 +8,7 @@
 //! - 服務生命週期：`supervisor`（僅 Linux）。
 //! - namespaces + exec：`exec`（僅 Linux）。
 
+pub mod applets;
 pub mod rootfs;
 pub mod whiteout;
 

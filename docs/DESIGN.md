@@ -225,9 +225,11 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
 - **Linux**（`namespaces`）：可用性 = `/proc/self/ns/user` 存在且允許 unprivileged userns（讀 `/proc/sys/kernel/unprivileged_userns_clone` 若存在）。執行 = in-process 呼叫 `guest_agent::run_bundle`。
 - **Windows**（`wsl2`）：可用性 = `wsl.exe --status` 成功且支援 WSL2。執行：
   1. agent 二進位 = `bundle/agents/guest-agent-<arch>`（缺→明確錯誤）。
-  2. distro 名 = `chefer-rt-<agent sha256 前 8 碼>`；不存在時：產生最小 rootfs tar（內含 `/bin/guest-agent` + 空目錄 `/proc /tmp /etc`，`/etc/wsl.conf` 設 `[automount] enabled=true`、`[boot] systemd=false`），`wsl --import <distro> %LOCALAPPDATA%\chefer\wsl\<distro> <tar> --version 2`。
-  3. 以 `wsl -d <distro> --user root --exec /bin/guest-agent run --bundle <wsl路徑> --data <wsl路徑>` 執行；Windows 路徑以純函式轉換（`C:\foo` → `/mnt/c/foo`；UNC/相對路徑報錯），不依賴 wslpath；stdio 直通；exit code 透傳。
+  2. distro 名 = `chefer-rt-<agent sha256 前 8 碼>`；不存在時：產生最小 rootfs tar（標準 FHS 目錄 + `/bin/guest-agent` + `/etc/wsl.conf`（automount enabled + `options="metadata"`）+ `/etc/passwd` + **`/bin/mount`、`/bin/umount` → guest-agent 的 symlink**），`wsl --import <distro> %LOCALAPPDATA%\chefer\wsl\<distro> <tar> --version 2`。
+     **重要（實測根因）**：WSL init 啟動 distro 時會執行 distro 內的 `/bin/mount` 來掛載 drvfs（呼叫形如 `mount -i -t 9p C:\ /mnt/c -o msize=65536,trans=fd,rfdno=5,wfdno=5,cache=mmap,noatime,aname=drvfs;...`，9p 連線經繼承的 fd）。缺 mount 時 automount 與 interop 全滅。guest-agent 以 busybox 風格 applet（argv[0] 派發，`applets.rs`）提供 mount/umount。
+  3. 以 `wsl -d <distro> --user root --exec /bin/guest-agent run --bundle <wsl路徑> --data <wsl路徑> --cache /var/lib/chefer/cache` 執行；rootfs 快取一律放 distro 內 ext4（/mnt/c 的 drvfs 上 symlink/hardlink/權限不可靠且 I/O 慢）；Windows 路徑以純函式轉換（`C:\foo` → `/mnt/c/foo`；UNC/相對路徑報錯），不依賴 wslpath；stdio 直通；exit code 透傳。
   4. 注意命令注入：所有外部參數都走 argv 陣列（`std::process::Command` 個別 arg），絕不組 shell 字串。
+  5. **網路（實測）**：WSL2 的 localhost 轉送（wslrelay）只綁 IPv6 `[::1]`；runtime 埠代理後端因此「先試 127.0.0.1、再退 [::1]」，且對 `host == guest` 的 TCP 埠在 Windows 上加 best-effort 的 IPv4 補橋（127.0.0.1:port → [::1]:port）。WSL 的 localhost 轉送不支援 UDP——Windows 上跨 WSL 的 UDP 埠映射目前無法生效（文件需註明限制）。
 - **macOS**（`vz`）：v1 骨架——`availability()` 檢查 OS 版本後仍回 `Unavailable("macOS 後端需要 guest kit（kernel+initrd），將於後續版本提供；目前請於 Linux 或 Windows 執行")`。程式碼結構保留 trait 實作位置。
 
 ### guest-agent（lib + bin；Linux 專屬邏輯 cfg 隔離）

@@ -52,6 +52,12 @@ enum Cmd {
 }
 
 fn main() -> ExitCode {
+    // busybox 風格 applet：以 mount/umount 名稱（symlink）被呼叫時，
+    // 執行對應 applet——WSL init 啟動 distro 時需要 distro 內有可用的 mount。
+    if let Some(code) = guest_agent::applets::maybe_run_applet() {
+        return ExitCode::from((code & 0xff) as u8);
+    }
+
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Run {
