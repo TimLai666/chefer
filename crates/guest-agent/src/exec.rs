@@ -40,6 +40,11 @@ pub struct SpawnSpec<'a> {
 /// 已啟動的服務（pid 為中繼行程；其 pgid 與 pid 相同，供整組送訊號）。
 pub struct Spawned {
     pub pid: Pid,
+    /// 服務本體（新 pid namespace 的 pid 1）在 host pid namespace 的 pid。
+    /// 終止時直接對它送訊號——殺掉 pid-ns 的 init 會連帶拆除整個 namespace，
+    /// 不受服務 setsid/setpgid 脫離中繼 process group 的影響。
+    /// 中繼行程在二次 fork 後回報；取不到時為 None（退回只用 process group）。
+    pub init_pid: Option<Pid>,
     /// 非 terminal 服務的 stdout 讀取端（供 supervisor 加前綴轉發）。
     pub stdout: Option<OwnedFd>,
     /// 非 terminal 服務的 stderr 讀取端。
@@ -99,6 +104,11 @@ pub fn spawn_service(spec: &SpawnSpec) -> Result<Spawned> {
         (Some(or_), Some(ow), Some(er), Some(ew))
     };
 
+    // pid 回報管線：中繼行程在二次 fork 後，把孫行程（pid-ns init）的 host pid
+    // 寫回給 supervisor。CLOEXEC：服務 exec 後不繼承。
+    let (pid_r, pid_w) =
+        nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).context("建立 pid 回報管線失敗")?;
+
     // SAFETY: fork 後子行程僅呼叫 async-signal 相對安全的操作與系統呼叫，
     // 失敗一律以 _exit 結束，不返回呼叫端。
     match unsafe { fork() }.with_context(|| format!("fork 服務 `{}` 失敗", svc.name))? {
@@ -107,8 +117,13 @@ pub fn spawn_service(spec: &SpawnSpec) -> Result<Spawned> {
             let _ = setpgid(child, child);
             drop(out_w);
             drop(err_w);
+            drop(pid_w);
+            // 讀取孫行程 host pid（4 bytes LE i32）；中繼行程二次 fork 失敗時
+            // 管線會被關閉而讀到 EOF → init_pid = None。
+            let init_pid = read_init_pid(pid_r);
             Ok(Spawned {
                 pid: child,
+                init_pid,
                 stdout: out_r,
                 stderr: err_r,
             })
@@ -116,9 +131,28 @@ pub fn spawn_service(spec: &SpawnSpec) -> Result<Spawned> {
         ForkResult::Child => {
             drop(out_r);
             drop(err_r);
-            let code = middle_child(&plan, out_w, err_w);
+            drop(pid_r);
+            let code = middle_child(&plan, out_w, err_w, pid_w);
             unsafe { libc::_exit(code) }
         }
+    }
+}
+
+/// 從 pid 回報管線讀回孫行程 host pid（4 bytes LE i32）；失敗/EOF → None。
+fn read_init_pid(pid_r: OwnedFd) -> Option<Pid> {
+    use std::io::Read;
+    let mut f = std::fs::File::from(pid_r);
+    let mut buf = [0u8; 4];
+    match f.read_exact(&mut buf) {
+        Ok(()) => {
+            let raw = i32::from_le_bytes(buf);
+            if raw > 0 {
+                Some(Pid::from_raw(raw))
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
     }
 }
 
@@ -235,7 +269,13 @@ fn build_plan(spec: &SpawnSpec) -> Result<ChildPlan> {
 }
 
 /// 中繼行程：設定 stdio / pgid / namespaces，再 fork 出孫行程並轉送其 exit code。
-fn middle_child(plan: &ChildPlan, stdout_w: Option<OwnedFd>, stderr_w: Option<OwnedFd>) -> i32 {
+/// `pid_w`：把孫行程（pid-ns init）的 host pid 回報給 supervisor 的管線寫入端。
+fn middle_child(
+    plan: &ChildPlan,
+    stdout_w: Option<OwnedFd>,
+    stderr_w: Option<OwnedFd>,
+    pid_w: OwnedFd,
+) -> i32 {
     // stdio 重導（terminal 服務維持繼承）
     unsafe {
         if let Some(fd) = &stdout_w {
@@ -283,19 +323,26 @@ fn middle_child(plan: &ChildPlan, stdout_w: Option<OwnedFd>, stderr_w: Option<Ow
 
     // unshare(PID) 只影響之後 fork 的子行程 → 再 fork 一次，孫行程成為新 ns 的 pid 1
     match unsafe { fork() } {
-        Ok(ForkResult::Parent { child }) => loop {
-            match waitpid(child, None) {
-                Ok(WaitStatus::Exited(_, code)) => return code,
-                Ok(WaitStatus::Signaled(_, sig, _)) => return 128 + sig as i32,
-                Ok(_) => continue,
-                Err(Errno::EINTR) => continue,
-                Err(e) => {
-                    eprintln!("[guest-agent] 等待服務 `{}` 失敗：{e}", plan.name);
-                    return 126;
+        Ok(ForkResult::Parent { child }) => {
+            // 回報孫行程 host pid 給 supervisor（供 setsid/setpgid 後仍能直接終止）
+            let raw = child.as_raw().to_le_bytes();
+            let _ = nix::unistd::write(&pid_w, &raw);
+            drop(pid_w);
+            loop {
+                match waitpid(child, None) {
+                    Ok(WaitStatus::Exited(_, code)) => return code,
+                    Ok(WaitStatus::Signaled(_, sig, _)) => return 128 + sig as i32,
+                    Ok(_) => continue,
+                    Err(Errno::EINTR) => continue,
+                    Err(e) => {
+                        eprintln!("[guest-agent] 等待服務 `{}` 失敗：{e}", plan.name);
+                        return 126;
+                    }
                 }
             }
-        },
+        }
         Ok(ForkResult::Child) => {
+            drop(pid_w);
             let err = match setup_and_exec(plan) {
                 Err(e) => e,
                 Ok(never) => match never {},
@@ -433,7 +480,17 @@ fn setup_and_exec(plan: &ChildPlan) -> Result<Infallible> {
         )
     })?;
 
-    // 8) 解析執行檔（手動 PATH 搜尋，避免各 libc 的 execvpe 行為差異）並 execve
+    // 8) execve 前把 SIGTERM/SIGINT 還原為 SIG_DFL。
+    //    中繼行程曾把這兩個訊號設為 SIG_IGN；POSIX 規定 execve 會把「被捕捉」的
+    //    訊號還原為預設，但「被忽略(SIG_IGN)」的維持忽略。若不還原，服務本體
+    //    與其子行程啟動時即忽略 SIGTERM/SIGINT，破壞 supervisor 的優雅終止
+    //    （SIGTERM → 5s → SIGKILL）契約。容器 runtime 的標準做法。
+    unsafe {
+        let _ = signal(Signal::SIGTERM, SigHandler::SigDfl);
+        let _ = signal(Signal::SIGINT, SigHandler::SigDfl);
+    }
+
+    // 9) 解析執行檔（手動 PATH 搜尋，避免各 libc 的 execvpe 行為差異）並 execve
     let prog = resolve_program(&plan.program, &plan.path_env)?;
     nix::unistd::execve(&prog, &plan.argv, &plan.envp).with_context(|| {
         format!(

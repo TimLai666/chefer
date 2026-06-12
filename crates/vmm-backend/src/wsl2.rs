@@ -63,7 +63,7 @@ impl ExecBackend for Wsl2Backend {
 
         // c. distro 不存在時匯入最小 rootfs
         if !distro_exists(&distro)? {
-            import_distro(&distro, &agent_bytes)?;
+            ensure_distro_imported(&distro, &agent_bytes)?;
         }
 
         // d. Windows 路徑 → WSL 路徑
@@ -151,7 +151,12 @@ fn distro_exists(name: &str) -> Result<bool> {
 }
 
 /// 產生最小 rootfs tar 並 `wsl --import` 成新 distro（WSL2）。
-fn import_distro(distro: &str, agent_bytes: &[u8]) -> Result<()> {
+///
+/// 並行安全：distro_exists 與 import 之間存在 TOCTOU——同一 kit 打包的多個 app
+/// 同時首次啟動時，可能都判定 distro 不存在而都嘗試 import，後者會因「名稱已存在」
+/// 失敗。此處對 import 失敗後**重新檢查**：若 distro 此時已存在（被另一個 process
+/// 搶先建立），視為成功；否則才真正回報錯誤，並清掉殘留的安裝目錄。
+fn ensure_distro_imported(distro: &str, agent_bytes: &[u8]) -> Result<()> {
     let local_app_data = std::env::var_os("LOCALAPPDATA").ok_or_else(|| {
         anyhow::anyhow!("找不到 %LOCALAPPDATA% 環境變數，無法決定 WSL distro 安裝目錄")
     })?;
@@ -178,19 +183,29 @@ fn import_distro(distro: &str, agent_bytes: &[u8]) -> Result<()> {
         .arg("2")
         .output()
         .context("執行 `wsl --import` 失敗")?;
-    if !out.status.success() {
-        bail!(
-            "匯入 WSL distro `{distro}` 失敗（exit {}）：{}；\
-             可嘗試手動執行 `wsl --unregister {distro}` 後重試，\
-             或確認 WSL2 已啟用（`wsl --status`）",
-            out.status.code().unwrap_or(-1),
-            first_line(
-                &decode_wsl_output(&out.stderr),
-                &decode_wsl_output(&out.stdout)
-            ),
-        );
+    if out.status.success() {
+        return Ok(());
     }
-    Ok(())
+
+    // import 失敗：可能是另一個 process 已搶先建立同名 distro（TOCTOU）。
+    // 重新檢查；若已存在則視為成功（冪等）。
+    if distro_exists(distro).unwrap_or(false) {
+        return Ok(());
+    }
+
+    // 真正失敗：清掉本次建立的殘留安裝目錄（避免殘留 vhdx 卡死後續 import）。
+    let _ = std::fs::remove_dir_all(&install_dir);
+    bail!(
+        "匯入 WSL distro `{distro}` 失敗（exit {}）：{}；\
+         請確認 WSL2 已啟用（`wsl --status`）後重試。\
+         （注意：若同名 distro 正被另一個 Chefer app 使用，請勿手動 unregister，\
+         直接重試即可。）",
+        out.status.code().unwrap_or(-1),
+        first_line(
+            &decode_wsl_output(&out.stderr),
+            &decode_wsl_output(&out.stdout)
+        ),
+    );
 }
 
 /// 清理所有 `chefer-rt-` 前綴的 distro；回傳已移除的名稱。

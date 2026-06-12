@@ -91,22 +91,24 @@ mod linux_impl {
             .clone()
             .unwrap_or_else(|| rootfs::default_cache_root(&cfg.data_dir));
         let mut rootfs_map: BTreeMap<String, std::path::PathBuf> = BTreeMap::new();
+        // 持有各服務 rootfs 的共享租約直到 run 結束，阻止並行 instance 在使用中刪除。
+        let mut leases: Vec<(String, rootfs::RootfsLease)> = Vec::new();
         for svc in &order {
-            let dir = rootfs::assemble_service_rootfs(&cfg.bundle_dir, svc, &cache_root)?;
-            rootfs_map.insert(svc.name.clone(), dir);
+            let lease = rootfs::assemble_service_rootfs(&cfg.bundle_dir, svc, &cache_root)?;
+            rootfs_map.insert(svc.name.clone(), lease.path().to_path_buf());
+            leases.push((svc.name.clone(), lease));
         }
 
         // 依拓撲順序啟動並監控
         let code = supervisor::run_services(&order, &rootfs_map, &cfg.data_dir)?;
 
-        // 未要求保留時，盡力清掉 rootfs 快取（失敗僅警告，不影響 exit code）
+        // 未要求保留時，嘗試清掉 rootfs 快取——只有在無其他 instance 使用時
+        // （能升級為獨佔鎖）才真正刪除，否則安全跳過。
         if !cfg.keep_rootfs {
-            for (name, dir) in &rootfs_map {
-                if let Err(e) = std::fs::remove_dir_all(dir) {
+            for (name, lease) in leases {
+                if !lease.cleanup() {
                     eprintln!(
-                        "[guest-agent] 警告：清理服務 `{name}` 的 rootfs 失敗（{}）：{e}；\
-                         可手動刪除該目錄",
-                        dir.display()
+                        "[guest-agent] 服務 `{name}` 的 rootfs 仍被其他執行中的 instance 使用，略過清理"
                     );
                 }
             }

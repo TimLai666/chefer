@@ -255,7 +255,7 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
   - `build [path] [--out dist] [--target <triple>]... [--kit-dir <dir>] [--dry-run] [--zstd-level N]`：load → pack → 對每個 target 找 runtime → assemble → 印出輸出路徑與大小。預設 target = host triple（編譯期 `BUILD_TARGET`）。
   - `run [path] [--build 之參數]`：build（單一 host target）後直接執行產物，stdio 直通。
   - `inspect <single-file>`：讀 footer + 解出 manifest.json 摘要（不執行）。
-  - `version` / `upgrade`：repo = `TimLai666/chefer`（常數修正）。
+  - `version` / `upgrade`：repo = `TimLai666/chefer`（常數修正）。`upgrade` 經 HTTPS（rustls）自 GitHub Releases 取得 kit 壓縮包並原地替換；傳輸層受 TLS 保護，但**不驗證發佈產物簽章**（self_update 預設無此能力）。供應鏈強化（防 release/帳號層級妥協）的後續方向：啟用 self_update 的 `signatures` feature + 內嵌 maintainer 簽章公鑰，對 Release 資產以 zipsign 簽署；在導入前，高安全情境請手動比對 Release 隨附的 `.sha256`。
 - 錯誤輸出統一走 `anyhow` context；user-facing 摘要維持彩色表格。
 
 ## 7. 平台支援矩陣（v1 目標）

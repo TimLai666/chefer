@@ -76,7 +76,7 @@ mod tests {
 
     #[test]
     fn reads_within_limit() {
-        let data = vec![1u8; 100];
+        let data = [1u8; 100];
         let mut r = LimitedReader::new(&data[..], 200);
         let mut out = Vec::new();
         assert_eq!(r.read_to_end(&mut out).unwrap(), 100);

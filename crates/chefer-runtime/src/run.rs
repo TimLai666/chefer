@@ -179,10 +179,10 @@ fn is_single_path_segment(old: &str) -> bool {
         return false;
     }
     let mut comps = Path::new(old).components();
-    match (comps.next(), comps.next()) {
-        (Some(std::path::Component::Normal(_)), None) => true,
-        _ => false,
-    }
+    matches!(
+        (comps.next(), comps.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
 }
 
 #[cfg(test)]

@@ -60,6 +60,15 @@ pub fn cmd_upgrade(channel: &str, to: Option<&str>, check_only: bool) -> Result<
                 cargo_crate_version!(),
                 ver
             );
+            // 完整性說明：下載經 HTTPS（rustls）連 GitHub，傳輸層不可被一般 MITM 竄改；
+            // 但本工具不驗證發佈產物的簽章。高安全需求情境，建議比對 Release 隨附的
+            // .sha256 檔後再採用。供應鏈強化（簽章驗證）見 docs/DESIGN.md。
+            println!(
+                "{}",
+                "註：更新透過 HTTPS 自 GitHub Releases 取得；如需更高保證，\
+                 可手動比對 Release 附帶的 .sha256 校驗檔。"
+                    .dimmed()
+            );
         }
     }
 

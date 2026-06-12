@@ -76,7 +76,7 @@ pub fn sanitize_rel_path(entry_path: &str) -> Result<Option<PathBuf>> {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{assemble_rootfs_at, assemble_service_rootfs};
+pub use linux::{RootfsLease, assemble_rootfs_at, assemble_service_rootfs};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -84,6 +84,7 @@ mod linux {
     use std::fs;
     use std::io::Read;
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::io::AsRawFd;
     use std::path::{Path, PathBuf};
 
     use anyhow::{Context, Result, bail};
@@ -91,39 +92,115 @@ mod linux {
     use super::{COMPLETE_MARKER, is_rootfs_complete, sanitize_rel_path, service_rootfs_dir};
     use crate::whiteout::{WhiteoutAction, parse_whiteout};
 
-    /// 組裝（或重用快取的）服務 rootfs，回傳 rootfs 目錄路徑。
+    /// 已組裝完成的 rootfs 租約：在 run 期間持有共享 flock，
+    /// 阻止其他並行 instance 在我們使用中刪除這個快取目錄。
+    ///
+    /// 背景（對抗式審查發現）：同一 kit 打包的多個 app（或同一 app 開兩次）
+    /// 共用同名 distro 與同一 `<cache>/<svc>-<chain12>` 目錄。若無鎖，
+    /// 後啟動者結束時的 `remove_dir_all` 會刪掉前者正在 pivot_root 使用的 rootfs，
+    /// 造成運行中服務的根檔案系統被破壞。並行組裝也會互相刪除半成品。
+    ///
+    /// 解法：組裝期持 `LOCK_EX`（序列化組裝/重建），完成後降為 `LOCK_SH`
+    /// 並持有至 run 結束；清理時嘗試非阻塞 `LOCK_EX`，唯有無其他共享持有者
+    /// （即沒有別的 instance 在用）時才真正刪除。
+    pub struct RootfsLease {
+        dir: PathBuf,
+        /// 持有 flock 的鎖檔（drop 時自動釋放鎖）。
+        lock: fs::File,
+    }
+
+    impl RootfsLease {
+        /// rootfs 目錄路徑。
+        pub fn path(&self) -> &Path {
+            &self.dir
+        }
+
+        /// 嘗試在「無其他 instance 使用」時刪除此 rootfs 快取。
+        /// 回傳是否真的刪除（false = 仍有其他使用者，已安全跳過）。
+        pub fn cleanup(self) -> bool {
+            // 升級為非阻塞 EX：成功代表此 fd 上不再與任何「其他開檔描述」的鎖衝突，
+            // 亦即沒有別的 instance 持有 SH → 可安全刪除。
+            if flock(&self.lock, libc::LOCK_EX | libc::LOCK_NB).is_ok() {
+                let _ = fs::remove_dir_all(&self.dir);
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    /// 對 flock 鎖檔套用 flock(2)。
+    fn flock(file: &fs::File, op: libc::c_int) -> std::io::Result<()> {
+        // SAFETY: 傳入有效的 fd 與合法的 flock 操作常數。
+        let r = unsafe { libc::flock(file.as_raw_fd(), op) };
+        if r == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    /// 組裝（或重用快取的）服務 rootfs，回傳持有共享鎖的 [`RootfsLease`]。
     ///
     /// 目標目錄：`<cache_root>/<svc>-<chain_hash12>`；已存在且含 `.complete` → 直接重用。
-    /// 存在但無 `.complete`（上次中斷）→ 整個移除重建。
+    /// 存在但無 `.complete`（上次中斷）→ 整個移除重建。全程以 flock 序列化，
+    /// 確保並行 instance 不會互相刪除或讀到半成品。
     pub fn assemble_service_rootfs(
         bundle_dir: &Path,
         svc: &chefer_bundle::ServiceEntry,
         cache_root: &Path,
-    ) -> Result<PathBuf> {
+    ) -> Result<RootfsLease> {
         let target = service_rootfs_dir(cache_root, svc);
-        if is_rootfs_complete(&target) {
-            return Ok(target);
-        }
-        if target.exists() {
-            fs::remove_dir_all(&target).with_context(|| {
-                format!(
-                    "移除不完整的 rootfs 快取失敗：{}；請手動刪除後重試",
-                    target.display()
-                )
+        fs::create_dir_all(cache_root)
+            .with_context(|| format!("建立快取根目錄失敗：{}", cache_root.display()))?;
+
+        // 鎖檔放在 cache_root（不在 target 內，因為 target 會被 remove_dir_all）。
+        let dir_name = target
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "rootfs".into());
+        let lock_path = cache_root.join(format!(".{dir_name}.lock"));
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("開啟 rootfs 鎖檔失敗：{}", lock_path.display()))?;
+
+        // 1) 取 EX 序列化「檢查 → 重建 → 寫 .complete」全程。
+        flock(&lock, libc::LOCK_EX)
+            .with_context(|| format!("取得 rootfs 獨佔鎖失敗：{}", lock_path.display()))?;
+
+        if !is_rootfs_complete(&target) {
+            if target.exists() {
+                fs::remove_dir_all(&target).with_context(|| {
+                    format!(
+                        "移除不完整的 rootfs 快取失敗：{}；請手動刪除後重試",
+                        target.display()
+                    )
+                })?;
+            }
+            fs::create_dir_all(&target)
+                .with_context(|| format!("建立 rootfs 目錄失敗：{}", target.display()))?;
+
+            if let Err(e) = assemble_rootfs_at(bundle_dir, svc, &target) {
+                // 失敗時盡力清掉半成品，避免下次誤用
+                let _ = fs::remove_dir_all(&target);
+                return Err(e);
+            }
+
+            fs::write(target.join(COMPLETE_MARKER), b"").with_context(|| {
+                format!("寫入 {COMPLETE_MARKER} 標記失敗：{}", target.display())
             })?;
         }
-        fs::create_dir_all(&target)
-            .with_context(|| format!("建立 rootfs 目錄失敗：{}", target.display()))?;
 
-        if let Err(e) = assemble_rootfs_at(bundle_dir, svc, &target) {
-            // 失敗時盡力清掉半成品，避免下次誤用
-            let _ = fs::remove_dir_all(&target);
-            return Err(e);
-        }
+        // 2) 降為 SH 並持有至 run 結束：允許多個 instance 共用同一 rootfs，
+        //    但任何 instance 的 cleanup（需 EX）在仍有人使用時都會被擋下。
+        flock(&lock, libc::LOCK_SH)
+            .with_context(|| format!("降為 rootfs 共享鎖失敗：{}", lock_path.display()))?;
 
-        fs::write(target.join(COMPLETE_MARKER), b"")
-            .with_context(|| format!("寫入 {COMPLETE_MARKER} 標記失敗：{}", target.display()))?;
-        Ok(target)
+        Ok(RootfsLease { dir: target, lock })
     }
 
     /// 直接把服務的所有層解到 `out_dir`（不經快取；`assemble-rootfs` 除錯指令亦用此）。
@@ -624,7 +701,8 @@ mod linux_tests {
             .finish();
 
         let svc = make_bundle(&bundle, "app", vec![l0, l1]);
-        let rootfs = assemble_service_rootfs(&bundle, &svc, &cache).unwrap();
+        let lease = assemble_service_rootfs(&bundle, &svc, &cache).unwrap();
+        let rootfs = lease.path();
 
         // whiteout：etc/a.txt 應被刪除；whiteout entry 本身不落地
         assert!(!rootfs.join("etc/a.txt").exists());
@@ -650,7 +728,7 @@ mod linux_tests {
         assert_eq!(link, std::path::PathBuf::from("a.txt"));
         assert_eq!(std::fs::read(rootfs.join("etc/hard")).unwrap(), b"v1");
         // 完成標記
-        assert!(is_rootfs_complete(&rootfs));
+        assert!(is_rootfs_complete(rootfs));
     }
 
     #[test]
@@ -661,13 +739,15 @@ mod linux_tests {
         let l0 = LayerBuilder::new().file("hello", b"hi", 0o644).finish();
         let svc = make_bundle(&bundle, "app", vec![l0]);
 
-        let rootfs = assemble_service_rootfs(&bundle, &svc, &cache).unwrap();
+        let lease = assemble_service_rootfs(&bundle, &svc, &cache).unwrap();
+        let rootfs = lease.path().to_path_buf();
         // 在快取內放哨兵檔；重用時不應重建
         std::fs::write(rootfs.join("sentinel"), b"keep").unwrap();
-        let rootfs2 = assemble_service_rootfs(&bundle, &svc, &cache).unwrap();
-        assert_eq!(rootfs, rootfs2);
+        drop(lease); // 釋放鎖，模擬另一次啟動
+        let lease2 = assemble_service_rootfs(&bundle, &svc, &cache).unwrap();
+        assert_eq!(rootfs, lease2.path());
         assert!(
-            rootfs2.join("sentinel").exists(),
+            lease2.path().join("sentinel").exists(),
             "快取命中時不應重建 rootfs"
         );
     }
@@ -685,10 +765,34 @@ mod linux_tests {
         std::fs::create_dir_all(&target).unwrap();
         std::fs::write(target.join("stale"), b"old").unwrap();
 
-        let rootfs = assemble_service_rootfs(&bundle, &svc, &cache).unwrap();
+        let lease = assemble_service_rootfs(&bundle, &svc, &cache).unwrap();
+        let rootfs = lease.path();
         assert!(!rootfs.join("stale").exists(), "不完整快取應整個重建");
         assert!(rootfs.join("hello").exists());
-        assert!(is_rootfs_complete(&rootfs));
+        assert!(is_rootfs_complete(rootfs));
+    }
+
+    #[test]
+    fn cleanup_skips_while_other_lease_holds_shared_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("bundle");
+        let cache = tmp.path().join("cache");
+        let l0 = LayerBuilder::new().file("hello", b"hi", 0o644).finish();
+        let svc = make_bundle(&bundle, "app", vec![l0]);
+
+        // instance A 持有租約（共享鎖）
+        let lease_a = assemble_service_rootfs(&bundle, &svc, &cache).unwrap();
+        let dir = lease_a.path().to_path_buf();
+        // instance B 重用快取、取得自己的共享鎖
+        let lease_b = assemble_service_rootfs(&bundle, &svc, &cache).unwrap();
+
+        // B 先結束並嘗試清理：A 仍持共享鎖 → 必須跳過刪除
+        assert!(!lease_b.cleanup(), "仍有 A 在用時 B 不應刪除 rootfs");
+        assert!(dir.is_dir(), "A 正在使用的 rootfs 不可被刪");
+
+        // A 結束清理：此時無人使用 → 真正刪除
+        assert!(lease_a.cleanup(), "最後使用者應能清除 rootfs");
+        assert!(!dir.exists(), "無人使用後 rootfs 應被刪除");
     }
 
     #[test]

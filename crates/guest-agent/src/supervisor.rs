@@ -12,11 +12,21 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use nix::errno::Errno;
-use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, killpg, sigaction};
+use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, kill, killpg, sigaction};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 
 use crate::exec::{SpawnSpec, spawn_service};
+
+/// 一個執行中服務：中繼行程 pid（= pgid）、服務本體（pid-ns init）host pid、名稱。
+struct Running {
+    /// 中繼行程 pid，亦為其 process group id（供 killpg）。
+    mid: Pid,
+    /// 服務本體在 host 的 pid（pid-ns 的 init）；用於直接終止，
+    /// 不受服務 setsid/setpgid 脫離中繼 process group 的影響。
+    init: Option<Pid>,
+    name: String,
+}
 
 /// SIGTERM / SIGINT 旗標（由訊號處理常式設定，主迴圈輪詢）。
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -51,7 +61,7 @@ pub fn run_services(
     data_dir: &Path,
 ) -> Result<i32> {
     // 啟動（中途收到關閉訊號 → 終止已啟動者並回 130）
-    let mut running: Vec<(Pid, String)> = Vec::new();
+    let mut running: Vec<Running> = Vec::new();
     for svc in order {
         if SHUTDOWN.load(Ordering::SeqCst) {
             terminate_all(&mut running);
@@ -82,7 +92,11 @@ pub fn run_services(
         if let Some(fd) = spawned.stderr {
             spawn_forwarder(svc.name.clone(), fd, true);
         }
-        running.push((spawned.pid, svc.name.clone()));
+        running.push(Running {
+            mid: spawned.pid,
+            init: spawned.init_pid,
+            name: svc.name.clone(),
+        });
         eprintln!(
             "[guest-agent] 服務 `{}` 已啟動（pid {}）",
             svc.name, spawned.pid
@@ -93,7 +107,7 @@ pub fn run_services(
 }
 
 /// 等待子行程結束；任一非零 → fail_fast 終止其餘並回傳該 code。
-fn monitor(running: &mut Vec<(Pid, String)>) -> Result<i32> {
+fn monitor(running: &mut Vec<Running>) -> Result<i32> {
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
             eprintln!("[guest-agent] 收到終止訊號，正在停止所有服務…");
@@ -114,10 +128,11 @@ fn monitor(running: &mut Vec<(Pid, String)>) -> Result<i32> {
             WaitStatus::Signaled(pid, sig, _) => (pid, 128 + sig as i32),
             _ => continue,
         };
-        let Some(idx) = running.iter().position(|(p, _)| *p == pid) else {
+        // 我們 waitpid 到的是中繼行程（其 exit code 即服務本體的 exit code）。
+        let Some(idx) = running.iter().position(|r| r.mid == pid) else {
             continue; // 非我們追蹤的子行程
         };
-        let (_, name) = running.remove(idx);
+        let name = running.remove(idx).name;
         if code != 0 {
             eprintln!(
                 "[guest-agent] 服務 `{name}` 以非零代碼 {code} 結束（fail_fast）；正在終止其餘服務…"
@@ -130,19 +145,25 @@ fn monitor(running: &mut Vec<(Pid, String)>) -> Result<i32> {
 }
 
 /// SIGTERM 全部 → 最多等 5 秒 → 仍存活者 SIGKILL（並回收殭屍行程）。
-fn terminate_all(running: &mut Vec<(Pid, String)>) {
+///
+/// 同時對「中繼行程的 process group」與「服務本體（pid-ns init）的 host pid」送訊號：
+/// 前者涵蓋一般情況；後者確保即使服務 setsid/setpgid 脫離中繼 group，
+/// 仍能直接殺掉 pid-ns 的 init 而拆除整個 namespace（避免行程/埠洩漏）。
+fn terminate_all(running: &mut Vec<Running>) {
     if running.is_empty() {
         return;
     }
-    for (pid, _) in running.iter() {
-        // pid == pgid（spawn 時 setpgid），對整組（中繼 + 服務本體）送訊號
-        let _ = killpg(*pid, Signal::SIGTERM);
+    for r in running.iter() {
+        let _ = killpg(r.mid, Signal::SIGTERM);
+        if let Some(init) = r.init {
+            let _ = kill(init, Signal::SIGTERM);
+        }
     }
     let deadline = Instant::now() + Duration::from_secs(5);
     while !running.is_empty() && Instant::now() < deadline {
-        running.retain(|(pid, _)| {
+        running.retain(|r| {
             !matches!(
-                waitpid(*pid, Some(WaitPidFlag::WNOHANG)),
+                waitpid(r.mid, Some(WaitPidFlag::WNOHANG)),
                 Ok(WaitStatus::Exited(..)) | Ok(WaitStatus::Signaled(..)) | Err(_)
             )
         });
@@ -151,10 +172,16 @@ fn terminate_all(running: &mut Vec<(Pid, String)>) {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    for (pid, name) in running.iter() {
-        eprintln!("[guest-agent] 服務 `{name}` 未在 5 秒內結束，強制終止（SIGKILL）");
-        let _ = killpg(*pid, Signal::SIGKILL);
-        let _ = waitpid(*pid, None);
+    for r in running.iter() {
+        eprintln!(
+            "[guest-agent] 服務 `{}` 未在 5 秒內結束，強制終止（SIGKILL）",
+            r.name
+        );
+        let _ = killpg(r.mid, Signal::SIGKILL);
+        if let Some(init) = r.init {
+            let _ = kill(init, Signal::SIGKILL);
+        }
+        let _ = waitpid(r.mid, None);
     }
     running.clear();
 }
