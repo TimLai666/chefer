@@ -143,8 +143,15 @@ mod linux {
     /// 組裝（或重用快取的）服務 rootfs，回傳持有共享鎖的 [`RootfsLease`]。
     ///
     /// 目標目錄：`<cache_root>/<svc>-<chain_hash12>`；已存在且含 `.complete` → 直接重用。
-    /// 存在但無 `.complete`（上次中斷）→ 整個移除重建。全程以 flock 序列化，
-    /// 確保並行 instance 不會互相刪除或讀到半成品。
+    /// 存在但無 `.complete`（上次中斷）→ 整個移除重建。
+    ///
+    /// 鎖策略（先共享、需要時才升級獨佔的雙重檢查）：
+    /// 1. 先取 `LOCK_SH`，若快取已完成 → 直接以共享鎖重用（多個 instance 可並行，
+    ///    彼此不阻塞——這是重點：絕不能在「重用快取」的常見路徑上互相等待）。
+    /// 2. 未完成 → 釋放 SH、取 `LOCK_EX` 重建，重建後**再次檢查**（避免與其他
+    ///    process 重複建置），最後降回 `LOCK_SH` 持有至 run 結束。
+    /// 持有的 SH 鎖會擋下其他 instance 的 cleanup（需 EX），確保使用中的 rootfs
+    /// 不被刪除。
     pub fn assemble_service_rootfs(
         bundle_dir: &Path,
         svc: &chefer_bundle::ServiceEntry,
@@ -168,10 +175,20 @@ mod linux {
             .open(&lock_path)
             .with_context(|| format!("開啟 rootfs 鎖檔失敗：{}", lock_path.display()))?;
 
-        // 1) 取 EX 序列化「檢查 → 重建 → 寫 .complete」全程。
+        // 1) 先取共享鎖：快取已完成即走快路徑（並行 instance 互不阻塞）。
+        flock(&lock, libc::LOCK_SH)
+            .with_context(|| format!("取得 rootfs 共享鎖失敗：{}", lock_path.display()))?;
+        if is_rootfs_complete(&target) {
+            return Ok(RootfsLease { dir: target, lock });
+        }
+
+        // 2) 未完成 → 釋放共享鎖、取獨佔鎖重建（獨佔只在「真的要建」時才需要）。
+        flock(&lock, libc::LOCK_UN)
+            .with_context(|| format!("釋放 rootfs 共享鎖失敗：{}", lock_path.display()))?;
         flock(&lock, libc::LOCK_EX)
             .with_context(|| format!("取得 rootfs 獨佔鎖失敗：{}", lock_path.display()))?;
 
+        // 雙重檢查：等待獨佔鎖期間可能已被其他 process 建好。
         if !is_rootfs_complete(&target) {
             if target.exists() {
                 fs::remove_dir_all(&target).with_context(|| {
@@ -195,8 +212,7 @@ mod linux {
             })?;
         }
 
-        // 2) 降為 SH 並持有至 run 結束：允許多個 instance 共用同一 rootfs，
-        //    但任何 instance 的 cleanup（需 EX）在仍有人使用時都會被擋下。
+        // 3) 降回 SH 並持有至 run 結束（允許並行共用，擋下他人 cleanup）。
         flock(&lock, libc::LOCK_SH)
             .with_context(|| format!("降為 rootfs 共享鎖失敗：{}", lock_path.display()))?;
 
