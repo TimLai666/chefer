@@ -43,6 +43,8 @@ Cargo workspace under `crates/`. The data flow is:
 
 ## AppCipe Format Notes
 
+**Authoring an `appcipe.yml`?** Read [.claude/skills/write-appcipe/SKILL.md](.claude/skills/write-appcipe/SKILL.md) — the full field reference, validation rules, and real-world gotchas (image `format` is hyphenated, official images that chown/gosu need root-range uid mapping, the v1 "db not truly isolated" networking caveat, `app_version` is display-only and not readable by the container). A runnable app+db example lives in [examples/demo/](examples/demo/).
+
 See [examples/appcipe.yml](examples/appcipe.yml) for the fully-commented reference. Key semantics:
 - `image:` accepts a short form (a bare tar path string) or a full form (`source`/`file`/`format`/`platform`) — both map to `appcipe_spec::ImageSourceOrPath`. Only `source: tar` is supported (dockerfile/image are rejected at validation).
 - Persistence is opt-in per service via `persist_path`; data lands in `{data_dir or system default}/data/{service}/`. `old_names` drives automatic data-dir migration.
