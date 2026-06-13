@@ -538,19 +538,18 @@ main() {
   host_uid="$(id -u)"
   host_target="$(rustc -vV | sed -n 's/^host: //p')"
   case "$(uname -m)" in
-    x86_64|amd64)
-      image_platform="linux/amd64"
-      output_target="${CHEFER_E2E_OUTPUT_TARGET:-x86_64-unknown-linux-musl}"
-      ;;
-    aarch64|arm64)
-      image_platform="linux/arm64"
-      output_target="${CHEFER_E2E_OUTPUT_TARGET:-aarch64-unknown-linux-musl}"
-      ;;
+    x86_64|amd64) image_platform="linux/amd64" ;;
+    aarch64|arm64) image_platform="linux/arm64" ;;
     *) die "unsupported Linux E2E host architecture: $(uname -m)" ;;
   esac
+  # 預設用 host 原生 gnu target：在 runner 上免 musl C 交叉工具鏈即可建置
+  # （chefer-runtime 依賴 C 後端的 zstd-sys，musl 目標需 x86_64-linux-musl-gcc）。
+  # 本 E2E 的目的是驗證原生 Linux 的 namespaces 執行路徑，與 C 連結方式無關；
+  # 散佈用的 musl 靜態單檔由 release.yml 經 cross 另行建置，CI 亦有 musl 靜態檢查。
+  output_target="${CHEFER_E2E_OUTPUT_TARGET:-$host_target}"
   case "$output_target" in
-    x86_64-unknown-linux-musl|aarch64-unknown-linux-musl) ;;
-    *) die "CHEFER_E2E_OUTPUT_TARGET must be a Linux musl target, got: ${output_target}" ;;
+    *-unknown-linux-gnu | *-unknown-linux-musl) ;;
+    *) die "CHEFER_E2E_OUTPUT_TARGET must be a Linux gnu/musl target, got: ${output_target}" ;;
   esac
   guest_port="${CHEFER_E2E_GUEST_PORT:-8080}"
   valid_port "$guest_port" || die "invalid guest port: ${guest_port}"

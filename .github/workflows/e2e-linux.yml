@@ -28,17 +28,14 @@ jobs:
         include:
           - name: linux-amd64
             runner: ubuntu-latest
-            rust_target: x86_64-unknown-linux-musl
           - name: linux-arm64
             runner: ubuntu-24.04-arm
-            rust_target: aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v4
 
+      # 用 runner 的 host 原生 gnu target 建置（免 musl C 交叉工具鏈）。
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust_target }}
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -63,5 +60,4 @@ jobs:
         shell: bash
         env:
           CHEFER_E2E_GUI: "1"
-          CHEFER_E2E_OUTPUT_TARGET: ${{ matrix.rust_target }}
         run: bash scripts/linux-e2e.sh
