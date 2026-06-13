@@ -78,7 +78,7 @@ impl VmResources {
 /// kernel command line：序列埠 console + 由 initramfs 解讀的 chefer 參數
 /// （keep_rootfs 與共享標籤）。實際掛載由 initramfs `/init` 執行。
 pub fn kernel_command_line(keep_rootfs: bool) -> String {
-    let mut s = String::from("console=hvc0 quiet");
+    let mut s = String::from("console=hvc0 quiet ip=dhcp panic=-1");
     s.push_str(&format!(
         " chefer.bundle_tag={SHARE_TAG_BUNDLE} chefer.data_tag={SHARE_TAG_DATA}"
     ));
@@ -127,6 +127,7 @@ mod tests {
     fn cmdline_contains_tags_and_keep_flag() {
         let c = kernel_command_line(false);
         assert!(c.contains("console=hvc0"));
+        assert!(c.contains("ip=dhcp"));
         assert!(c.contains(&format!("chefer.bundle_tag={SHARE_TAG_BUNDLE}")));
         assert!(c.contains(&format!("chefer.data_dir={GUEST_DATA_DIR}")));
         assert!(!c.contains("keep_rootfs"));

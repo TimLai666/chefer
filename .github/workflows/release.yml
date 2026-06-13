@@ -7,6 +7,11 @@ on:
         description: Existing git tag to build and verify without uploading to a GitHub Release
         required: true
         type: string
+      linux_ref:
+        description: 建置 macOS micro-VM appliance 使用的 Linux stable git tag/ref
+        required: false
+        default: v6.6.32
+        type: string
   release:
     types: [published]
 
@@ -19,6 +24,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CHEFER_LINUX_REF: ${{ inputs.linux_ref || vars.CHEFER_LINUX_REF || 'v6.6.32' }}
 
 jobs:
   preflight:
@@ -27,6 +33,7 @@ jobs:
     outputs:
       checkout_ref: ${{ steps.tag.outputs.checkout_ref }}
       release_tag: ${{ steps.tag.outputs.release_tag }}
+      linux_ref: ${{ steps.tag.outputs.linux_ref }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -52,8 +59,14 @@ jobs:
             echo "::error::Release tag does not exist or does not resolve to a commit: $TAG"
             exit 1
           fi
+          LINUX_REF="${CHEFER_LINUX_REF}"
+          if [[ -z "$LINUX_REF" || "$LINUX_REF" == *".."* || "$LINUX_REF" == *" "* ]]; then
+            echo "::error::Linux appliance ref is not safe: $LINUX_REF"
+            exit 1
+          fi
           echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "checkout_ref=refs/tags/$TAG" >> "$GITHUB_OUTPUT"
+          echo "linux_ref=$LINUX_REF" >> "$GITHUB_OUTPUT"
 
   # ── 第一階段：各 target 編譯 chefer-cli / chefer-runtime（musl target 加 guest-agent）──
   build:
@@ -122,10 +135,38 @@ jobs:
           path: stage/*
           if-no-files-found: error
 
+  appliance:
+    name: build appliance (${{ matrix.arch }})
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.checkout_ref }}
+
+      - name: Build Linux micro-VM appliance
+        shell: bash
+        run: bash scripts/build-appliance.sh --arch "${{ matrix.arch }}" --linux-ref "${{ needs.preflight.outputs.linux_ref }}" --out stage
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appliance-${{ matrix.arch }}
+          path: |
+            stage/chefer-vmlinuz-${{ matrix.arch }}
+            stage/chefer-initramfs-${{ matrix.arch }}
+            stage/BUILDINFO-${{ matrix.arch }}
+            stage/SHA256SUMS-${{ matrix.arch }}
+          if-no-files-found: error
+
   # ── 第二階段：每個 host 平台組一份完整 kit（CLI + 全部 runtime + 兩架構 guest-agent）──
   package:
     name: package kit (${{ matrix.host_target }})
-    needs: [preflight, build]
+    needs: [preflight, build, appliance]
     strategy:
       fail-fast: false
       matrix:
@@ -170,6 +211,9 @@ jobs:
           cp all/chefer-runtime-* "out/$PKG/kit/"
           # 兩種 guest 架構的靜態 agent
           cp all/guest-agent-x86_64 all/guest-agent-aarch64 "out/$PKG/kit/"
+          # macOS VZ 後端使用的 Linux micro-VM appliance（所有 host kit 都附，方便跨平台打包）
+          cp all/chefer-vmlinuz-* all/chefer-initramfs-* "out/$PKG/kit/"
+          cp all/BUILDINFO-* all/SHA256SUMS-* "out/$PKG/kit/"
 
           chmod +x "out/$PKG/chefer$EXT" out/$PKG/kit/* || true
 

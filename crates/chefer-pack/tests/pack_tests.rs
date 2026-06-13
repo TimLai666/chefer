@@ -204,6 +204,7 @@ fn default_opts(out: &Path) -> PackOptions {
         clean: true,
         write_original_yml: false,
         kit_dirs: vec![],
+        target_triples: vec![],
         require_agents: false,
         zstd_level: 3,
     }
@@ -461,6 +462,71 @@ fn pack_copies_guest_agent_from_kit() {
     let agent = layout::agents_dir(&res.bundle_dir).join(layout::guest_agent_name("x86_64"));
     assert!(agent.is_file(), "guest-agent 未複製到 agents/");
     assert_eq!(std::fs::read(&agent).unwrap(), b"fake-musl-agent");
+}
+
+#[test]
+fn pack_copies_macos_appliance_from_kit_when_targeting_darwin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (image_tar, _) = build_docker_archive(tmp.path(), "linux", "arm64", None);
+
+    let kit_dir = tmp.path().join("kit");
+    std::fs::create_dir_all(&kit_dir).unwrap();
+    std::fs::write(kit_dir.join("guest-agent-aarch64"), b"fake-musl-agent").unwrap();
+    std::fs::write(kit_dir.join("chefer-vmlinuz-aarch64"), b"fake-kernel").unwrap();
+    std::fs::write(kit_dir.join("chefer-initramfs-aarch64"), b"fake-initramfs").unwrap();
+
+    let svc = make_service(ImageSourceOrPath::Full {
+        source: ImageSourceType::Tar,
+        file: image_tar.to_string_lossy().to_string(),
+        format: ImageFormat::DockerArchive,
+        platform: ImagePlatform::LinuxArm64,
+    });
+    let app = make_app("MacApplianceApp", vec![("web", svc)]);
+    let out = tmp.path().join("out");
+    let mut opts = default_opts(&out);
+    opts.kit_dirs = vec![kit_dir];
+    opts.target_triples = vec!["aarch64-apple-darwin".to_string()];
+    opts.require_agents = true;
+    let res = pack(&app, &opts).unwrap();
+
+    let vm = layout::vm_dir(&res.bundle_dir);
+    assert_eq!(
+        std::fs::read(vm.join(layout::kernel_name("aarch64"))).unwrap(),
+        b"fake-kernel"
+    );
+    assert_eq!(
+        std::fs::read(vm.join(layout::initramfs_name("aarch64"))).unwrap(),
+        b"fake-initramfs"
+    );
+}
+
+#[test]
+fn pack_skips_missing_macos_appliance_without_failing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (image_tar, _) = build_docker_archive(tmp.path(), "linux", "arm64", None);
+
+    let kit_dir = tmp.path().join("kit");
+    std::fs::create_dir_all(&kit_dir).unwrap();
+    std::fs::write(kit_dir.join("guest-agent-aarch64"), b"fake-musl-agent").unwrap();
+
+    let svc = make_service(ImageSourceOrPath::Full {
+        source: ImageSourceType::Tar,
+        file: image_tar.to_string_lossy().to_string(),
+        format: ImageFormat::DockerArchive,
+        platform: ImagePlatform::LinuxArm64,
+    });
+    let app = make_app("MissingMacApplianceApp", vec![("web", svc)]);
+    let out = tmp.path().join("out");
+    let mut opts = default_opts(&out);
+    opts.kit_dirs = vec![kit_dir];
+    opts.target_triples = vec!["aarch64-apple-darwin".to_string()];
+    opts.require_agents = true;
+
+    let res = pack(&app, &opts).unwrap();
+    assert!(
+        !layout::vm_dir(&res.bundle_dir).exists(),
+        "缺少 appliance 時應略過 vm/，不阻斷建置"
+    );
 }
 
 #[test]

@@ -17,7 +17,7 @@ impl ExecBackend for NamespacesBackend {
 
     /// 可用性：/proc/self/ns/user 存在；若 /proc/sys/kernel/unprivileged_userns_clone
     /// 存在則必須為 1（部分發行版用此開關停用非特權 user namespaces）。
-    fn availability(&self) -> Availability {
+    fn availability(&self, _ctx: &AppRunContext) -> Availability {
         if !Path::new("/proc/self/ns/user").exists() {
             return Availability::Unavailable(
                 "核心未啟用 user namespaces（缺 /proc/self/ns/user）；\

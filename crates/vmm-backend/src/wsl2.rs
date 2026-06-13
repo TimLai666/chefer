@@ -23,7 +23,7 @@ impl ExecBackend for Wsl2Backend {
     }
 
     /// 可用性：`wsl.exe --status` 成功（exit 0）即視為可用。
-    fn availability(&self) -> Availability {
+    fn availability(&self, _ctx: &AppRunContext) -> Availability {
         match wsl_command().arg("--status").output() {
             Ok(out) if out.status.success() => Availability::Available,
             Ok(out) => Availability::Unavailable(format!(

@@ -7,6 +7,7 @@
 //!    → zstd 重壓寫入 `services/<svc>/layers/`，並與 config 的 rootfs.diff_ids 比對。
 //! 3. 產出 manifest.json（chefer_bundle::Manifest）與（選）appcipe.yml 回寫。
 //! 4. 從 kit 複製對應 guest 架構的 musl guest-agent 到 `agents/`。
+//! 5. 建置 macOS 目標時，best-effort 從 kit 複製 micro-VM appliance 到 `vm/`。
 
 mod archive;
 mod convert;
@@ -35,6 +36,8 @@ pub struct PackOptions {
     pub write_original_yml: bool,
     /// kit 搜尋目錄（會排在預設搜尋順序之前；用於尋找 guest-agent）。
     pub kit_dirs: Vec<PathBuf>,
+    /// 這次 `chefer build` 要組裝的 target triples；用於判斷是否需內嵌 macOS appliance。
+    pub target_triples: Vec<String>,
     /// 找不到 guest-agent 時是否視為錯誤（false 時僅印出警告）。
     pub require_agents: bool,
     /// 層重壓所用的 zstd 壓縮等級。
@@ -104,6 +107,7 @@ pub fn pack(app: &AppCipe, opts: &PackOptions) -> Result<PackResult> {
     }
 
     copy_agents(&bundle_dir, &manifest, opts)?;
+    copy_macos_appliances(&bundle_dir, opts)?;
 
     Ok(PackResult {
         bundle_dir,
@@ -267,6 +271,76 @@ fn copy_agents(bundle_dir: &Path, manifest: &Manifest, opts: &PackOptions) -> Re
         }
     }
     Ok(())
+}
+
+/// 建置 macOS target 時，將對應架構的 Linux micro-VM appliance 複製到 `vm/`。
+///
+/// appliance 尚未進入 kit 前依 DESIGN §2 採 best-effort：缺少時警告但不阻斷建置；
+/// 產物仍可 assemble，只是在 macOS 執行時 availability/run 會給出明確錯誤。
+fn copy_macos_appliances(bundle_dir: &Path, opts: &PackOptions) -> Result<()> {
+    let mut arches: BTreeSet<&'static str> = BTreeSet::new();
+    for target in &opts.target_triples {
+        if let Some(arch) = macos_target_arch(target) {
+            arches.insert(arch);
+        }
+    }
+    if arches.is_empty() {
+        return Ok(());
+    }
+
+    let mut kit_dirs = opts.kit_dirs.clone();
+    kit_dirs.extend(kit::default_kit_dirs());
+
+    let vm_dir = layout::vm_dir(bundle_dir);
+    for arch in arches {
+        match kit::find_appliance(&kit_dirs, arch) {
+            Some((kernel, initramfs)) => {
+                fs::create_dir_all(&vm_dir)?;
+                let kernel_dst = vm_dir.join(layout::kernel_name(arch));
+                let initramfs_dst = vm_dir.join(layout::initramfs_name(arch));
+                fs::copy(&kernel, &kernel_dst).with_context(|| {
+                    format!("複製 macOS appliance kernel 失敗：{}", kernel.display())
+                })?;
+                fs::copy(&initramfs, &initramfs_dst).with_context(|| {
+                    format!(
+                        "複製 macOS appliance initramfs 失敗：{}",
+                        initramfs.display()
+                    )
+                })?;
+            }
+            None => {
+                eprintln!(
+                    "警告：找不到 macOS micro-VM appliance（需要 {} 與 {}）。\
+                     已搜尋 kit 目錄：{}。\
+                     將略過內嵌 vm/；此產物仍可組裝，但在 macOS 上會回報後端不可用。",
+                    layout::kernel_name(arch),
+                    layout::initramfs_name(arch),
+                    format_kit_dirs(&kit_dirs),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn macos_target_arch(target: &str) -> Option<&'static str> {
+    match target {
+        "x86_64-apple-darwin" => Some("x86_64"),
+        "aarch64-apple-darwin" => Some("aarch64"),
+        _ => None,
+    }
+}
+
+fn format_kit_dirs(kit_dirs: &[PathBuf]) -> String {
+    if kit_dirs.is_empty() {
+        "（無可搜尋目錄）".to_string()
+    } else {
+        kit_dirs
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join("、")
+    }
 }
 
 /// 目前 UTC 時間的 RFC3339 字串（秒以下截斷，輸出穩定）。

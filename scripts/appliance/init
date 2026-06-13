@@ -1,0 +1,97 @@
+#!/bin/busybox sh
+set -eu
+
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+/bin/busybox --install -s /bin >/dev/null 2>&1 || true
+
+mountpoint() {
+  grep -qs " $1 " /proc/mounts
+}
+
+log() {
+  echo "[chefer-init] $*"
+}
+
+fail() {
+  code="${2:-1}"
+  log "錯誤：$1"
+  echo "CHEFER_GUEST_EXIT=${code}"
+  sync
+  poweroff -f >/dev/null 2>&1 || halt -f >/dev/null 2>&1 || true
+  while true; do sleep 3600; done
+}
+
+mkdir -p /proc /sys /dev /dev/pts /dev/shm /run /tmp /mnt
+mountpoint /proc || mount -t proc proc /proc || true
+mountpoint /sys || mount -t sysfs sysfs /sys || true
+mountpoint /dev || mount -t devtmpfs devtmpfs /dev || mount -t tmpfs devtmpfs /dev || true
+mkdir -p /dev/pts /dev/shm /run /tmp /mnt
+mountpoint /dev/pts || mount -t devpts devpts /dev/pts || true
+mountpoint /dev/shm || mount -t tmpfs tmpfs /dev/shm || true
+
+if [ -e /dev/hvc0 ]; then
+  exec </dev/hvc0 >/dev/hvc0 2>&1
+elif [ -e /dev/console ]; then
+  exec </dev/console >/dev/console 2>&1
+fi
+
+cmdline="$(cat /proc/cmdline 2>/dev/null || true)"
+cmd_arg() {
+  key="$1"
+  for token in $cmdline; do
+    case "$token" in
+      "$key="*) echo "${token#*=}"; return 0 ;;
+      "$key") echo "1"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+bundle_tag="$(cmd_arg chefer.bundle_tag || true)"
+data_tag="$(cmd_arg chefer.data_tag || true)"
+bundle_dir="$(cmd_arg chefer.bundle_dir || true)"
+data_dir="$(cmd_arg chefer.data_dir || true)"
+keep_rootfs="$(cmd_arg chefer.keep_rootfs || true)"
+
+[ -n "$bundle_tag" ] || fail "kernel cmdline 缺 chefer.bundle_tag" 125
+[ -n "$data_tag" ] || fail "kernel cmdline 缺 chefer.data_tag" 125
+[ -n "$bundle_dir" ] || fail "kernel cmdline 缺 chefer.bundle_dir" 125
+[ -n "$data_dir" ] || fail "kernel cmdline 缺 chefer.data_dir" 125
+
+mkdir -p "$bundle_dir" "$data_dir"
+log "掛載 bundle virtiofs tag=${bundle_tag} -> ${bundle_dir}"
+mount -t virtiofs -o ro "$bundle_tag" "$bundle_dir" \
+  || fail "無法掛載唯讀 bundle virtiofs（tag=${bundle_tag}）；請確認 QEMU/VZ 已提供共享目錄" 126
+log "掛載 data virtiofs tag=${data_tag} -> ${data_dir}"
+mount -t virtiofs "$data_tag" "$data_dir" \
+  || fail "無法掛載可寫 data virtiofs（tag=${data_tag}）；請確認 QEMU/VZ 已提供共享目錄" 126
+
+machine="$(uname -m)"
+case "$machine" in
+  x86_64) arch="x86_64" ;;
+  aarch64|arm64) arch="aarch64" ;;
+  *) fail "不支援的 guest 架構：${machine}" 125 ;;
+esac
+
+agent_src="${bundle_dir}/agents/guest-agent-${arch}"
+[ -f "$agent_src" ] || fail "bundle 缺 ${agent_src}；請以含 guest-agent-${arch} 的 kit 重新打包" 127
+
+mkdir -p /run/chefer
+cp "$agent_src" /run/chefer/guest-agent \
+  || fail "複製 guest-agent 到可執行暫存目錄失敗" 127
+chmod 0755 /run/chefer/guest-agent || true
+
+set +e
+if [ "$keep_rootfs" = "1" ]; then
+  /run/chefer/guest-agent run --bundle "$bundle_dir" --data "$data_dir" --cache "${data_dir}/.rootfs-cache-vm" --keep-rootfs
+else
+  /run/chefer/guest-agent run --bundle "$bundle_dir" --data "$data_dir" --cache "${data_dir}/.rootfs-cache-vm"
+fi
+code="$?"
+set -e
+
+log "guest-agent 結束，exit=${code}"
+echo "CHEFER_GUEST_EXIT=${code}"
+sync
+poweroff -f >/dev/null 2>&1 || halt -f >/dev/null 2>&1 || true
+while true; do sleep 3600; done

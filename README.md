@@ -17,7 +17,7 @@ you can "cook" your containerized application into a portable single-file app, m
 | Capability | Linux | Windows | macOS |
 |---|---|---|---|
 | `chefer build` (package for any platform, given a kit) | ✅ | ✅ | ✅ |
-| Run the single-file app (linux/amd64, linux/arm64 services) | ✅ rootless namespaces, no dependencies | ✅ WSL2 (a minimal Chefer-dedicated distro is created automatically on first run) | 🔜 planned (Virtualization.framework backend) |
+| Run the single-file app (linux/amd64, linux/arm64 services) | ✅ rootless namespaces, no dependencies | ✅ WSL2 (a minimal Chefer-dedicated distro is created automatically on first run) | 🔜 appliance/QEMU path in progress; VZ still needs real-Mac validation |
 | GUI services | ✅ X11 / Wayland socket passthrough | ✅ via WSLg (best-effort) | 🔜 |
 | windows/amd64 containers | ❌ | ❌ | ❌ |
 
@@ -50,7 +50,7 @@ you can "cook" your containerized application into a portable single-file app, m
 
 5. **Distribute** the file under `dist/<Name>/` — that's it. Users just download and run; no Docker, no installer.
 
-> `chefer build` needs a **runtime kit** (prebuilt `chefer-runtime-<target>` and `guest-agent-<arch>` binaries). Every package on the [latest GitHub Release](https://github.com/TimLai666/chefer/releases/latest) ships a complete `kit/` containing runtimes for all 6 targets plus both musl guest-agent architectures — download one package and you can package for every platform. Kit search order: `--kit-dir` > `CHEFER_KIT_DIR` > `<exe dir>/kit` > `<exe dir>`.
+> `chefer build` needs a **runtime kit** (prebuilt `chefer-runtime-<target>`, `guest-agent-<arch>`, and for macOS targets `chefer-vmlinuz-<arch>` / `chefer-initramfs-<arch>` appliance files). Every package on the [latest GitHub Release](https://github.com/TimLai666/chefer/releases/latest) ships a complete `kit/` containing runtimes for all 6 targets, both musl guest-agent architectures, and the macOS micro-VM appliance — download one package and you can package for every platform. Kit search order: `--kit-dir` > `CHEFER_KIT_DIR` > `<exe dir>/kit` > `<exe dir>`.
 
 ## CLI Commands
 
@@ -95,7 +95,7 @@ single executable ── user double-clicks ──> chefer-runtime
   └─ pick platform backend:
        Linux   → rootless namespaces (in-process)
        Windows → WSL2 (auto-provisioned minimal distro)
-       macOS   → planned
+       macOS   → Virtualization.framework micro-VM (appliance/QEMU verified first; real-Mac VZ validation pending)
             │
             ▼
        guest-agent: assemble rootfs from layers (whiteouts),
@@ -121,11 +121,20 @@ cargo build -p guest-agent --target x86_64-unknown-linux-musl --release
 
 The musl targets are already configured to link with `rust-lld` (see [.cargo/config.toml](.cargo/config.toml)), so they build on any host without a musl C toolchain. To use self-built binaries as a kit, place them in a directory as `chefer-runtime-<target-triple>[.exe]` and `guest-agent-<arch>` and pass it via `--kit-dir` (or `CHEFER_KIT_DIR`).
 
+To build and validate the macOS micro-VM appliance on Linux:
+
+```bash
+CHEFER_LINUX_REF=v6.6.32 bash scripts/build-appliance.sh --arch x86_64 --out dist/appliance
+CHEFER_LINUX_REF=v6.6.32 bash scripts/qemu-e2e.sh
+```
+
+`scripts/qemu-e2e.sh` boots the appliance with QEMU + virtiofs, runs a real Chefer bundle through the musl guest-agent, and verifies namespaces, persistence, fail-fast exit code propagation, and host≠guest TCP forwarding. The actual macOS Virtualization.framework backend still must be validated on a physical Mac; GitHub-hosted macOS runners cannot boot nested VZ guests.
+
 ## Known Limitations
 
 Honest list of what doesn't work (yet):
 
-- **macOS cannot run single-file apps yet.** Packaging on/for macOS works; the Virtualization.framework execution backend is planned for a later version.
+- **macOS VZ execution still needs physical-Mac validation.** Packaging on/for macOS can embed the Linux appliance; Linux+QEMU validates the guest path, but GitHub-hosted macOS runners cannot boot a Virtualization.framework guest.
 - **UDP port mappings do not work on Windows** — WSL2's localhost forwarding is TCP-only. TCP mappings (including host≠guest proxying) work.
 - **GUI support is best-effort**: Linux passes through X11/Wayland sockets; Windows relies on WSLg.
 - **Image source is `tar` only** (`docker save` or OCI archive; multi-arch archives auto-select by `platform`). `source: dockerfile` / `source: image` are not implemented yet.

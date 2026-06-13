@@ -151,7 +151,7 @@ bundle/
 - `MountSpec::parse("<host>:<guest>")`：從**右往左**切一次 `:`（相容 `C:\`）。
 - layout 輔助：`manifest_path(bundle_dir)`、`service_layers_dir(bundle_dir, svc)`、`agents_dir(bundle_dir)`、`guest_agent_name(arch)`、`platform_to_arch(platform)`、`layer_file_name(idx, diff_id)`。
 - `topo_sort(services) -> Result<Vec<&ServiceEntry>>`（depends_on 拓撲排序；偵測循環）。
-- `kit` 模組（**kit 探索統一在此**，pack/assembler/cli 共用）：`default_kit_dirs()`、`find_runtime(kit_dirs, target, allow_plain)`、`find_guest_agent(kit_dirs, arch)`、`runtime_file_name(target)`、`not_found_help(...)`。
+- `kit` 模組（**kit 探索統一在此**，pack/assembler/cli 共用）：`default_kit_dirs()`、`find_runtime(kit_dirs, target, allow_plain)`、`find_guest_agent(kit_dirs, arch)`、`find_appliance(kit_dirs, arch)`、`runtime_file_name(target)`、`not_found_help(...)`。
 
 ### appcipe-spec（lib）
 - 維持 `from_file/from_str`（內容=解析+驗證；**路徑正規化移到 normalize**。spec **不得**依賴 normalize——正式入口是 `appcipe_normalize::load`，CLI/pack 一律走那裡）。
@@ -175,7 +175,7 @@ bundle/
 - `pub fn load(path: &Path) -> anyhow::Result<AppCipe>`：讀檔 → 解析 → normalize → validate。CLI 與 pack 一律走這裡。
 
 ### chefer-pack（lib）
-- `pub struct PackOptions { pub out_dir: PathBuf, pub clean: bool, pub write_original_yml: bool, pub kit_dirs: Vec<PathBuf>, pub require_agents: bool, pub zstd_level: i32 }`
+- `pub struct PackOptions { pub out_dir: PathBuf, pub clean: bool, pub write_original_yml: bool, pub kit_dirs: Vec<PathBuf>, pub target_triples: Vec<String>, pub require_agents: bool, pub zstd_level: i32 }`
 - `pub struct PackResult { pub bundle_dir: PathBuf, pub manifest: chefer_bundle::Manifest }`
 - `pub fn pack(app: &AppCipe, opts: &PackOptions) -> anyhow::Result<PackResult>`
 - 行為：
@@ -188,6 +188,7 @@ bundle/
   4. 從 image config 抽出 `ImageConfig`（Entrypoint/Cmd/Env/WorkingDir/User/ExposedPorts）。
   5. 寫 manifest.json（用 chefer-bundle 型別）。
   6. 從 kit 複製 guest-agent 到 `agents/`（依 services 用到的 arch 去重；`require_agents=false` 時缺少僅警告）。
+  7. 若 `target_triples` 含 macOS target，從 kit best-effort 複製對應架構的 appliance 到 `vm/`；缺少 `chefer-vmlinuz-<arch>` 或 `chefer-initramfs-<arch>` 時只警告、不阻斷建置，產物在 macOS 執行時由 vz 後端回報明確不可用原因。
 - tar 讀取一律串流，不把整層讀進記憶體。
 
 ### chefer-assembler（lib + bin）
@@ -220,7 +221,7 @@ pub struct AppRunContext<'a> {
 }
 pub trait ExecBackend {
     fn name(&self) -> &'static str;
-    fn availability(&self) -> Availability;
+    fn availability(&self, ctx: &AppRunContext) -> Availability;
     fn run(&self, ctx: &AppRunContext) -> anyhow::Result<i32>; // app 整體 exit code
 }
 pub fn backends() -> Vec<Box<dyn ExecBackend>>;        // 依平台排序
@@ -234,14 +235,14 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
   3. 以 `wsl -d <distro> --user root --exec /bin/guest-agent run --bundle <wsl路徑> --data <wsl路徑> --cache /var/lib/chefer/cache` 執行；rootfs 快取一律放 distro 內 ext4（/mnt/c 的 drvfs 上 symlink/hardlink/權限不可靠且 I/O 慢）；Windows 路徑以純函式轉換（`C:\foo` → `/mnt/c/foo`；UNC/相對路徑報錯），不依賴 wslpath；stdio 直通；exit code 透傳。
   4. 注意命令注入：所有外部參數都走 argv 陣列（`std::process::Command` 個別 arg），絕不組 shell 字串。
   5. **網路（實測）**：WSL2 的 localhost 轉送（wslrelay）只綁 IPv6 `[::1]`；runtime 埠代理後端因此「先試 127.0.0.1、再退 [::1]」，且對 `host == guest` 的 TCP 埠在 Windows 上加 best-effort 的 IPv4 補橋（127.0.0.1:port → [::1]:port）。WSL 的 localhost 轉送不支援 UDP——Windows 上跨 WSL 的 UDP 埠映射目前無法生效（文件需註明限制）。
-- **macOS**（`vz`，Apple Virtualization.framework）：macOS 沒有現成 Linux，必須自行開一台輕量 Linux micro-VM 來跑容器。設計如下（**狀態：契約已定 + 跨平台純邏輯已實作並測試；實際 VZ 開機 shim 與 Linux appliance 待在實體 Mac / Linux+QEMU 上實作驗證**——在驗證通過前 `availability()` 維持 `Unavailable`，不偽稱可執行）。
+- **macOS**（`vz`，Apple Virtualization.framework）：macOS 沒有現成 Linux，必須自行開一台輕量 Linux micro-VM 來跑容器。設計如下（**狀態：契約已定 + 跨平台純邏輯已實作並測試；Linux appliance 建置與 QEMU E2E 已納入 scripts/CI；實際 VZ 開機 shim 待在實體 Mac 上實作驗證**——在 VZ 實機驗證通過前 `availability()` 維持 `Unavailable`，不偽稱可執行）。
   - **Appliance（kit 內附預編 kernel）**：kit 與 macOS 目標的 bundle 內附一份精簡 Linux 開機組合：
     - `vm/chefer-vmlinuz-<arch>`：預編 Linux kernel（含 virtio-blk/virtiofs/virtio-net/overlayfs）。
     - `vm/chefer-initramfs-<arch>`：最小 initramfs，其 `/init` 掛載 virtiofs 共享的 bundle 與 data 後，`exec` 內附的 guest-agent `run --bundle /mnt/bundle --data /mnt/data`。
     - arch 對應同 `layout::platform_to_arch`（x86_64 / aarch64）；Apple Silicon 上以 arm64 guest 為主。
-  - **VM 組態（VZVirtualMachineConfiguration）**：`VZLinuxBootLoader(kernelURL = vmlinuz, initialRamdiskURL = initramfs, commandLine = "console=hvc0 ...")`；CPU/記憶體取預設（CPU = min(host, 4)、RAM = 1–2GiB，可由 env 覆寫）；storage/share 用 `VZVirtioFileSystemDeviceConfiguration`（virtiofs）把 bundle（唯讀）與 data dir（讀寫）掛進 guest；`VZVirtioConsoleDeviceConfiguration` 接 guest 的 hvc0 做 stdio 直通與 exit code 回傳（guest-agent 的 exit code 經一個小協定或 console 尾標回報）。
+  - **VM 組態（VZVirtualMachineConfiguration）**：`VZLinuxBootLoader(kernelURL = vmlinuz, initialRamdiskURL = initramfs, commandLine = "console=hvc0 quiet ip=dhcp panic=-1 ...")`；CPU/記憶體取預設（CPU = min(host, 4)、RAM = 1–2GiB，可由 env 覆寫）；storage/share 用 `VZVirtioFileSystemDeviceConfiguration`（virtiofs）把 bundle（唯讀）與 data dir（讀寫）掛進 guest；`VZVirtioConsoleDeviceConfiguration` 接 guest 的 hvc0 做 stdio 直通與 exit code 回傳（initramfs 在 console 印出 `CHEFER_GUEST_EXIT=<code>` 後關機）。
   - **網路 / 埠映射**：`VZNATNetworkDeviceAttachment` 給 guest NAT IP；host→guest 不自動轉送，故 runtime 沿用既有埠代理（如同 WSL2），對 guest IP 做 TCP relay。UDP 視 VZ NAT 能力而定（先支援 TCP）。
-  - **純邏輯（跨平台可測，`vz.rs` 內）**：appliance 檔在 bundle 內的查找（`layout::vm_dir` / `kernel_name` / `initramfs_name`）、kernel command line 組裝、VM 資源（CPU/RAM）計算、guest 路徑映射、錯誤訊息——皆為純函式並有單元測試（在 Windows/Linux 上即可跑）。
+  - **純邏輯（跨平台可測，`vz_util.rs` 內）**：appliance 檔在 bundle 內的查找（`layout::vm_dir` / `kernel_name` / `initramfs_name`）、kernel command line 組裝、VM 資源（CPU/RAM）計算、guest 路徑映射、錯誤訊息——皆為純函式並有單元測試（在 Windows/Linux 上即可跑）。
   - **macOS 專屬層（`#[cfg(target_os = "macos")]`）**：以 objc2-virtualization 驅動上述組態並開機；此層只能在實體 Mac 驗證（GHA macOS runner 為巢狀虛擬化、開不了 VZ guest，僅能 compile-check）。
   - **Appliance 建置**：`vm/chefer-vmlinuz-*` 與 `vm/chefer-initramfs-*` 由獨立的 Linux 建置流程產生，並可在 **Linux + QEMU**（同樣 virtio 開機）上做 E2E 驗證，與 macOS 無關——這是讓 vz 後端可信的關鍵前置，且不需 Mac。
 
@@ -274,7 +275,7 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
     - 解壓到同目錄暫存資料夾；安全檢查每個 archive entry（拒絕絕對路徑、Windows 前綴、`..`、空路徑）。解壓後必須剛好得到 `chefer_<tag>_<target>/` 根目錄，內含 `chefer[.exe]` 與 `kit/chefer-runtime-*`、`kit/guest-agent-x86_64`、`kit/guest-agent-aarch64`。
     - 驗證完整後，先以 `self_replace` 替換目前執行中的 `chefer`，再以暫存 `kit/` 原子性（同檔案系統 rename）替換目前執行檔旁的 `kit/`；若任一步失敗，錯誤訊息需指出可手動解壓 release kit 覆蓋安裝目錄。
     - 傳輸層受 TLS 保護，且 `.sha256` 可偵測下載損毀；但**不驗證發佈產物簽章**。供應鏈強化（防 release/帳號層級妥協）的後續方向：啟用 self_update 的 `signatures` feature + 內嵌 maintainer 簽章公鑰，對 Release 資產以 zipsign 簽署。
-    - release workflow 在上傳前必須以 `scripts/verify-release-kit.sh` 驗證每個 kit 壓縮包與 `.sha256`：檔名安全、checksum 正確、唯一根目錄、host CLI、六個 runtime、兩個 guest-agent，且不含 symlink/special entry。workflow 先以 preflight 驗證 tag 存在於 `refs/tags/<tag>`、可 resolve 到 commit，且 tag 僅含 `A-Za-z0-9._-` 並以英數字開頭；`workflow_dispatch` dry-run 必須要求輸入既有 git tag，checkout 該 tag 後跑同一套六目標 build/package/verify，但只上傳 Actions artifacts、不掛到 GitHub Release；published release 則使用 release tag 並上傳 release assets。
+    - release workflow 在上傳前必須以 `scripts/verify-release-kit.sh` 驗證每個 kit 壓縮包與 `.sha256`：檔名安全、checksum 正確、唯一根目錄、host CLI、六個 runtime、兩個 guest-agent、兩個架構的 macOS appliance（kernel + initramfs），且不含 symlink/special entry。workflow 先以 preflight 驗證 tag 存在於 `refs/tags/<tag>`、可 resolve 到 commit，且 tag 僅含 `A-Za-z0-9._-` 並以英數字開頭；`workflow_dispatch` dry-run 必須要求輸入既有 git tag，checkout 該 tag 後跑同一套六目標 build/package/verify，但只上傳 Actions artifacts、不掛到 GitHub Release；published release 則使用 release tag 並上傳 release assets。
 - 錯誤輸出統一走 `anyhow` context；user-facing 摘要維持彩色表格。
 
 ## 7. 平台支援矩陣（v1 目標）
@@ -292,5 +293,6 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
 - 整合測試（Windows host 可跑）：合成映像 → pack → assemble（用實際編出的 chefer-runtime.exe）→ 執行 `--dump-footer`、驗證解壓與 manifest。
 - Linux 行為（namespaces、rootfs 組裝）在 CI ubuntu runner 上以整合測試驗證；本機可用 WSL2 輔助驗證。
 - 原生 Linux E2E 使用 `scripts/linux-e2e.sh`（GitHub Actions: `Native Linux E2E`，matrix: `ubuntu-latest`（amd64）與 `ubuntu-24.04-arm`（arm64））：在非 root、非 WSL 的 Linux host 上以 Docker 建立真實映像並 `docker save` 成 tar，接著建置 host 原生 gnu target 的 runtime（免 musl C 交叉工具鏈——散佈用的 musl 靜態單檔由 release.yml 經 cross 另建、CI 另有 musl 靜態檢查）、`chefer build --target <host-gnu>` 成單檔並實際執行；驗證服務在 rootless user/pid namespaces 內（container euid=0、pid=1、uid_map 映射到 host uid）、persist_path 重啟後仍保留、`crash: fail_fast` exit code 透傳、以及 host≠guest TCP 埠映射可由 host 連線。arm64 目標以同一腳本在 GitHub hosted `ubuntu-24.04-arm` runner 上實跑。
+- Linux appliance / QEMU E2E 使用 `scripts/build-appliance.sh` + `scripts/qemu-e2e.sh`（GitHub Actions: `appliance QEMU E2E`）：以指定的 Linux git tag/ref 產生 `chefer-vmlinuz-<arch>` 與 `chefer-initramfs-<arch>`，再用 QEMU + virtiofs 掛入真實 Chefer bundle/data，開機後由 initramfs 執行 bundle 內的 musl guest-agent；驗證 guest-agent 在 VM 內建立 namespaces（euid=0、pid=1、uid_map 證據）、persist_path 重啟保留、`fail_fast` exit code 透過 `CHEFER_GUEST_EXIT=<code>` 回傳，以及 host≠guest TCP forwarding 可由 host 連線。這條 E2E 不依賴 macOS，是啟用 VZ shim 前的可信前置。
 - Linux GUI E2E 由同一腳本在 `CHEFER_E2E_GUI=1` 時啟用：host 端啟動 Xvfb，容器映像內執行真 X11 程式（`xmessage`），`interface_mode: gui` 需正確 bind `/tmp/.X11-unix` 並傳遞 `DISPLAY`，host 端以 `xwininfo` 確認視窗存在；另以 headless Weston + `wayland-info` 驗證 Wayland socket 與 `XDG_RUNTIME_DIR`/`WAYLAND_DISPLAY` 傳遞。
 - Windows WSLg GUI E2E 使用 `scripts/windows-wslg-e2e.ps1`：在 Windows + WSL2 + WSLg + Docker Desktop 的互動桌面上建置真實 X11 GUI 映像，`docker save` 後打成 Windows 單檔，執行時由 WSL2 後端建立/重用 Chefer distro；script 以 Win32 top-level window enumeration 等待 `CheferWslgE2E` 視窗標題並要求程序正常結束，驗證 WSLg socket/env 與 Chefer GUI bind 實際可顯示。

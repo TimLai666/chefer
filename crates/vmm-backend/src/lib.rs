@@ -60,8 +60,8 @@ pub struct AppRunContext<'a> {
 pub trait ExecBackend {
     /// 後端名稱（"namespaces" / "wsl2" / "vz"）。
     fn name(&self) -> &'static str;
-    /// 檢查此後端於目前環境是否可用。
-    fn availability(&self) -> Availability;
+    /// 檢查此後端於目前環境與本次 bundle 是否可用。
+    fn availability(&self, ctx: &AppRunContext) -> Availability;
     /// 執行整個 app，回傳 app 整體 exit code。
     fn run(&self, ctx: &AppRunContext) -> Result<i32>;
 }
@@ -98,7 +98,7 @@ pub fn run_app(ctx: &AppRunContext) -> Result<i32> {
     }
     let mut reasons: Vec<String> = Vec::new();
     for backend in &list {
-        match backend.availability() {
+        match backend.availability(ctx) {
             Availability::Available => return backend.run(ctx),
             Availability::Unavailable(reason) => {
                 reasons.push(format!("  - {}：{}", backend.name(), reason));

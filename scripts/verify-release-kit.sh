@@ -131,6 +131,10 @@ required_kit_files=(
   "chefer-runtime-aarch64-apple-darwin"
   "guest-agent-x86_64"
   "guest-agent-aarch64"
+  "chefer-vmlinuz-x86_64"
+  "chefer-initramfs-x86_64"
+  "chefer-vmlinuz-aarch64"
+  "chefer-initramfs-aarch64"
 )
 
 for file in "${required_kit_files[@]}"; do

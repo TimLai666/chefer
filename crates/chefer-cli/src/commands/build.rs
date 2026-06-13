@@ -66,6 +66,7 @@ pub fn cmd_build(
         clean: true,
         write_original_yml: !opts.no_embed_original,
         kit_dirs: kit_dirs.clone(),
+        target_triples: targets.clone(),
         require_agents,
         zstd_level: opts.zstd_level,
     };
