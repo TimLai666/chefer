@@ -282,6 +282,12 @@ start_virtiofsd() {
   local shared_dir="$3"
   local log="$4"
   rm -f "$socket"
+  # --sandbox=none：不做 chroot（CI 環境非 root，無法 pivot_root）。
+  # virtiofsd 以非 root（runner uid）執行：guest 的 uid 0 檔案操作實際以 runner uid
+  # 落地到 host。guest-agent unshare(USER) 後映射 uid 0→runner_uid，virtiofs 仍把
+  # 請求的 uid 0 視為「virtiofsd 自身 uid」——因為非 root 的 virtiofsd 無法 setfsuid(0)，
+  # 所有寫入都以 runner uid 執行，與映射後的容器 uid 一致。
+  # 關鍵前提：host 端 shared_dir 必須由 runner uid 擁有且可寫（由呼叫端 mkdir -p 保證）。
   "$virtiofsd" \
     --socket-path="$socket" \
     --shared-dir="$shared_dir" \
