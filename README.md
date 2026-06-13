@@ -42,7 +42,7 @@ Writing an `appcipe.yml` by hand means knowing the field reference, the validati
 If you use an agentic coding tool (Claude Code, Codex, etc.), install the skill so your agent can author and validate recipes for you:
 
 ```bash
-npx skills add TimLai666/chefer
+npx skills add TimLai666/chefer/skills
 ```
 
 Then just ask your agent to "write an appcipe for these images" — it will follow the field reference, apply the validation rules, sidestep the known gotchas, and run `chefer check` for you.
