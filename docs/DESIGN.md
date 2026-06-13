@@ -44,6 +44,9 @@ bundle/
 ├─ agents/                        # （選）內嵌 guest-agent 靜態 musl 二進位
 │  ├─ guest-agent-x86_64          # 對應 linux/amd64
 │  └─ guest-agent-aarch64         # 對應 linux/arm64
+├─ vm/                            # （選）macOS 目標內嵌的 Linux micro-VM appliance
+│  ├─ chefer-vmlinuz-<arch>       # 預編 Linux kernel
+│  └─ chefer-initramfs-<arch>     # 最小 initramfs（/init 掛 virtiofs 後 exec guest-agent）
 └─ services/
    └─ <svc>/
       └─ layers/
@@ -54,6 +57,7 @@ bundle/
 
 - 層檔名：`{序號:04}-{diff_id去掉"sha256:"後取前12碼}.tar.zst`。
 - `agents/` 規則：建置 Windows / macOS 目標的單檔時**必須**內嵌對應 guest 架構的 agent（缺少時 build 報錯並說明如何取得 kit）；Linux 目標可省略（Linux 後端 in-process 執行）。
+- `vm/` 規則：建置 macOS 目標的單檔時內嵌 Linux appliance（kernel+initramfs）；appliance 尚未進入 kit 前，build 以警告略過（產物仍可組裝，僅 macOS 執行不可用），不阻斷建置。
 
 ## 3. manifest.json schema（chefer-bundle::Manifest）
 
@@ -230,7 +234,16 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
   3. 以 `wsl -d <distro> --user root --exec /bin/guest-agent run --bundle <wsl路徑> --data <wsl路徑> --cache /var/lib/chefer/cache` 執行；rootfs 快取一律放 distro 內 ext4（/mnt/c 的 drvfs 上 symlink/hardlink/權限不可靠且 I/O 慢）；Windows 路徑以純函式轉換（`C:\foo` → `/mnt/c/foo`；UNC/相對路徑報錯），不依賴 wslpath；stdio 直通；exit code 透傳。
   4. 注意命令注入：所有外部參數都走 argv 陣列（`std::process::Command` 個別 arg），絕不組 shell 字串。
   5. **網路（實測）**：WSL2 的 localhost 轉送（wslrelay）只綁 IPv6 `[::1]`；runtime 埠代理後端因此「先試 127.0.0.1、再退 [::1]」，且對 `host == guest` 的 TCP 埠在 Windows 上加 best-effort 的 IPv4 補橋（127.0.0.1:port → [::1]:port）。WSL 的 localhost 轉送不支援 UDP——Windows 上跨 WSL 的 UDP 埠映射目前無法生效（文件需註明限制）。
-- **macOS**（`vz`）：v1 骨架——`availability()` 檢查 OS 版本後仍回 `Unavailable("macOS 後端需要 guest kit（kernel+initrd），將於後續版本提供；目前請於 Linux 或 Windows 執行")`。程式碼結構保留 trait 實作位置。
+- **macOS**（`vz`，Apple Virtualization.framework）：macOS 沒有現成 Linux，必須自行開一台輕量 Linux micro-VM 來跑容器。設計如下（**狀態：契約已定 + 跨平台純邏輯已實作並測試；實際 VZ 開機 shim 與 Linux appliance 待在實體 Mac / Linux+QEMU 上實作驗證**——在驗證通過前 `availability()` 維持 `Unavailable`，不偽稱可執行）。
+  - **Appliance（kit 內附預編 kernel）**：kit 與 macOS 目標的 bundle 內附一份精簡 Linux 開機組合：
+    - `vm/chefer-vmlinuz-<arch>`：預編 Linux kernel（含 virtio-blk/virtiofs/virtio-net/overlayfs）。
+    - `vm/chefer-initramfs-<arch>`：最小 initramfs，其 `/init` 掛載 virtiofs 共享的 bundle 與 data 後，`exec` 內附的 guest-agent `run --bundle /mnt/bundle --data /mnt/data`。
+    - arch 對應同 `layout::platform_to_arch`（x86_64 / aarch64）；Apple Silicon 上以 arm64 guest 為主。
+  - **VM 組態（VZVirtualMachineConfiguration）**：`VZLinuxBootLoader(kernelURL = vmlinuz, initialRamdiskURL = initramfs, commandLine = "console=hvc0 ...")`；CPU/記憶體取預設（CPU = min(host, 4)、RAM = 1–2GiB，可由 env 覆寫）；storage/share 用 `VZVirtioFileSystemDeviceConfiguration`（virtiofs）把 bundle（唯讀）與 data dir（讀寫）掛進 guest；`VZVirtioConsoleDeviceConfiguration` 接 guest 的 hvc0 做 stdio 直通與 exit code 回傳（guest-agent 的 exit code 經一個小協定或 console 尾標回報）。
+  - **網路 / 埠映射**：`VZNATNetworkDeviceAttachment` 給 guest NAT IP；host→guest 不自動轉送，故 runtime 沿用既有埠代理（如同 WSL2），對 guest IP 做 TCP relay。UDP 視 VZ NAT 能力而定（先支援 TCP）。
+  - **純邏輯（跨平台可測，`vz.rs` 內）**：appliance 檔在 bundle 內的查找（`layout::vm_dir` / `kernel_name` / `initramfs_name`）、kernel command line 組裝、VM 資源（CPU/RAM）計算、guest 路徑映射、錯誤訊息——皆為純函式並有單元測試（在 Windows/Linux 上即可跑）。
+  - **macOS 專屬層（`#[cfg(target_os = "macos")]`）**：以 objc2-virtualization 驅動上述組態並開機；此層只能在實體 Mac 驗證（GHA macOS runner 為巢狀虛擬化、開不了 VZ guest，僅能 compile-check）。
+  - **Appliance 建置**：`vm/chefer-vmlinuz-*` 與 `vm/chefer-initramfs-*` 由獨立的 Linux 建置流程產生，並可在 **Linux + QEMU**（同樣 virtio 開機）上做 E2E 驗證，與 macOS 無關——這是讓 vz 後端可信的關鍵前置，且不需 Mac。
 
 ### guest-agent（lib + bin；Linux 專屬邏輯 cfg 隔離）
 - lib：`pub struct RunConfig { pub bundle_dir: PathBuf, pub data_dir: PathBuf, pub cache_dir: Option<PathBuf>, pub keep_rootfs: bool }`

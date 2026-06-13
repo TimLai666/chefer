@@ -52,6 +52,14 @@ pub fn find_guest_agent(kit_dirs: &[PathBuf], arch: &str) -> Option<PathBuf> {
     find_first(kit_dirs, &names)
 }
 
+/// 尋找 macOS micro-VM appliance（kernel + initramfs）；兩者皆存在才回傳。
+/// 供 chefer-pack 在打包 macOS 目標時內嵌進 bundle 的 `vm/`。
+pub fn find_appliance(kit_dirs: &[PathBuf], arch: &str) -> Option<(PathBuf, PathBuf)> {
+    let kernel = find_first(kit_dirs, &[crate::layout::kernel_name(arch)])?;
+    let initramfs = find_first(kit_dirs, &[crate::layout::initramfs_name(arch)])?;
+    Some((kernel, initramfs))
+}
+
 fn find_first<S: AsRef<str>>(dirs: &[PathBuf], names: &[S]) -> Option<PathBuf> {
     for d in dirs {
         for n in names {

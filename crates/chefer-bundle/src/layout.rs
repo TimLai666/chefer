@@ -27,6 +27,21 @@ pub fn guest_agent_name(arch: &str) -> String {
     format!("guest-agent-{arch}")
 }
 
+/// macOS micro-VM appliance（kernel + initramfs）目錄。
+pub fn vm_dir(bundle_dir: &Path) -> PathBuf {
+    bundle_dir.join("vm")
+}
+
+/// 預編 Linux kernel 的檔名（arch ∈ "x86_64", "aarch64"）。
+pub fn kernel_name(arch: &str) -> String {
+    format!("chefer-vmlinuz-{arch}")
+}
+
+/// 最小 initramfs 的檔名（arch ∈ "x86_64", "aarch64"）。
+pub fn initramfs_name(arch: &str) -> String {
+    format!("chefer-initramfs-{arch}")
+}
+
 /// 由 image platform 字串（如 "linux/amd64"）取得 guest 架構名。
 /// 回傳 None 表示非 Linux 平台（目前不支援執行）。
 pub fn platform_to_arch(platform: &str) -> Option<&'static str> {
@@ -59,5 +74,12 @@ mod tests {
         assert_eq!(platform_to_arch("linux/amd64"), Some("x86_64"));
         assert_eq!(platform_to_arch("linux/arm64"), Some("aarch64"));
         assert_eq!(platform_to_arch("windows/amd64"), None);
+    }
+
+    #[test]
+    fn appliance_names() {
+        assert_eq!(kernel_name("aarch64"), "chefer-vmlinuz-aarch64");
+        assert_eq!(initramfs_name("x86_64"), "chefer-initramfs-x86_64");
+        assert!(vm_dir(Path::new("/b")).ends_with("vm"));
     }
 }

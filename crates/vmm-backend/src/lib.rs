@@ -20,6 +20,11 @@ mod wsl2;
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod wsl_util;
 
+// macOS vz 後端的純函式（appliance 查找、VM 資源、kernel cmdline）；跨平台可測。
+// 非 macOS 平台僅供測試使用，允許 dead_code。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod vz_util;
+
 use anyhow::Result;
 
 /// 後端可用性檢查結果。
