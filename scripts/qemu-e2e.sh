@@ -225,15 +225,18 @@ wait_for_http() {
   local url="$1"
   local qemu_pid="$2"
   local log="$3"
-  for _ in $(seq 1 300); do
-    if curl -fsS --max-time 1 "$url" >/dev/null 2>&1; then
+  # TCG（無 KVM）下 guest-agent rootfs 組裝 + 服務啟動可能數分鐘；
+  # 600 × 0.5s = 300s，與 CHEFER_QEMU_TIMEOUT 預設 240s 的 VM 級 timeout 對齊
+  # （VM timeout 會先殺 QEMU，下面 kill -0 檢查會捕到並報錯）。
+  for _ in $(seq 1 600); do
+    if curl -fsS --max-time 2 "$url" >/dev/null 2>&1; then
       return 0
     fi
     if ! kill -0 "$qemu_pid" 2>/dev/null; then
       cat "$log" >&2 || true
       die "VM 在 ${url} 可連線前就已結束"
     fi
-    sleep 0.2
+    sleep 0.5
   done
   cat "$log" >&2 || true
   die "等待 ${url} 逾時"
@@ -339,7 +342,8 @@ start_qemu() {
   require_cmd "$qemu_bin"
   : >"$console_log"
   note "啟動 QEMU（${arch}, accel=${accel}）：${run_name}"
-  timeout --kill-after=10s "${CHEFER_QEMU_TIMEOUT:-240s}" "$qemu_bin" \
+  # TCG（無 KVM）下 guest-agent rootfs 組裝 + Python 容器啟動可能數分鐘
+  timeout --kill-after=10s "${CHEFER_QEMU_TIMEOUT:-480s}" "$qemu_bin" \
     -machine "$machine" \
     -cpu "$cpu" \
     -m 1536M \

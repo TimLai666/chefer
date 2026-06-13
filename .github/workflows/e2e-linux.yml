@@ -68,7 +68,7 @@ jobs:
   qemu-appliance-e2e:
     name: appliance QEMU E2E (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 120
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
