@@ -81,23 +81,18 @@ cp "$agent_src" /run/chefer/guest-agent \
   || fail "複製 guest-agent 到可執行暫存目錄失敗" 127
 chmod 0755 /run/chefer/guest-agent || true
 
-# virtiofs 掛載的 data 目錄在 host 端由非 root uid（runner）擁有；
-# virtiofsd 以該 uid 執行且無法 setfsuid(0)——guest-agent unshare(USER)
-# 映射 uid 0→runner_uid 後，透過 virtiofs 的寫入請求仍以 uid 0 發出，
-# 但 virtiofsd 回應時 host 端的 POSIX 權限可能不允許。
-# 解法：init 在 unshare 前（此時 VM 內的 uid 0 仍可透過 virtiofsd 操作）
-# 先建好快取根目錄並設為 world-writable，guest-agent 後續的所有子目錄建立
-# 繼承父目錄的寬鬆權限，避免 uid 映射後的 EPERM。
-cache_dir="${data_dir}/.rootfs-cache-vm"
-mkdir -p "$cache_dir" 2>/dev/null || true
-chmod 1777 "$data_dir" 2>/dev/null || true
-chmod 1777 "$cache_dir" 2>/dev/null || true
+# rootfs 快取不能放在 virtiofs（data 共享）上：非 root virtiofsd 無法
+# setfsuid，guest-agent unshare(USER) 後的 uid 映射會導致 EPERM。
+# 改用 VM 本地的 tmpfs（/tmp/chefer-rootfs-cache）組裝 rootfs；
+# persist 資料仍透過 virtiofs data 共享寫回 host。
+cache_dir="/tmp/chefer-rootfs-cache"
+mkdir -p "$cache_dir"
 
 set +e
 if [ "$keep_rootfs" = "1" ]; then
-  /run/chefer/guest-agent run --bundle "$bundle_dir" --data "$data_dir" --cache "${data_dir}/.rootfs-cache-vm" --keep-rootfs
+  /run/chefer/guest-agent run --bundle "$bundle_dir" --data "$data_dir" --cache "$cache_dir" --keep-rootfs
 else
-  /run/chefer/guest-agent run --bundle "$bundle_dir" --data "$data_dir" --cache "${data_dir}/.rootfs-cache-vm"
+  /run/chefer/guest-agent run --bundle "$bundle_dir" --data "$data_dir" --cache "$cache_dir"
 fi
 code="$?"
 set -e
