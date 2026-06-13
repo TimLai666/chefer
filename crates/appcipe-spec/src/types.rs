@@ -79,13 +79,15 @@ pub enum ImageSourceType {
     Image, // 直接拉現有 image
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ImageFormat {
     #[default]
+    #[serde(rename = "auto")]
     Auto,
+    // 標準（skopeo/containers）寫法為連字號；同時接受底線形式以相容。
+    #[serde(rename = "docker-archive", alias = "docker_archive")]
     DockerArchive,
+    #[serde(rename = "oci-archive", alias = "oci_archive")]
     OciArchive,
 }
 

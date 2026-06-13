@@ -639,6 +639,27 @@ services:
     }
 
     #[test]
+    fn accepts_image_format_hyphen_and_underscore() {
+        // 連字號（skopeo 慣用、文件與 E2E 腳本所用）與底線兩種都要能解析。
+        for fmt in [
+            "docker-archive",
+            "docker_archive",
+            "oci-archive",
+            "oci_archive",
+            "auto",
+        ] {
+            let app = parse_raw(&format!(
+                "version: \"0.1\"\nname: App\nservices:\n  db:\n    image:\n      source: tar\n      file: ./db.tar\n      format: {fmt}\n"
+            ));
+            assert!(
+                app.validate().is_ok(),
+                "format `{fmt}` 應可解析並通過：{:?}",
+                app.validate()
+            );
+        }
+    }
+
+    #[test]
     fn rejects_empty_image_file() {
         let e = validate_err(
             r#"
