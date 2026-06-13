@@ -4,7 +4,7 @@ For developers, **Docker** is a friendly and convenient way to package applicati
 However, for end users, asking them to install Docker, pull images, configure networks, and mount volumes just to run an app is simply unrealistic.
 
 **Chefer** was built to solve this pain point.
-It combines multiple **Docker images** in a **Docker Compose-like** way (which we call it "**AppCipe**"),
+It combines multiple **Docker images** in a **Docker Compose-like** way (which we call an "**AppCipe**"),
 then packages them into a **single standalone executable** that runs **without Docker or any container engine** — users just download and run.
 
 > Chefer turns container app delivery from **"Please install Docker"** into **"Just double-click and run."**
@@ -14,16 +14,42 @@ you can "cook" your containerized application into a portable single-file app, m
 
 ## Platform Support
 
+`chefer build` runs on all three host OSes and can cross-package for any of the six output targets given a kit. What follows is **how a packaged app behaves at run time**, per host OS, feature by feature. Status reflects the current state of the project — see [Known Limitations](#known-limitations) for the caveat behind every ⚠️.
+
 | Capability | Linux | Windows | macOS |
 |---|---|---|---|
-| `chefer build` (package for any platform, given a kit) | ✅ | ✅ | ✅ |
-| Run the single-file app (linux/amd64, linux/arm64 services) | ✅ rootless namespaces, no dependencies | ✅ WSL2 (a minimal Chefer-dedicated distro is created automatically on first run) | 🔜 appliance/QEMU path in progress; VZ still needs real-Mac validation |
-| GUI services | ✅ X11 / Wayland socket passthrough | ✅ via WSLg (best-effort) | 🔜 |
-| windows/amd64 containers | ❌ | ❌ | ❌ |
+| **Run the single-file app** | ✅ rootless user namespaces, zero dependencies | ✅ WSL2 — a minimal Chefer-dedicated distro is auto-provisioned on first run | 🔧 Virtualization.framework micro-VM; guest path validated on Linux+QEMU, real-Mac VZ boot pending |
+| **Backend** | `namespaces` (in-process guest-agent) | `wsl2` (bundle-embedded musl guest-agent) | `vz` (Linux appliance + musl guest-agent) |
+| **Multi-service apps** (`depends_on` topo start order) | ✅ | ✅ | 🔧 |
+| **Data persistence** (`persist_path` → host dir, survives restarts) | ✅ | ✅ verified | 🔧 |
+| **Internal networking** (services reach each other via `127.0.0.1:<port>`) | ✅ | ✅ | 🔧 |
+| **Host port mapping — TCP** (`"host:guest"`, host≠guest proxied) | ✅ | ✅ verified | 🔧 |
+| **Host port mapping — UDP** | ✅ | ❌ WSL2 localhost forwarding is TCP-only | 🔧 |
+| **GUI services** | ✅ X11 / Wayland socket passthrough | ✅ via WSLg (best-effort) | 🔧 |
+| **`crash: fail_fast`** (any non-zero exit tears down the app, code propagated) | ✅ | ✅ verified | 🔧 |
+| **Data-dir migration** (`old_names`) | ✅ | ✅ | 🔧 |
+| **Official chown/gosu images** (redis, postgres, …) | ✅ full uid-range mapping | ⚠️ WSL2 nested userns falls back to single-uid; images that `chown`/`gosu` to a service uid may fail | 🔧 |
+| **`windows/*` containers** | ❌ | ❌ | ❌ |
+
+Legend: ✅ implemented & exercised in CI / on a real machine · 🔧 implemented, guest path QEMU-verified, awaiting real-Apple-Silicon validation · ⚠️ works with a documented caveat · ❌ not supported.
+
+Linux containers only — `linux/amd64` and `linux/arm64`. `windows/*` images are rejected at validation on every host.
+
+## Skills — teach your AI agent to write AppCipes
+
+Writing an `appcipe.yml` by hand means knowing the field reference, the validation rules, and a handful of real-world gotchas (which images need full uid mapping, how internal networking actually works in v1, what `app_version` does and doesn't do). This repo ships an **agent skill** that packs all of that into one place: [`skills/write-appcipe`](skills/write-appcipe/SKILL.md).
+
+If you use an agentic coding tool (Claude Code, Codex, etc.), install the skill so your agent can author and validate recipes for you:
+
+```bash
+npx skills add TimLai666/chefer
+```
+
+Then just ask your agent to "write an appcipe for these images" — it will follow the field reference, apply the validation rules, sidestep the known gotchas, and run `chefer check` for you.
 
 ## Quick Start
 
-1. **Export your image(s) as tar** (both `docker save` and OCI archives are accepted; multi-arch archives are auto-resolved):
+1. **Export your image(s) as tar** (both `docker save` and OCI archives are accepted; multi-arch archives are auto-resolved by each service's `platform`):
 
    ```bash
    docker save -o images/app.tar myimage:latest
@@ -52,6 +78,16 @@ you can "cook" your containerized application into a portable single-file app, m
 
 > `chefer build` needs a **runtime kit** (prebuilt `chefer-runtime-<target>`, `guest-agent-<arch>`, and for macOS targets `chefer-vmlinuz-<arch>` / `chefer-initramfs-<arch>` appliance files). Every package on the [latest GitHub Release](https://github.com/TimLai666/chefer/releases/latest) ships a complete `kit/` containing runtimes for all 6 targets, both musl guest-agent architectures, and the macOS micro-VM appliance — download one package and you can package for every platform. Kit search order: `--kit-dir` > `CHEFER_KIT_DIR` > `<exe dir>/kit` > `<exe dir>`.
 
+## Demo — app + database in one file
+
+[examples/demo](examples/demo) is a minimal but complete two-service app: a Python HTTP service that increments a visit counter stored in **redis**, with the redis data persisted across restarts. It demonstrates internal networking (`app` reaches `db` over `127.0.0.1:6379`), opt-in persistence (`persist_path: /data`), and host port mapping (`18080:8080`) — all in one executable. Its [README](examples/demo/README.md) also documents honestly where v1's networking model stops short (services share one network namespace, so "db not exposed" is not yet true isolation — see [Known Limitations](#known-limitations)).
+
+```bash
+bash examples/demo/scripts/build-images.sh          # or .ps1 on Windows — needs Docker
+cargo run -p chefer-cli -- build examples/demo/appcipe.yml --out dist
+./dist/CheferDemo/CheferDemo_<target>                # then curl http://127.0.0.1:18080/
+```
+
 ## CLI Commands
 
 | Command | Description |
@@ -70,11 +106,12 @@ you can "cook" your containerized application into a portable single-file app, m
 
 A Docker Compose-flavored YAML. The essentials:
 
-- `version: "0.1"` (required), `name` (required; also the output file and data-folder name), `app_version`, `data_dir`, `old_names` (automatic data-dir migration), `crash: fail_fast`.
+- `version: "0.1"` (required), `name` (required; also the output file and data-folder name), `app_version` (display-only metadata — **not** injected into containers), `data_dir`, `old_names` (automatic data-dir migration), `crash: fail_fast`.
 - Each entry under `services:` has an `image` (a bare tar path, or the full `source`/`file`/`format`/`platform` form — currently `source: tar` only), plus optional `cmd`, `workdir`, `env`, `persist_path`, `ports` (`"host:guest[/proto]"`), `mounts` (`"<host_path>:<container_path>"`), `interface_mode` (`gui | terminal | both | none`) and `depends_on`.
 - Persistence is opt-in per service via `persist_path`; data lives on the host under `{data_dir or platform default}/data/{service}/` and survives restarts.
+- Inter-service networking is implicit: in v1 all services in an app share one network namespace, so a service reaches another at `127.0.0.1:<port>`. Only `ports:` entries get a host→guest proxy.
 
-See [examples/appcipe.yml](examples/appcipe.yml) for the fully-commented reference and [examples/appcipe_simple.yml](examples/appcipe_simple.yml) for the minimal one.
+See [examples/appcipe.yml](examples/appcipe.yml) for the fully-commented reference, [examples/appcipe_simple.yml](examples/appcipe_simple.yml) for the minimal one, and the [`write-appcipe` skill](skills/write-appcipe/SKILL.md) for the full field reference, validation rules, and gotchas.
 
 ## How It Works
 
@@ -134,11 +171,13 @@ CHEFER_LINUX_REF=v6.6.32 bash scripts/qemu-e2e.sh
 
 Honest list of what doesn't work (yet):
 
-- **macOS VZ execution still needs physical-Mac validation.** Packaging on/for macOS can embed the Linux appliance; Linux+QEMU validates the guest path, but GitHub-hosted macOS runners cannot boot a Virtualization.framework guest.
+- **macOS VZ execution still needs physical-Mac validation.** Packaging on/for macOS can embed the Linux appliance and the guest path is validated on Linux+QEMU, but GitHub-hosted macOS runners cannot boot a Virtualization.framework guest, so the actual VZ boot path is unverified on real hardware. The `vz` backend reports itself unavailable until then.
+- **No per-app network isolation in v1.** All services in an app share one network namespace, so a service with no `ports:` is still reachable from sibling services — and on Windows, WSL2's `wslrelay` auto-mirrors any in-VM loopback port to the Windows host, so a "db with no ports" is in practice still reachable from the host. Truly internal-only services need per-app netns isolation, a planned feature. See [examples/demo/README.md](examples/demo/README.md) for a measured demonstration.
 - **UDP port mappings do not work on Windows** — WSL2's localhost forwarding is TCP-only. TCP mappings (including host≠guest proxying) work.
+- **Official chown/gosu images on Windows:** in WSL2's nested user namespace Chefer falls back to a single-uid mapping, so images whose entrypoint `chown`s to / `gosu`s a dedicated service uid (e.g. official `redis`, `postgres`) may fail to start. On real Linux and the macOS VM the full uid/gid range is mapped, so those images work there. Workaround: use an image that runs as container root (the demo's `db` does exactly this).
 - **GUI support is best-effort**: Linux passes through X11/Wayland sockets; Windows relies on WSLg.
 - **Image source is `tar` only** (`docker save` or OCI archive; multi-arch archives auto-select by `platform`). `source: dockerfile` / `source: image` are not implemented yet.
-- **Linux containers only** (`linux/amd64`, `linux/arm64`); `windows/amd64` containers are rejected at validation.
+- **Linux containers only** (`linux/amd64`, `linux/arm64`); `windows/*` containers are rejected at validation.
 - `depends_on` controls **start order only** — there are no health checks in v1.
 - At most **one** service per app may use `interface_mode: terminal` or `both`; host ports must be unique across the whole app.
 - On Windows the runtime requires **WSL2** (`wsl --install` once, if not present).
