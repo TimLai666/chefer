@@ -283,16 +283,21 @@ start_virtiofsd() {
   local log="$4"
   rm -f "$socket"
   # --sandbox=none：不做 chroot（CI 環境非 root，無法 pivot_root）。
-  # virtiofsd 以非 root（runner uid）執行：guest 的 uid 0 檔案操作實際以 runner uid
-  # 落地到 host。guest-agent unshare(USER) 後映射 uid 0→runner_uid，virtiofs 仍把
-  # 請求的 uid 0 視為「virtiofsd 自身 uid」——因為非 root 的 virtiofsd 無法 setfsuid(0)，
-  # 所有寫入都以 runner uid 執行，與映射後的容器 uid 一致。
-  # 關鍵前提：host 端 shared_dir 必須由 runner uid 擁有且可寫（由呼叫端 mkdir -p 保證）。
+  # 關鍵：guest（VM 內 root，uid 0）對 virtiofs 的寫入會要求 virtiofsd setfsuid(0)，
+  # 但 virtiofsd 以非 root（runner uid）執行，無法切到 uid 0 → 寫入 EPERM
+  # （persist 資料寫回 host 即在此失敗）。用 --translate-uid/gid 把 guest uid/gid 0
+  # 雙向映射到 runner 自身的 uid/gid：guest root 的寫入改以 runner 身份落地，
+  # 而 runner 擁有 shared_dir，故可寫；反向讓 host 端 runner 擁有的檔案在 guest 內顯示為 root。
+  local huid hgid
+  huid="$(id -u)"
+  hgid="$(id -g)"
   "$virtiofsd" \
     --socket-path="$socket" \
     --shared-dir="$shared_dir" \
     --cache=never \
-    --sandbox=none >"$log" 2>&1 &
+    --sandbox=none \
+    --translate-uid "map:0:${huid}:1" \
+    --translate-gid "map:0:${hgid}:1" >"$log" 2>&1 &
   local pid=$!
   VIRTIOFSD_PIDS+=("$pid")
   wait_for_socket "$socket" "$log"
