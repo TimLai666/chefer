@@ -482,13 +482,35 @@ fn setup_and_exec(plan: &ChildPlan) -> Result<Infallible> {
         }
     }
 
-    // 6) pivot_root（put_old 用 rootfs 內暫目錄，detach 後刪除）
+    // 6) 切換根目錄：優先 pivot_root（隔離最完整）；若 / 是 initramfs rootfs，
+    //    kernel 會以 EINVAL 拒絕 pivot_root，此時退回 MS_MOVE + chroot
+    //    （macOS vz / QEMU appliance 從 initramfs 開機即屬此情形）。
     let put_old = root.join(".chefer-put-old");
     fs::create_dir_all(&put_old).context("建立 pivot_root 暫目錄失敗")?;
-    nix::unistd::pivot_root(root, &put_old).context("pivot_root 失敗")?;
-    nix::unistd::chdir("/").context("chdir(/) 失敗")?;
-    umount2("/.chefer-put-old", MntFlags::MNT_DETACH).context("卸載舊根失敗")?;
-    let _ = fs::remove_dir("/.chefer-put-old");
+    match nix::unistd::pivot_root(root, &put_old) {
+        Ok(()) => {
+            nix::unistd::chdir("/").context("chdir(/) 失敗")?;
+            umount2("/.chefer-put-old", MntFlags::MNT_DETACH).context("卸載舊根失敗")?;
+            let _ = fs::remove_dir("/.chefer-put-old");
+        }
+        Err(Errno::EINVAL) => {
+            // initramfs rootfs 無法 pivot_root。改用 switch_root 慣用法：
+            // chdir(新根) → MS_MOVE 把新根掛載移成 / → chroot(".")。
+            let _ = fs::remove_dir(&put_old); // 此路徑不需 put_old
+            nix::unistd::chdir(root).context("chdir(新根) 失敗")?;
+            mnt(
+                Some(Path::new(".")),
+                Path::new("/"),
+                None,
+                MsFlags::MS_MOVE,
+                None,
+            )
+            .context("MS_MOVE 新根到 / 失敗（pivot_root 退回路徑）")?;
+            nix::unistd::chroot(".").context("chroot(新根) 失敗")?;
+            nix::unistd::chdir("/").context("chdir(/) 失敗")?;
+        }
+        Err(e) => return Err(anyhow::anyhow!("pivot_root 失敗：{e}")),
+    }
 
     // 7) chdir 至工作目錄（workdir_override > image working_dir > /）
     nix::unistd::chdir(Path::new(&plan.workdir)).with_context(|| {
