@@ -1,6 +1,12 @@
 name: Release (build & attach kits)
 
 on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing git tag to build and verify without uploading to a GitHub Release
+        required: true
+        type: string
   release:
     types: [published]
 
@@ -15,9 +21,44 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  preflight:
+    name: validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      checkout_ref: ${{ steps.tag.outputs.checkout_ref }}
+      release_tag: ${{ steps.tag.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag
+        id: tag
+        shell: bash
+        env:
+          DISPATCH_TAG: ${{ inputs.release_tag }}
+          EVENT_TAG: ${{ github.ref_name }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            TAG="$DISPATCH_TAG"
+          else
+            TAG="$EVENT_TAG"
+          fi
+          if [[ ! "$TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || "$TAG" == "." || "$TAG" == ".." ]]; then
+            echo "::error::Release tag is not safe for asset filenames: $TAG"
+            exit 1
+          fi
+          if ! git rev-parse -q --verify "refs/tags/${TAG}^{commit}" >/dev/null; then
+            echo "::error::Release tag does not exist or does not resolve to a commit: $TAG"
+            exit 1
+          fi
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "checkout_ref=refs/tags/$TAG" >> "$GITHUB_OUTPUT"
+
   # ── 第一階段：各 target 編譯 chefer-cli / chefer-runtime（musl target 加 guest-agent）──
   build:
     name: build (${{ matrix.target }})
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:
@@ -31,6 +72,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.checkout_ref }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -82,7 +125,7 @@ jobs:
   # ── 第二階段：每個 host 平台組一份完整 kit（CLI + 全部 runtime + 兩架構 guest-agent）──
   package:
     name: package kit (${{ matrix.host_target }})
-    needs: build
+    needs: [preflight, build]
     strategy:
       fail-fast: false
       matrix:
@@ -95,6 +138,10 @@ jobs:
           - aarch64-apple-darwin
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.checkout_ref }}
+
       - uses: actions/download-artifact@v4
         with:
           path: all
@@ -104,9 +151,15 @@ jobs:
         shell: bash
         run: |
           HT="${{ matrix.host_target }}"
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${{ needs.preflight.outputs.release_tag }}"
           EXT=""
           [[ "$HT" == *windows* ]] && EXT=".exe"
+          case "$TAG" in
+            ""|*/*|*\\*|*:*)
+              echo "::error::Release tag is not safe for asset filenames: $TAG"
+              exit 1
+              ;;
+          esac
 
           PKG="chefer_${TAG}_${HT}"
           mkdir -p "out/$PKG/kit"
@@ -130,7 +183,24 @@ jobs:
           fi
           rm -rf "$PKG"
 
+      - name: Validate kit
+        shell: bash
+        run: bash scripts/verify-release-kit.sh out "${{ needs.preflight.outputs.release_tag }}" "${{ matrix.host_target }}"
+
+      - name: Upload dry-run artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-kit-${{ matrix.host_target }}
+          path: |
+            out/*.zip
+            out/*.zip.sha256
+            out/*.tar.gz
+            out/*.tar.gz.sha256
+          if-no-files-found: error
+
       - name: Upload to Release
+        if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}

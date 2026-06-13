@@ -1,0 +1,67 @@
+name: Native Linux E2E
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  native-linux-e2e:
+    name: docker save -> chefer build -> single-file run (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            runner: ubuntu-latest
+            rust_target: x86_64-unknown-linux-musl
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+            rust_target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Enable unprivileged user namespaces
+        shell: bash
+        run: |
+          if [[ -e /proc/sys/kernel/unprivileged_userns_clone ]]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          fi
+
+      - name: Install GUI E2E tools
+        run: sudo apt-get update && sudo apt-get install -y xvfb x11-utils weston wayland-utils
+
+      - name: Docker info
+        run: docker info
+
+      - name: Run native Linux E2E
+        shell: bash
+        env:
+          CHEFER_E2E_GUI: "1"
+          CHEFER_E2E_OUTPUT_TARGET: ${{ matrix.rust_target }}
+        run: bash scripts/linux-e2e.sh

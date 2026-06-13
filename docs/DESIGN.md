@@ -225,7 +225,7 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
 - **Linux**（`namespaces`）：可用性 = `/proc/self/ns/user` 存在且允許 unprivileged userns（讀 `/proc/sys/kernel/unprivileged_userns_clone` 若存在）。執行 = in-process 呼叫 `guest_agent::run_bundle`。
 - **Windows**（`wsl2`）：可用性 = `wsl.exe --status` 成功且支援 WSL2。執行：
   1. agent 二進位 = `bundle/agents/guest-agent-<arch>`（缺→明確錯誤）。
-  2. distro 名 = `chefer-rt-<agent sha256 前 8 碼>`；不存在時：產生最小 rootfs tar（標準 FHS 目錄 + `/bin/guest-agent` + `/etc/wsl.conf`（automount enabled + `options="metadata"`）+ `/etc/passwd` + **`/bin/mount`、`/bin/umount` → guest-agent 的 symlink**），`wsl --import <distro> %LOCALAPPDATA%\chefer\wsl\<distro> <tar> --version 2`。
+  2. distro 名 = `chefer-rt-<agent sha256 前 8 碼>`；不存在時：產生最小 rootfs tar（標準 FHS 目錄 + `/bin/guest-agent` + `/etc/wsl.conf`（automount enabled + `options="metadata"`）+ `/etc/passwd` + **`/bin/mount`、`/bin/umount` → guest-agent 的 symlink** + **`/tmp/.X11-unix` → `/mnt/wslg/.X11-unix` symlink**，讓 WSLg 存在時 X11 client 可找到 socket），`wsl --import <distro> %LOCALAPPDATA%\chefer\wsl\<distro> <tar> --version 2`。
      **重要（實測根因）**：WSL init 啟動 distro 時會執行 distro 內的 `/bin/mount` 來掛載 drvfs（呼叫形如 `mount -i -t 9p C:\ /mnt/c -o msize=65536,trans=fd,rfdno=5,wfdno=5,cache=mmap,noatime,aname=drvfs;...`，9p 連線經繼承的 fd）。缺 mount 時 automount 與 interop 全滅。guest-agent 以 busybox 風格 applet（argv[0] 派發，`applets.rs`）提供 mount/umount。
   3. 以 `wsl -d <distro> --user root --exec /bin/guest-agent run --bundle <wsl路徑> --data <wsl路徑> --cache /var/lib/chefer/cache` 執行；rootfs 快取一律放 distro 內 ext4（/mnt/c 的 drvfs 上 symlink/hardlink/權限不可靠且 I/O 慢）；Windows 路徑以純函式轉換（`C:\foo` → `/mnt/c/foo`；UNC/相對路徑報錯），不依賴 wslpath；stdio 直通；exit code 透傳。
   4. 注意命令注入：所有外部參數都走 argv 陣列（`std::process::Command` 個別 arg），絕不組 shell 字串。
@@ -242,7 +242,7 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
   - 解完寫 `.complete`。
 - 服務啟動（Linux）：
   - 依 `topo_sort` 順序啟動（v1：先後順序即依賴語意，無健康檢查；文件註明）。
-  - 每個服務：`unshare(user+mount+pid)`（uid/gid map 成 root）→ 掛 `/proc` → bind `/dev/{null,zero,random,urandom,tty}`、`/dev/pts`、`/dev/shm`(tmpfs) → bind persist（`<data_dir>/data/<svc>` ↔ persist_path，host 端先 `create_dir_all`）→ bind mounts（host 路徑不存在→啟動前報錯）→ interface_mode 含 gui 時 bind `/tmp/.X11-unix` 與 `$XDG_RUNTIME_DIR/wayland-*`（存在才掛）並傳遞 `DISPLAY`/`WAYLAND_DISPLAY` → `pivot_root` → `chdir(workdir)` → env 合併（§3）→ exec 有效命令。
+  - 每個服務：`unshare(user+mount+pid)`（uid/gid map 成 root）→ 掛 `/proc` → bind `/dev/{null,zero,random,urandom,tty}`、`/dev/pts`、`/dev/shm`(tmpfs) → bind persist（`<data_dir>/data/<svc>` ↔ persist_path，host 端先 `create_dir_all`）→ bind mounts（host 路徑不存在→啟動前報錯）→ interface_mode 含 gui 時 bind `/tmp/.X11-unix` 與 `$XDG_RUNTIME_DIR/wayland-*` socket（存在且為 socket 才掛；WSLg 內若未提供 `XDG_RUNTIME_DIR` 但 `/mnt/wslg/runtime-dir` 存在，則以該目錄作為 Wayland fallback）並傳遞 `DISPLAY`/`XDG_RUNTIME_DIR`/`WAYLAND_DISPLAY`（`WAYLAND_DISPLAY` 僅沿用實際已掛 socket，否則取排序後第一個）→ `pivot_root` → `chdir(workdir)` → env 合併（§3）→ exec 有效命令。
   - 網路：**不** unshare netns（共享網路 → ports 直接生效，WSL2 下由 localhost forwarding 對外）。
   - 監控：任一子行程結束且 exit ≠ 0 → 終止其餘全部（SIGTERM → 等 5s → SIGKILL）→ 回傳該 exit code（fail_fast）。全部正常結束 → 0。
   - `interface_mode=terminal/both`：該服務 stdio 直通（v1：所有服務 stdout/stderr 都加 `[svc]` 前綴轉發；terminal 服務 stdin 直通——僅允許一個服務宣告 terminal/both，多個→驗證期報錯）。
@@ -261,6 +261,7 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
     - 解壓到同目錄暫存資料夾；安全檢查每個 archive entry（拒絕絕對路徑、Windows 前綴、`..`、空路徑）。解壓後必須剛好得到 `chefer_<tag>_<target>/` 根目錄，內含 `chefer[.exe]` 與 `kit/chefer-runtime-*`、`kit/guest-agent-x86_64`、`kit/guest-agent-aarch64`。
     - 驗證完整後，先以 `self_replace` 替換目前執行中的 `chefer`，再以暫存 `kit/` 原子性（同檔案系統 rename）替換目前執行檔旁的 `kit/`；若任一步失敗，錯誤訊息需指出可手動解壓 release kit 覆蓋安裝目錄。
     - 傳輸層受 TLS 保護，且 `.sha256` 可偵測下載損毀；但**不驗證發佈產物簽章**。供應鏈強化（防 release/帳號層級妥協）的後續方向：啟用 self_update 的 `signatures` feature + 內嵌 maintainer 簽章公鑰，對 Release 資產以 zipsign 簽署。
+    - release workflow 在上傳前必須以 `scripts/verify-release-kit.sh` 驗證每個 kit 壓縮包與 `.sha256`：檔名安全、checksum 正確、唯一根目錄、host CLI、六個 runtime、兩個 guest-agent，且不含 symlink/special entry。workflow 先以 preflight 驗證 tag 存在於 `refs/tags/<tag>`、可 resolve 到 commit，且 tag 僅含 `A-Za-z0-9._-` 並以英數字開頭；`workflow_dispatch` dry-run 必須要求輸入既有 git tag，checkout 該 tag 後跑同一套六目標 build/package/verify，但只上傳 Actions artifacts、不掛到 GitHub Release；published release 則使用 release tag 並上傳 release assets。
 - 錯誤輸出統一走 `anyhow` context；user-facing 摘要維持彩色表格。
 
 ## 7. 平台支援矩陣（v1 目標）
@@ -277,3 +278,6 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
 - 各 crate 單元測試；關鍵：spec 驗證矩陣、PortSpec/MountSpec 解析、footer roundtrip、pack 對合成 docker-archive 與 oci-archive 的解析（測試程式內建構最小映像 tar，不依賴 Docker）、whiteout 邏輯（純函式部分跨平台可測）。
 - 整合測試（Windows host 可跑）：合成映像 → pack → assemble（用實際編出的 chefer-runtime.exe）→ 執行 `--dump-footer`、驗證解壓與 manifest。
 - Linux 行為（namespaces、rootfs 組裝）在 CI ubuntu runner 上以整合測試驗證；本機可用 WSL2 輔助驗證。
+- 原生 Linux E2E 使用 `scripts/linux-e2e.sh`（GitHub Actions: `Native Linux E2E`，matrix: `ubuntu-latest`/`x86_64-unknown-linux-musl` 與 `ubuntu-24.04-arm`/`aarch64-unknown-linux-musl`）：在非 root、非 WSL 的 Linux host 上以 Docker 建立真實映像並 `docker save` 成 tar，接著建置 Linux musl runtime、`chefer build --target <linux-musl>` 成 release-like 單檔並實際執行；驗證服務在 rootless user/pid namespaces 內（container euid=0、pid=1、uid_map 映射到 host uid）、persist_path 重啟後仍保留、`crash: fail_fast` exit code 透傳、以及 host≠guest TCP 埠映射可由 host 連線。arm64 目標以同一腳本在 GitHub hosted `ubuntu-24.04-arm` runner 上實跑。
+- Linux GUI E2E 由同一腳本在 `CHEFER_E2E_GUI=1` 時啟用：host 端啟動 Xvfb，容器映像內執行真 X11 程式（`xmessage`），`interface_mode: gui` 需正確 bind `/tmp/.X11-unix` 並傳遞 `DISPLAY`，host 端以 `xwininfo` 確認視窗存在；另以 headless Weston + `wayland-info` 驗證 Wayland socket 與 `XDG_RUNTIME_DIR`/`WAYLAND_DISPLAY` 傳遞。
+- Windows WSLg GUI E2E 使用 `scripts/windows-wslg-e2e.ps1`：在 Windows + WSL2 + WSLg + Docker Desktop 的互動桌面上建置真實 X11 GUI 映像，`docker save` 後打成 Windows 單檔，執行時由 WSL2 後端建立/重用 Chefer distro；script 以 Win32 top-level window enumeration 等待 `CheferWslgE2E` 視窗標題並要求程序正常結束，驗證 WSLg socket/env 與 Chefer GUI bind 實際可顯示。

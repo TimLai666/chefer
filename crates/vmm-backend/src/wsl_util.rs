@@ -105,6 +105,7 @@ pub fn build_min_rootfs_tar(agent_bytes: &[u8]) -> Result<Vec<u8>> {
     append_file(&mut builder, "bin/guest-agent", agent_bytes, 0o755)?;
     append_file(&mut builder, "etc/wsl.conf", WSL_CONF.as_bytes(), 0o644)?;
     append_file(&mut builder, "etc/passwd", ETC_PASSWD.as_bytes(), 0o644)?;
+    append_symlink(&mut builder, "tmp/.X11-unix", "/mnt/wslg/.X11-unix")?;
 
     // WSL init 啟動 distro 時會執行 distro 內的 /bin/mount 來掛載 drvfs（/mnt/c），
     // 缺少時 automount 與 interop 整個失效——以 symlink 指向 guest-agent，
@@ -295,6 +296,7 @@ mod tests {
         // WSL init 需要 distro 內的 mount/umount（automount 用）
         assert_eq!(symlinks["bin/mount"], "guest-agent");
         assert_eq!(symlinks["bin/umount"], "guest-agent");
+        assert_eq!(symlinks["tmp/.X11-unix"], "/mnt/wslg/.X11-unix");
 
         let (mode, content) = &files["bin/guest-agent"];
         assert_eq!(*mode, 0o755, "/bin/guest-agent 必須可執行");

@@ -15,7 +15,7 @@ use std::ffi::CString;
 use std::fs;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -201,7 +201,16 @@ fn build_plan(spec: &SpawnSpec) -> Result<ChildPlan> {
             let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
             env.entry("DISPLAY".to_string()).or_insert(display);
         }
+        let mut xdg_candidates = Vec::new();
         if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+            xdg_candidates.push(xdg);
+        }
+        let wslg_runtime = "/mnt/wslg/runtime-dir";
+        if Path::new(wslg_runtime).is_dir() && !xdg_candidates.iter().any(|xdg| xdg == wslg_runtime)
+        {
+            xdg_candidates.push(wslg_runtime.to_string());
+        }
+        for xdg in xdg_candidates {
             let xdg_dir = Path::new(&xdg);
             let mut wayland_names: Vec<String> = Vec::new();
             if let Ok(rd) = fs::read_dir(xdg_dir) {
@@ -209,6 +218,12 @@ fn build_plan(spec: &SpawnSpec) -> Result<ChildPlan> {
                     let name = e.file_name().to_string_lossy().into_owned();
                     // 只掛 socket 本體（wayland-0 等），略過 lock 檔
                     if name.starts_with("wayland-") && !name.ends_with(".lock") {
+                        let Ok(file_type) = e.file_type() else {
+                            continue;
+                        };
+                        if !file_type.is_socket() {
+                            continue;
+                        }
                         binds.push(BindEntry {
                             host: e.path(),
                             target: join_guest(spec.rootfs, &format!("{xdg}/{name}"))?,
@@ -223,9 +238,12 @@ fn build_plan(spec: &SpawnSpec) -> Result<ChildPlan> {
                 wayland_names.sort();
                 env.entry("XDG_RUNTIME_DIR".to_string())
                     .or_insert(xdg.clone());
-                let wd =
-                    std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| wayland_names[0].clone());
+                let wd = std::env::var("WAYLAND_DISPLAY")
+                    .ok()
+                    .filter(|name| wayland_names.iter().any(|candidate| candidate == name))
+                    .unwrap_or_else(|| wayland_names[0].clone());
                 env.entry("WAYLAND_DISPLAY".to_string()).or_insert(wd);
+                break;
             }
         }
     }
