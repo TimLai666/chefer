@@ -43,9 +43,13 @@ pub fn is_rootfs_complete(dir: &Path) -> bool {
     dir.is_dir() && dir.join(COMPLETE_MARKER).is_file()
 }
 
-/// tar entry 路徑的安全檢查與正規化。
+/// tar entry 路徑（rootfs 內容）的安全檢查與正規化。
 ///
-/// - 拒絕：絕對路徑、`..`、含 `\` 或 `:` 的成分（Windows 路徑/磁碟前綴）。
+/// 此處處理的是「容器 rootfs 內」的 Linux 檔案，落地到 Linux 檔案系統：
+/// - 拒絕：絕對路徑（以 `/` 開頭）、含 `..` 的成分（路徑穿越）。
+/// - **允許** `:` 與 `\`：在 Linux 上兩者都是合法檔名字元，且 Debian/Ubuntu 的
+///   dpkg multiarch 中繼資料大量使用 `:`（如 `var/lib/dpkg/info/gcc-12-base:arm64.list`）。
+///   （tar 規格僅以 `/` 為路徑分隔，故 `\` 必為字面檔名，不得當成分隔。）
 /// - `Ok(None)` 表示路徑正規化後為空（如 `"./"`），呼叫端應跳過該 entry。
 pub fn sanitize_rel_path(entry_path: &str) -> Result<Option<PathBuf>> {
     if entry_path.starts_with('/') {
@@ -59,12 +63,6 @@ pub fn sanitize_rel_path(entry_path: &str) -> Result<Option<PathBuf>> {
         }
         if comp == ".." {
             bail!("tar entry 含上層目錄參照（..），已拒絕：{entry_path}");
-        }
-        if comp.contains('\\') {
-            bail!("tar entry 含反斜線（疑似 Windows 路徑），已拒絕：{entry_path}");
-        }
-        if comp.contains(':') {
-            bail!("tar entry 含 `:`（疑似 Windows 磁碟前綴），已拒絕：{entry_path}");
         }
         out.push(comp);
         depth += 1;
@@ -321,7 +319,8 @@ mod linux {
         for entry in archive.entries().context("讀取 tar entry 失敗")? {
             let mut entry = entry.context("讀取 tar entry 失敗")?;
             let path_buf = entry.path().context("tar entry 路徑無法解析")?.into_owned();
-            let path_str = path_buf.to_string_lossy().replace('\\', "/");
+            // tar 規格僅以 `/` 為分隔，不可把 `\` 當分隔（`\` 是合法 Linux 檔名字元）。
+            let path_str = path_buf.to_string_lossy().into_owned();
 
             // whiteout：不落地，只對既有內容動作
             if let Some(action) = parse_whiteout(&path_str) {
@@ -470,7 +469,7 @@ mod linux {
                     .link_name()
                     .context("讀取 hardlink 目標失敗")?
                     .ok_or_else(|| anyhow::anyhow!("hardlink entry 缺少目標：{path_str}"))?;
-                let target_str = target.to_string_lossy().replace('\\', "/");
+                let target_str = target.to_string_lossy();
                 let target_str = target_str.strip_prefix('/').unwrap_or(&target_str);
                 let Some(target_rel) = sanitize_rel_path(target_str)? else {
                     bail!("hardlink 目標無效：{path_str} → {target_str}");
@@ -582,8 +581,30 @@ mod tests {
         assert!(sanitize_rel_path("/etc/passwd").is_err(), "絕對路徑");
         assert!(sanitize_rel_path("a/../../b").is_err(), "上層參照");
         assert!(sanitize_rel_path("..").is_err(), "純上層參照");
-        assert!(sanitize_rel_path("C:/windows").is_err(), "磁碟前綴");
-        assert!(sanitize_rel_path(r"a\b/c").is_err(), "反斜線");
+    }
+
+    /// `:` 與 `\` 在 Linux 是合法檔名字元，rootfs 層解壓必須接受
+    /// （Debian/Ubuntu 的 dpkg multiarch 中繼資料大量使用 `:`）。
+    #[test]
+    fn sanitize_accepts_linux_colon_and_backslash() {
+        // Debian multiarch：gcc-12-base:arm64.list
+        let p = sanitize_rel_path("var/lib/dpkg/info/gcc-12-base:arm64.list")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            p,
+            PathBuf::from("var")
+                .join("lib")
+                .join("dpkg")
+                .join("info")
+                .join("gcc-12-base:arm64.list")
+        );
+        // `C:` 視為字面檔名（非磁碟前綴）——它只是 rootfs 內某個叫 `C:` 的目錄
+        let p = sanitize_rel_path("C:/windows").unwrap().unwrap();
+        assert_eq!(p, PathBuf::from("C:").join("windows"));
+        // 反斜線為字面檔名字元，整段成分保留
+        let p = sanitize_rel_path(r"a\b/c").unwrap().unwrap();
+        assert_eq!(p, PathBuf::from(r"a\b").join("c"));
     }
 }
 
