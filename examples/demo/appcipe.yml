@@ -1,0 +1,30 @@
+# Chefer demo：應用 + 資料庫，示範內部網路、資料持久化、db 不對外暴露。
+#
+# 打包前先用 scripts/build-images.sh（或 .ps1）產生 images/app.tar 與 images/db.tar，
+# 再 `chefer build examples/demo/appcipe.yml`。
+version: "0.1"
+name: CheferDemo
+app_version: "1.0.0"
+
+services:
+  # 資料庫：redis，AOF 持久化到 /data。
+  # 沒有 ports → chefer 不會建立 host→guest 代理。app 透過共享網路的
+  # localhost:6379 連到它（內部網路）。
+  # 注意（v1 已知缺口）：服務共享同一 network namespace，且 WSL2 會自動把
+  # loopback 埠鏡射到 Windows，故 6379 目前仍可從 host 連到——真正的「內部專用」
+  # 需逐 app netns 隔離。詳見 README.md。
+  db:
+    image: ./images/db.tar         # 自建 alpine+redis（CMD 已含 redis-server 參數）
+    persist_path: /data            # redis 的 AOF 落在此，App 重啟後資料保留
+    interface_mode: none
+
+  # 應用：HTTP 服務，連 db 做計數。只有它對外開埠（18080 → 容器內 8080）。
+  app:
+    image: ./images/app.tar
+    env:
+      REDIS_HOST: "127.0.0.1"      # 內部網路：與 db 共享網路 namespace
+      REDIS_PORT: "6379"
+      PORT: "8080"
+    ports: ["18080:8080"]          # 唯一對外暴露的埠
+    interface_mode: none
+    depends_on: [db]               # 先啟動 db（app 啟動時仍會重試連線）

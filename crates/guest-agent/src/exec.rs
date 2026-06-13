@@ -375,8 +375,31 @@ fn middle_child(
     }
 }
 
-/// 在新 user namespace 內把目前 uid/gid 映射為 0（須先 deny setgroups）。
+/// 子 user namespace 可映射的 uid/gid 範圍大小（特權路徑）。
+/// 涵蓋容器內常見的服務專用 uid（redis 999、postgres 999、www-data 33…）。
+const ID_MAP_RANGE: u32 = 65536;
+
+/// 在新 user namespace 內設定 uid/gid 映射。
+///
+/// 兩條路徑：
+/// - **特權（uid==0，即 WSL2 / VM 內以 root 執行）**：映射完整範圍
+///   `0 0 65536`（identity），並 **allow** setgroups。如此容器內的
+///   `chown`/`gosu`/`setuid` 到服務專用 uid（redis 999、postgres 999…）
+///   才能成功——大量真實映像的 entrypoint 都會這麼做。寫多行/跨 uid 映射
+///   需要 parent ns 的 CAP_SETUID/CAP_SETGID，root 具備。
+/// - **非特權（原生 Linux rootless 的一般使用者）**：只能映射呼叫者自身的
+///   單一 uid（`0 <uid> 1`），且須先 **deny** setgroups。會 chown 到其他
+///   uid 的映像在此情境受限（未來可用 newuidmap + /etc/subuid 擴充）。
 fn write_id_maps(uid: u32, gid: u32) -> Result<()> {
+    // 以 root 執行時先嘗試「特權範圍映射」；成功則回。失敗（例如 WSL2 把 distro
+    // root 放在巢狀 userns，對範圍缺 CAP_SETUID 而回 EPERM）則退回單一 uid 映射。
+    // uid_map 只能成功寫入一次；失敗的寫入不消耗該次，故可安全退回重試。
+    if uid == 0 && gid == 0 && try_privileged_range_map().is_ok() {
+        return Ok(());
+    }
+
+    // 單一 uid 映射（原生 Linux rootless，或上面範圍映射失敗的退回路徑）。
+    // 寫單行 gid_map 前必須 deny setgroups。
     match fs::write("/proc/self/setgroups", "deny") {
         Ok(()) => {}
         // 舊核心（< 3.19）沒有此檔案 → 可直接寫 gid_map
@@ -387,6 +410,21 @@ fn write_id_maps(uid: u32, gid: u32) -> Result<()> {
         .context("寫入 /proc/self/uid_map 失敗")?;
     fs::write("/proc/self/gid_map", format!("0 {gid} 1"))
         .context("寫入 /proc/self/gid_map 失敗")?;
+    Ok(())
+}
+
+/// 嘗試特權範圍映射 `0 0 65536`（identity）並 allow setgroups，
+/// 讓容器內 chown/gosu 到服務專用 uid 能成功（真實映像常見）。
+/// 任一步失敗即回 Err，由呼叫端退回單一 uid 映射。
+fn try_privileged_range_map() -> Result<()> {
+    // setgroups=allow 須在 gid_map 之前；NotFound（舊核心）視為可接受。
+    match fs::write("/proc/self/setgroups", "allow") {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(anyhow::anyhow!("setgroups=allow 失敗：{e}")),
+    }
+    fs::write("/proc/self/uid_map", format!("0 0 {ID_MAP_RANGE}")).context("uid_map 範圍")?;
+    fs::write("/proc/self/gid_map", format!("0 0 {ID_MAP_RANGE}")).context("gid_map 範圍")?;
     Ok(())
 }
 
