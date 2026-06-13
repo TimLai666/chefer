@@ -36,7 +36,13 @@ enum Cmd {
         /// 服務結束後保留已組裝的 rootfs（供下次啟動重用）
         #[arg(long)]
         keep_rootfs: bool,
+        /// VM 後端（wsl2/vz）專用：在 VM 內補起 UDP 埠的 eth0→loopback 橋接
+        /// （因 wslrelay/VZ NAT 不轉 UDP）。原生 Linux 後端不應設定此旗標。
+        #[arg(long)]
+        udp_bridge: bool,
     },
+    /// 印出本機（VM）對外的主要 IPv4，供 host 端後端建立 UDP relay 用；無則非 0 退出
+    Vmip,
     /// 只組裝單一服務的 rootfs 到指定目錄（除錯用）
     AssembleRootfs {
         /// bundle 目錄（內含 manifest.json）
@@ -65,12 +71,14 @@ fn main() -> ExitCode {
             data,
             cache,
             keep_rootfs,
+            udp_bridge,
         } => {
             let cfg = guest_agent::RunConfig {
                 bundle_dir: bundle,
                 data_dir: data,
                 cache_dir: cache,
                 keep_rootfs,
+                udp_bridge,
             };
             match guest_agent::run_bundle(&cfg) {
                 // exit code 透傳（clamp 至 u8 範圍；>255 取低位元組慣例）
@@ -81,6 +89,16 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Cmd::Vmip => match guest_agent::udp_bridge::detect_primary_ipv4() {
+            Some(ip) => {
+                println!("{ip}");
+                ExitCode::SUCCESS
+            }
+            None => {
+                eprintln!("guest-agent vmip：找不到對外 IPv4（只有 loopback？）");
+                ExitCode::from(1)
+            }
+        },
         Cmd::AssembleRootfs {
             bundle,
             service,

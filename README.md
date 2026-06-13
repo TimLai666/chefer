@@ -24,7 +24,7 @@ you can "cook" your containerized application into a portable single-file app, m
 | **Data persistence** (`persist_path` → host dir, survives restarts) | ✅ | ✅ verified | 🔧 |
 | **Internal networking** (services reach each other via `127.0.0.1:<port>`) | ✅ | ✅ | 🔧 |
 | **Host port mapping — TCP** (`"host:guest"`, host≠guest proxied) | ✅ | ✅ verified | 🔧 |
-| **Host port mapping — UDP** | ✅ | ❌ WSL2 localhost forwarding is TCP-only | 🔧 |
+| **Host port mapping — UDP** | ✅ | ✅ verified — Chefer relays via the VM IP + an in-VM eth0→loopback bridge (WSL2's own forwarding is TCP-only) | 🔧 |
 | **GUI services** | ✅ X11 / Wayland socket passthrough | ✅ via WSLg (best-effort) | 🔧 |
 | **`crash: fail_fast`** (any non-zero exit tears down the app, code propagated) | ✅ | ✅ verified | 🔧 |
 | **Data-dir migration** (`old_names`) | ✅ | ✅ | 🔧 |
@@ -173,7 +173,7 @@ Honest list of what doesn't work (yet):
 
 - **macOS VZ execution still needs physical-Mac validation.** Packaging on/for macOS can embed the Linux appliance and the guest path is validated on Linux+QEMU, but GitHub-hosted macOS runners cannot boot a Virtualization.framework guest, so the actual VZ boot path is unverified on real hardware. The `vz` backend reports itself unavailable until then.
 - **No per-app network isolation in v1.** All services in an app share one network namespace, so a service with no `ports:` is still reachable from sibling services — and on Windows, WSL2's `wslrelay` auto-mirrors any in-VM loopback port to the Windows host, so a "db with no ports" is in practice still reachable from the host. Truly internal-only services need per-app netns isolation, a planned feature. See [examples/demo/README.md](examples/demo/README.md) for a measured demonstration.
-- **UDP port mappings do not work on Windows** — WSL2's localhost forwarding is TCP-only. TCP mappings (including host≠guest proxying) work.
+- **UDP on Windows uses a Chefer-managed relay (works; minor caveat).** WSL2's own localhost forwarding is TCP-only, so Chefer forwards UDP to the VM's IP and runs an in-VM `eth0→loopback` bridge so even loopback-bound UDP services are reachable. The bridge binds after a short grace so services that bind `0.0.0.0` win the port (and are hit directly); a UDP service that binds `0.0.0.0` *slower* than that grace could rarely lose the port to the bridge — a clear, retryable bind error if it happens.
 - **Official chown/gosu images on Windows:** in WSL2's nested user namespace Chefer falls back to a single-uid mapping, so images whose entrypoint `chown`s to / `gosu`s a dedicated service uid (e.g. official `redis`, `postgres`) may fail to start. On real Linux and the macOS VM the full uid/gid range is mapped, so those images work there. Workaround: use an image that runs as container root (the demo's `db` does exactly this).
 - **GUI support is best-effort**: Linux passes through X11/Wayland sockets; Windows relies on WSLg.
 - **Image source is `tar` only** (`docker save` or OCI archive; multi-arch archives auto-select by `platform`). `source: dockerfile` / `source: image` are not implemented yet.

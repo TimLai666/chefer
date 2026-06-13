@@ -10,6 +10,7 @@
 
 pub mod applets;
 pub mod rootfs;
+pub mod udp_bridge;
 pub mod whiteout;
 
 #[cfg(target_os = "linux")]
@@ -32,6 +33,10 @@ pub struct RunConfig {
     pub cache_dir: Option<PathBuf>,
     /// 服務結束後是否保留已組裝的 rootfs（供下次啟動重用）。
     pub keep_rootfs: bool,
+    /// VM 後端（wsl2/vz）專用：在 VM 內補起 UDP 埠的 `<vm_ip>:guest → 127.0.0.1:guest`
+    /// 橋接（因 wslrelay/VZ NAT 不轉 UDP）。原生 Linux namespaces 後端必須為 false
+    /// ——共享 netns 下直接以 loopback 生效，且綁 LAN IP 會把服務暴露到區網。
+    pub udp_bridge: bool,
 }
 
 /// 讀取 bundle 內的 manifest.json（含可行動的錯誤訊息）。
@@ -84,6 +89,12 @@ mod linux_impl {
         let order = chefer_bundle::topo_sort(&manifest.services)?;
 
         validate_services(&order)?;
+
+        // VM 後端：在 VM 內補起 UDP 埠橋接（背景執行緒，等服務先綁好埠的寬限期）。
+        // 原生 Linux（udp_bridge=false）共享 netns，不需也不應綁 LAN IP。
+        if cfg.udp_bridge {
+            crate::udp_bridge::start_vm_udp_bridges(&manifest);
+        }
 
         // 組裝（或重用快取的）各服務 rootfs
         let cache_root = cfg
@@ -191,6 +202,7 @@ mod tests {
             data_dir: PathBuf::from("y"),
             cache_dir: None,
             keep_rootfs: false,
+            udp_bridge: false,
         };
         let err = run_bundle(&cfg).unwrap_err();
         assert!(format!("{err}").contains("僅能於 Linux"));

@@ -4,18 +4,22 @@
 //!   後端依序嘗試 127.0.0.1 與 [::1]——Windows 上 WSL2 的 localhost 轉送
 //!   （wslrelay）實測只綁 IPv6 [::1]，只連 v4 會失敗。
 //! - UDP：雙 socket relay；記住最後一個 client 來源位址做回程。
-//!   （注意：WSL2 的 localhost 轉送不支援 UDP；Windows 上跨 WSL 的 UDP
-//!   映射目前無法生效，僅 Linux 後端可用。）
+//!   僅 Linux（共享 netns，可直送 127.0.0.1:guest）在此啟動。
+//!   Windows 因 WSL2 的 wslrelay 不轉 UDP，改由 wsl2 後端取得 VM IP 後自行
+//!   relay 到 `<vm_ip>:guest`（見 vmm-backend/wsl2.rs），故此處在 Windows 略過 UDP
+//!   ——若在此也綁 127.0.0.1:host，會與後端的 relay 搶占同一 host 埠。
 //! - host == guest：Linux 上不代理（共享網路，埠直接生效）；Windows 上
 //!   另起 best-effort 的 IPv4 補橋（127.0.0.1:port → [::1]:port），
 //!   讓只認 127.0.0.1 的 Windows 程式也能連到 WSL 內的服務；
 //!   此補橋 bind 失敗只警告不致命（wslrelay 可能已綁 v4）。
 //! - 代理 threads 為 daemon 性質：不 join，隨主程式結束而消滅。
 
-use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+#[cfg(not(windows))]
+use std::net::UdpSocket;
+use std::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+#[cfg(not(windows))]
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use chefer_bundle::{Manifest, PortProto};
@@ -52,7 +56,15 @@ pub fn start_port_proxies(manifest: &Manifest) -> Result<()> {
             }
             let result = match spec.proto {
                 PortProto::Tcp => start_tcp_proxy(spec.host, spec.guest),
+                #[cfg(not(windows))]
                 PortProto::Udp => start_udp_proxy(spec.host, spec.guest),
+                #[cfg(windows)]
+                PortProto::Udp => {
+                    // Windows：UDP 由 wsl2 後端取得 VM IP 後自行 relay（wslrelay 不轉 UDP），
+                    // 此處不綁，避免與後端搶占 127.0.0.1:host；continue 以免誤印「已啟動」。
+                    tracing::debug!("UDP 埠 {spec} 交由 wsl2 後端轉發（wslrelay 不轉 UDP）");
+                    continue;
+                }
             };
             match result {
                 Ok(()) => {
@@ -158,6 +170,7 @@ fn relay_tcp(client: TcpStream, backends: &[SocketAddr]) -> Result<()> {
 
 // ── UDP ────────────────────────────────────────────────────────────
 
+#[cfg(not(windows))]
 fn start_udp_proxy(host: u16, guest: u16) -> Result<()> {
     let host_sock = UdpSocket::bind(("127.0.0.1", host))
         .with_context(|| format!("bind 127.0.0.1:{host}/udp 失敗"))?;
@@ -166,6 +179,7 @@ fn start_udp_proxy(host: u16, guest: u16) -> Result<()> {
 
 /// 雙 socket UDP relay：host_sock 收 client 封包轉給 guest；
 /// guest 回應送回「最後一個」client 來源（簡化版，足敷單一 client 情境）。
+#[cfg(not(windows))]
 pub(crate) fn spawn_udp_proxy(host_sock: UdpSocket, guest: u16) -> Result<()> {
     let guest_sock = UdpSocket::bind(("127.0.0.1", 0)).context("建立 UDP relay socket 失敗")?;
     guest_sock
@@ -192,7 +206,7 @@ pub(crate) fn spawn_udp_proxy(host_sock: UdpSocket, guest: u16) -> Result<()> {
                     Err(err) => {
                         tracing::debug!("UDP 代理（host 端）接收失敗：{err}");
                         // 避免錯誤時熱迴圈空轉
-                        thread::sleep(Duration::from_millis(50));
+                        thread::sleep(std::time::Duration::from_millis(50));
                     }
                 }
             }
@@ -224,6 +238,7 @@ pub(crate) fn spawn_udp_proxy(host_sock: UdpSocket, guest: u16) -> Result<()> {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+    use std::time::Duration;
 
     #[test]
     fn tcp_proxy_relays_data() {
@@ -297,6 +312,7 @@ mod tests {
         assert_eq!(&buf, msg);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn udp_proxy_relays_data_with_return_path() {
         // UDP echo server 於 OS 隨機埠 G

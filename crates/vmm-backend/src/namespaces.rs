@@ -52,6 +52,9 @@ impl ExecBackend for NamespacesBackend {
             data_dir: ctx.data_dir.to_path_buf(),
             cache_dir: None,
             keep_rootfs: ctx.opts.keep_tmp,
+            // 原生 Linux 共享 netns：UDP 埠以 loopback 直接生效，不啟用 VM 內橋接
+            // （啟用會綁 eth0/LAN IP，等同把服務暴露到區網）。
+            udp_bridge: false,
         })
     }
 }

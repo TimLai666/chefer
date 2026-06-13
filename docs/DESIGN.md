@@ -206,7 +206,11 @@ bundle/
   - macOS: `~/Library/Application Support/{name}`
   - Linux: `$XDG_DATA_HOME/{name}` 或 `~/.local/share/{name}`
 - old_names 遷移：新目錄不存在時，依序找同層舊名目錄，第一個存在者 rename 為新名。
-- 埠代理：對每個 `host != guest` 的 PortSpec 啟一條 thread：TCP `listen 127.0.0.1:host → connect 127.0.0.1:guest` 雙向轉送；UDP 簡單 relay（記住最後來源）。`host == guest` 不代理。
+- 埠代理：
+  - **TCP**：對每個 `host != guest` 的 PortSpec 啟一條 thread：`listen 127.0.0.1:host → connect 127.0.0.1:guest` 雙向轉送（後端候選先 127.0.0.1 後 [::1]）。`host == guest` 在 Linux 不代理（共享 netns）、在 Windows 加 best-effort IPv4 補橋。
+  - **UDP**：採 per-client session table relay（每個來源位址各開一條 upstream socket 並各起回程 thread；非「只記最後來源」）。
+    - Linux：`listen 127.0.0.1:host → 127.0.0.1:guest`（共享 netns）。
+    - Windows（wsl2）/ macOS（vz）：因 WSL2 的 `wslrelay` 不轉 UDP（VZ NAT 同理不自動轉送），改由後端取得 VM 的對外 IPv4，host 端 relay `127.0.0.1:host → <vm_ip>:guest`（含 `host == guest`，UDP 在 Windows 不會自然生效，故一律 relay）；VM 內由 guest-agent 起 `<vm_ip>:guest → 127.0.0.1:guest` 的橋接，補上「服務只綁 loopback」的情形（服務綁 0.0.0.0 時直接命中 `<vm_ip>:guest`，橋接以 EADDRINUSE 略過）。此 UDP 的 host 端 relay 因需 VM IP，**由 wsl2/vz 後端啟動**，不在 runtime 的跨平台 `start_port_proxies`（後者在 Windows 略過 UDP）。
 - Ctrl-C / SIGTERM：終止後端與子行程、清 temp、以 130 退出。
 
 ### vmm-backend（改為 lib）
@@ -234,22 +238,23 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
      **重要（實測根因）**：WSL init 啟動 distro 時會執行 distro 內的 `/bin/mount` 來掛載 drvfs（呼叫形如 `mount -i -t 9p C:\ /mnt/c -o msize=65536,trans=fd,rfdno=5,wfdno=5,cache=mmap,noatime,aname=drvfs;...`，9p 連線經繼承的 fd）。缺 mount 時 automount 與 interop 全滅。guest-agent 以 busybox 風格 applet（argv[0] 派發，`applets.rs`）提供 mount/umount。
   3. 以 `wsl -d <distro> --user root --exec /bin/guest-agent run --bundle <wsl路徑> --data <wsl路徑> --cache /var/lib/chefer/cache` 執行；rootfs 快取一律放 distro 內 ext4（/mnt/c 的 drvfs 上 symlink/hardlink/權限不可靠且 I/O 慢）；Windows 路徑以純函式轉換（`C:\foo` → `/mnt/c/foo`；UNC/相對路徑報錯），不依賴 wslpath；stdio 直通；exit code 透傳。
   4. 注意命令注入：所有外部參數都走 argv 陣列（`std::process::Command` 個別 arg），絕不組 shell 字串。
-  5. **網路（實測）**：WSL2 的 localhost 轉送（wslrelay）只綁 IPv6 `[::1]`；runtime 埠代理後端因此「先試 127.0.0.1、再退 [::1]」，且對 `host == guest` 的 TCP 埠在 Windows 上加 best-effort 的 IPv4 補橋（127.0.0.1:port → [::1]:port）。WSL 的 localhost 轉送不支援 UDP——Windows 上跨 WSL 的 UDP 埠映射目前無法生效（文件需註明限制）。
+  5. **網路（實測）**：WSL2 的 localhost 轉送（wslrelay）只綁 IPv6 `[::1]`；runtime TCP 埠代理後端因此「先試 127.0.0.1、再退 [::1]」，且對 `host == guest` 的 TCP 埠在 Windows 上加 best-effort 的 IPv4 補橋（127.0.0.1:port → [::1]:port）。
+  6. **UDP 埠映射（已解決，實測）**：wslrelay 不轉 UDP，故 wsl2 後端在啟動 guest-agent 前先以 `wsl -d <distro> --exec /bin/guest-agent vmip` 取得 VM eth0 的 IPv4，對每個 UDP PortSpec（含 `host == guest`）於 host 端起 `127.0.0.1:host → <vm_ip>:guest` 的 session relay；並以 `--udp-bridge` 旗標叫 guest-agent 在 VM 內補起 `<vm_ip>:guest → 127.0.0.1:guest` 橋接（涵蓋服務只綁 loopback 的情形；服務綁 0.0.0.0 則直接命中、橋接以 EADDRINUSE 略過）。VM IP 每次啟動現查（NAT 模式下會變）。已知殘留：服務若綁 0.0.0.0 且 bind 時機晚於 VM 內橋接（橋接已設寬限期降低機率），可能與橋接搶埠——屬罕見且會以明確 bind 錯誤呈現、可重試。
 - **macOS**（`vz`，Apple Virtualization.framework）：macOS 沒有現成 Linux，必須自行開一台輕量 Linux micro-VM 來跑容器。設計如下（**狀態：契約已定 + 跨平台純邏輯已實作並測試；Linux appliance 建置與 QEMU E2E 已納入 scripts/CI；實際 VZ 開機 shim 待在實體 Mac 上實作驗證**——在 VZ 實機驗證通過前 `availability()` 維持 `Unavailable`，不偽稱可執行）。
   - **Appliance（kit 內附預編 kernel）**：kit 與 macOS 目標的 bundle 內附一份精簡 Linux 開機組合：
     - `vm/chefer-vmlinuz-<arch>`：預編 Linux kernel（含 virtio-blk/virtiofs/virtio-net/overlayfs）。
     - `vm/chefer-initramfs-<arch>`：最小 initramfs，其 `/init` 掛載 virtiofs 共享的 bundle 與 data 後，`exec` 內附的 guest-agent `run --bundle /mnt/bundle --data /mnt/data`。
     - arch 對應同 `layout::platform_to_arch`（x86_64 / aarch64）；Apple Silicon 上以 arm64 guest 為主。
   - **VM 組態（VZVirtualMachineConfiguration）**：`VZLinuxBootLoader(kernelURL = vmlinuz, initialRamdiskURL = initramfs, commandLine = "console=hvc0 quiet ip=dhcp panic=-1 ...")`；CPU/記憶體取預設（CPU = min(host, 4)、RAM = 1–2GiB，可由 env 覆寫）；storage/share 用 `VZVirtioFileSystemDeviceConfiguration`（virtiofs）把 bundle（唯讀）與 data dir（讀寫）掛進 guest；`VZVirtioConsoleDeviceConfiguration` 接 guest 的 hvc0 做 stdio 直通與 exit code 回傳（initramfs 在 console 印出 `CHEFER_GUEST_EXIT=<code>` 後關機）。
-  - **網路 / 埠映射**：`VZNATNetworkDeviceAttachment` 給 guest NAT IP；host→guest 不自動轉送，故 runtime 沿用既有埠代理（如同 WSL2），對 guest IP 做 TCP relay。UDP 視 VZ NAT 能力而定（先支援 TCP）。
+  - **網路 / 埠映射**：`VZNATNetworkDeviceAttachment` 給 guest NAT IP；host→guest 不自動轉送，故 runtime 沿用既有埠代理（如同 WSL2），對 guest IP 做 TCP relay。UDP 沿用與 wsl2 相同機制：vz 後端取得 guest IP 後於 host 端 relay `127.0.0.1:host → <guest_ip>:guest`，並以 `--udp-bridge` 叫 guest-agent 在 VM 內補橋（appliance init 已帶此旗標，guest 側就緒；**macOS host 端 relay 與 vz 開機 shim 同屬待實機驗證項**）。
   - **純邏輯（跨平台可測，`vz_util.rs` 內）**：appliance 檔在 bundle 內的查找（`layout::vm_dir` / `kernel_name` / `initramfs_name`）、kernel command line 組裝、VM 資源（CPU/RAM）計算、guest 路徑映射、錯誤訊息——皆為純函式並有單元測試（在 Windows/Linux 上即可跑）。
   - **macOS 專屬層（`#[cfg(target_os = "macos")]`）**：以 objc2-virtualization 驅動上述組態並開機；此層只能在實體 Mac 驗證（GHA macOS runner 為巢狀虛擬化、開不了 VZ guest，僅能 compile-check）。
   - **Appliance 建置**：`vm/chefer-vmlinuz-*` 與 `vm/chefer-initramfs-*` 由獨立的 Linux 建置流程產生，並可在 **Linux + QEMU**（同樣 virtio 開機）上做 E2E 驗證，與 macOS 無關——這是讓 vz 後端可信的關鍵前置，且不需 Mac。
 
 ### guest-agent（lib + bin；Linux 專屬邏輯 cfg 隔離）
-- lib：`pub struct RunConfig { pub bundle_dir: PathBuf, pub data_dir: PathBuf, pub cache_dir: Option<PathBuf>, pub keep_rootfs: bool }`
-  `pub fn run_bundle(cfg: &RunConfig) -> anyhow::Result<i32>`（非 Linux 回傳明確錯誤）。
-- bin：`guest-agent run --bundle <dir> --data <dir> [--cache <dir>] [--keep-rootfs]`；另提供 `guest-agent assemble-rootfs`（除錯）。
+- lib：`pub struct RunConfig { pub bundle_dir: PathBuf, pub data_dir: PathBuf, pub cache_dir: Option<PathBuf>, pub keep_rootfs: bool, pub udp_bridge: bool }`
+  `pub fn run_bundle(cfg: &RunConfig) -> anyhow::Result<i32>`（非 Linux 回傳明確錯誤）。`udp_bridge=true`（VM 後端：wsl2/vz）時，於啟動服務前 spawn 一條寬限執行緒在 VM 內補起 `<vm_ip>:guest → 127.0.0.1:guest` 的 UDP 橋接（見埠代理節）；namespaces 後端傳 false（原生 Linux 直接共享 netns，不得綁 LAN IP）。
+- bin：`guest-agent run --bundle <dir> --data <dir> [--cache <dir>] [--keep-rootfs] [--udp-bridge]`；`guest-agent vmip`（印出 VM 對外 IPv4，供後端查詢，無則非 0 退出）；另提供 `guest-agent assemble-rootfs`（除錯）。
 - rootfs 組裝：
   - 目的地：`cache_dir`（預設 `<data_dir>/.rootfs-cache`）`/<svc>-<chain_hash12>/`，chain_hash = sha256(diff_id 以 `\n` 串接)。已存在且含 `.complete` 標記 → 直接重用。
   - 依序解每層 zstd tar：**whiteout 處理**——`.wh.<name>` → 刪除對應項；`.wh..wh..opq` → 清空該目錄既有內容；其餘正常解（保留 symlink/hardlink/權限；路徑安全檢查同 §0）。
@@ -257,7 +262,7 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
 - 服務啟動（Linux）：
   - 依 `topo_sort` 順序啟動（v1：先後順序即依賴語意，無健康檢查；文件註明）。
   - 每個服務：`unshare(user+mount+pid)`（uid/gid map 成 root）→ 掛 `/proc` → bind `/dev/{null,zero,random,urandom,tty}`、`/dev/pts`、`/dev/shm`(tmpfs) → bind persist（`<data_dir>/data/<svc>` ↔ persist_path，host 端先 `create_dir_all`）→ bind mounts（host 路徑不存在→啟動前報錯）→ interface_mode 含 gui 時 bind `/tmp/.X11-unix` 與 `$XDG_RUNTIME_DIR/wayland-*` socket（存在且為 socket 才掛；WSLg 內若未提供 `XDG_RUNTIME_DIR` 但 `/mnt/wslg/runtime-dir` 存在，則以該目錄作為 Wayland fallback）並傳遞 `DISPLAY`/`XDG_RUNTIME_DIR`/`WAYLAND_DISPLAY`（`WAYLAND_DISPLAY` 僅沿用實際已掛 socket，否則取排序後第一個）→ `pivot_root` → `chdir(workdir)` → env 合併（§3）→ exec 有效命令。
-  - 網路：**不** unshare netns（共享網路 → ports 直接生效，WSL2 下由 localhost forwarding 對外）。
+  - 網路：**不** unshare netns（共享網路 → ports 直接生效，WSL2 下 TCP 由 localhost forwarding 對外、UDP 由 `--udp-bridge` 起的 VM 內橋接 + host 端 relay 對外）。
   - 監控：任一子行程結束且 exit ≠ 0 → 終止其餘全部（SIGTERM → 等 5s → SIGKILL）→ 回傳該 exit code（fail_fast）。全部正常結束 → 0。
   - `interface_mode=terminal/both`：該服務 stdio 直通（v1：所有服務 stdout/stderr 都加 `[svc]` 前綴轉發；terminal 服務 stdin 直通——僅允許一個服務宣告 terminal/both，多個→驗證期報錯）。
 - musl 靜態建置：`cargo build -p guest-agent --target x86_64-unknown-linux-musl --release` 必須可行（避免依賴需要 cc 的 crate；zstd 解壓用純 Rust 的 ruzstd）。musl 目標的 linker 統一為 rust-lld（`.cargo/config.toml` 已設定，跨 host 一致）。

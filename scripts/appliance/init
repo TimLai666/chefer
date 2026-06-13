@@ -88,11 +88,13 @@ chmod 0755 /run/chefer/guest-agent || true
 cache_dir="/tmp/chefer-rootfs-cache"
 mkdir -p "$cache_dir"
 
+# --udp-bridge：VM 內補起 UDP 埠的 eth0→loopback 橋接（無 UDP 埠時為 no-op）。
+# host 端（macOS vz）的 UDP relay 待實機實作；guest 側先就緒。
 set +e
 if [ "$keep_rootfs" = "1" ]; then
-  /run/chefer/guest-agent run --bundle "$bundle_dir" --data "$data_dir" --cache "$cache_dir" --keep-rootfs
+  /run/chefer/guest-agent run --bundle "$bundle_dir" --data "$data_dir" --cache "$cache_dir" --udp-bridge --keep-rootfs
 else
-  /run/chefer/guest-agent run --bundle "$bundle_dir" --data "$data_dir" --cache "$cache_dir"
+  /run/chefer/guest-agent run --bundle "$bundle_dir" --data "$data_dir" --cache "$cache_dir" --udp-bridge
 fi
 code="$?"
 set -e

@@ -4,10 +4,12 @@
 //! 安全注意：所有 wsl.exe 呼叫一律以 `std::process::Command` 傳遞個別參數
 //! （argv 陣列），絕不組 shell 字串；並設 `WSL_UTF8=1` 讓輸出為 UTF-8。
 
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use chefer_bundle::PortProto;
 
 use crate::wsl_util::{
     DISTRO_PREFIX, agent_distro_name, build_min_rootfs_tar, decode_wsl_output, windows_path_to_wsl,
@@ -74,7 +76,17 @@ impl ExecBackend for Wsl2Backend {
         let data_wsl = to_wsl_path(ctx.data_dir)
             .with_context(|| format!("轉換資料目錄路徑失敗：{}", ctx.data_dir.display()))?;
 
-        // e. 在 distro 內執行 guest-agent；stdio 直通，exit code 透傳。
+        // e. UDP 埠：wslrelay 不轉 UDP，故在啟動 guest-agent 前先取 VM eth0 的 IPv4，
+        //    對每個 UDP PortSpec 於 host 端起 `127.0.0.1:host → <vm_ip>:guest` relay
+        //    （含 host == guest——UDP 在 Windows 不會自然生效，一律 relay）。
+        //    VM 內側的 `<vm_ip>:guest → 127.0.0.1:guest` 橋接由下方 --udp-bridge 觸發。
+        let udp_specs = udp_port_specs(ctx.manifest);
+        if !udp_specs.is_empty() {
+            let vm_ip = query_vm_ipv4(&distro)?;
+            start_host_udp_relays(vm_ip, &udp_specs)?;
+        }
+
+        // f. 在 distro 內執行 guest-agent；stdio 直通，exit code 透傳。
         //    rootfs 快取一律放 distro 內的 ext4（/var/lib/chefer/cache）：
         //    /mnt/c（drvfs）上 symlink/hardlink/權限不可靠且 I/O 慢，
         //    不能在那裡組 rootfs。
@@ -91,7 +103,9 @@ impl ExecBackend for Wsl2Backend {
             .arg("--data")
             .arg(&data_wsl)
             .arg("--cache")
-            .arg("/var/lib/chefer/cache");
+            .arg("/var/lib/chefer/cache")
+            // VM 內補起 UDP 埠的 eth0→loopback 橋接（無 UDP 埠時於 guest 內為 no-op）
+            .arg("--udp-bridge");
         if ctx.opts.keep_tmp {
             cmd.arg("--keep-rootfs");
         }
@@ -100,6 +114,75 @@ impl ExecBackend for Wsl2Backend {
             .with_context(|| format!("在 WSL distro `{distro}` 內啟動 guest-agent 失敗"))?;
         Ok(status.code().unwrap_or(1))
     }
+}
+
+/// 蒐集 manifest 中所有 UDP PortSpec 的 `(host, guest)`（含 host == guest）。
+fn udp_port_specs(manifest: &chefer_bundle::Manifest) -> Vec<(u16, u16)> {
+    manifest
+        .services
+        .iter()
+        .flat_map(|s| &s.ports)
+        .filter(|p| p.proto == PortProto::Udp)
+        .map(|p| (p.host, p.guest))
+        .collect()
+}
+
+/// 以 `wsl -d <distro> --user root --exec /bin/guest-agent vmip` 取得 VM eth0 的 IPv4。
+/// 此呼叫會順帶啟動 distro；輸出為單行 IP 字串。
+fn query_vm_ipv4(distro: &str) -> Result<Ipv4Addr> {
+    let out = wsl_command()
+        .arg("-d")
+        .arg(distro)
+        .arg("--user")
+        .arg("root")
+        .arg("--exec")
+        .arg("/bin/guest-agent")
+        .arg("vmip")
+        .output()
+        .with_context(|| format!("在 WSL distro `{distro}` 內查詢 VM IP 失敗"))?;
+    if !out.status.success() {
+        bail!(
+            "guest-agent vmip 失敗（exit {}）：{}；無法為 UDP 埠建立轉發",
+            out.status.code().unwrap_or(-1),
+            first_line(
+                &decode_wsl_output(&out.stderr),
+                &decode_wsl_output(&out.stdout)
+            ),
+        );
+    }
+    let text = decode_wsl_output(&out.stdout);
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    line.parse::<Ipv4Addr>().with_context(|| {
+        format!("無法解析 guest-agent vmip 的輸出為 IPv4：{line:?}（distro `{distro}`）")
+    })
+}
+
+/// 對每個 UDP `(host, guest)` 於 host 端 bind `127.0.0.1:host`，relay 至 `<vm_ip>:guest`。
+/// 任一 host 埠 bind 失敗（通常已被占用）即整體報錯（與 TCP 埠代理一致的 fail-fast）。
+fn start_host_udp_relays(vm_ip: Ipv4Addr, specs: &[(u16, u16)]) -> Result<()> {
+    let mut failures: Vec<String> = Vec::new();
+    for &(host, guest) in specs {
+        match UdpSocket::bind((Ipv4Addr::LOCALHOST, host)) {
+            Ok(sock) => {
+                let target = SocketAddr::from((vm_ip, guest));
+                guest_agent::udp_bridge::spawn_udp_relay(sock, target);
+                eprintln!("[chefer] UDP 埠轉發：127.0.0.1:{host} → {vm_ip}:{guest}");
+            }
+            Err(e) => failures.push(format!("  - {host}/udp：bind 127.0.0.1:{host} 失敗：{e}")),
+        }
+    }
+    if !failures.is_empty() {
+        bail!(
+            "以下 host UDP 埠無法啟動轉發（埠可能已被其他程式占用；\
+             請關閉占用的程式，或調整 appcipe.yml 的 ports 後重新打包）：\n{}",
+            failures.join("\n")
+        );
+    }
+    Ok(())
 }
 
 /// 建立帶 `WSL_UTF8=1` 的 wsl.exe 命令（個別 arg，不組 shell 字串）。
