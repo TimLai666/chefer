@@ -131,7 +131,7 @@ jobs:
             cp "target/$T/release/guest-agent" "stage/guest-agent-$ARCH"
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bin-${{ matrix.target }}
           path: stage/*
@@ -155,7 +155,7 @@ jobs:
         shell: bash
         run: bash scripts/build-appliance.sh --arch "${{ matrix.arch }}" --linux-ref "${{ needs.preflight.outputs.linux_ref }}" --out stage
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: appliance-${{ matrix.arch }}
           path: |
@@ -235,7 +235,7 @@ jobs:
 
       - name: Upload dry-run artifact
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: release-kit-${{ matrix.host_target }}
           path: |
