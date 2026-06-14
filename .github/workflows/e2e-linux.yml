@@ -36,7 +36,7 @@ jobs:
           - name: linux-arm64
             runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       # 用 runner 的 host 原生 gnu target 建置（免 musl C 交叉工具鏈）。
       - name: Install Rust
@@ -82,7 +82,7 @@ jobs:
             runner: ubuntu-24.04-arm
             guest_target: aarch64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
