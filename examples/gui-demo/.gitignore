@@ -1,0 +1,2 @@
+# image tar 由 scripts/build-images.{sh,ps1} 就地產生，不納入版控
+/images/

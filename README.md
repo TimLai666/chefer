@@ -25,7 +25,7 @@ you can "cook" your containerized application into a portable single-file app, m
 | **Internal networking** (services reach each other via `127.0.0.1:<port>`) | ✅ | ✅ | 🔧 |
 | **Host port mapping — TCP** (`"host:guest"`, host≠guest proxied) | ✅ | ✅ verified | 🔧 |
 | **Host port mapping — UDP** | ✅ | ✅ verified — Chefer relays via the VM IP + an in-VM eth0→loopback bridge (WSL2's own forwarding is TCP-only) | 🔧 |
-| **GUI services** | ✅ X11 / Wayland socket passthrough | ✅ via WSLg (best-effort) | 🔧 |
+| **GUI services** | ✅ X11 / Wayland socket passthrough | ✅ verified via WSLg ([gui-demo](examples/gui-demo)) | 🔧 |
 | **`crash: fail_fast`** (any non-zero exit tears down the app, code propagated) | ✅ | ✅ verified | 🔧 |
 | **Data-dir migration** (`old_names`) | ✅ | ✅ | 🔧 |
 | **Official chown/gosu images** (redis, postgres, …) | ✅ full uid-range mapping | ⚠️ WSL2 nested userns falls back to single-uid; images that `chown`/`gosu` to a service uid may fail | 🔧 |
@@ -46,6 +46,39 @@ npx skills add TimLai666/chefer/skills
 ```
 
 Then just ask your agent to "write an appcipe for these images" — it will follow the field reference, apply the validation rules, sidestep the known gotchas, and run `chefer check` for you.
+
+## Install
+
+> **Running** a Chefer-packaged app needs nothing — the single file is self-contained. You only need to install Chefer if you want to **package** apps yourself.
+
+### Option 1 — Prebuilt binary (recommended)
+
+Download the package for your platform from the [latest release](https://github.com/TimLai666/chefer/releases/latest) — `chefer_<version>_<target>.zip` (Windows) or `chefer_<version>_<target>.tar.gz` (Linux/macOS). Inside, the `chefer` executable sits next to a `kit/` folder (the runtimes, guest-agents and macOS appliance it needs to build apps); keep them together so the kit is auto-discovered.
+
+```powershell
+# Windows (PowerShell) — extract and put chefer on PATH (keep kit\ beside chefer.exe)
+Expand-Archive chefer_<version>_x86_64-pc-windows-msvc.zip -DestinationPath $env:LOCALAPPDATA\Programs\chefer
+$env:Path += ";$env:LOCALAPPDATA\Programs\chefer\chefer_<version>_x86_64-pc-windows-msvc"
+chefer version
+```
+
+```bash
+# Linux / macOS — extract and put chefer on PATH (keep kit/ beside the binary)
+tar -xzf chefer_<version>_x86_64-unknown-linux-musl.tar.gz -C ~/.local/share/chefer
+ln -sf ~/.local/share/chefer/chefer_<version>_x86_64-unknown-linux-musl/chefer ~/.local/bin/chefer
+chefer version
+```
+
+One package can cross-package for **every** target (its `kit/` ships all platforms' runtimes + both guest-agent arches + the macOS appliance). Update later with `chefer upgrade`. On macOS, allow the unsigned binary in System Settings → Privacy & Security on first run.
+
+### Option 2 — From source
+
+```bash
+git clone https://github.com/TimLai666/chefer && cd chefer
+cargo build --release -p chefer-cli          # binary at target/release/chefer-cli
+```
+
+`init` / `check` / `inspect` work straight away. To `chefer build` / `run` you also need a **kit** (prebuilt runtime + guest-agent, plus the appliance for macOS targets) — either copy the `kit/` from a release, or build your own (see [Building from Source](#building-from-source)) and point at it with `--kit-dir` / `CHEFER_KIT_DIR`. From a source checkout you can also just run `cargo run -p chefer-cli -- <command>`.
 
 ## Quick Start
 
@@ -78,14 +111,22 @@ Then just ask your agent to "write an appcipe for these images" — it will foll
 
 > `chefer build` needs a **runtime kit** (prebuilt `chefer-runtime-<target>`, `guest-agent-<arch>`, and for macOS targets `chefer-vmlinuz-<arch>` / `chefer-initramfs-<arch>` appliance files). Every package on the [latest GitHub Release](https://github.com/TimLai666/chefer/releases/latest) ships a complete `kit/` containing runtimes for all 6 targets, both musl guest-agent architectures, and the macOS micro-VM appliance — download one package and you can package for every platform. Kit search order: `--kit-dir` > `CHEFER_KIT_DIR` > `<exe dir>/kit` > `<exe dir>`.
 
-## Demo — app + database in one file
+## Demos
 
-[examples/demo](examples/demo) is a minimal but complete two-service app: a Python HTTP service that increments a visit counter stored in **redis**, with the redis data persisted across restarts. It demonstrates internal networking (`app` reaches `db` over `127.0.0.1:6379`), opt-in persistence (`persist_path: /data`), and host port mapping (`18080:8080`) — all in one executable. Its [README](examples/demo/README.md) also documents honestly where v1's networking model stops short (services share one network namespace, so "db not exposed" is not yet true isolation — see [Known Limitations](#known-limitations)).
+**App + database in one file** — [examples/demo](examples/demo) is a minimal but complete two-service app: a Python HTTP service that increments a visit counter stored in **redis**, with the redis data persisted across restarts. It demonstrates internal networking (`app` reaches `db` over `127.0.0.1:6379`), opt-in persistence (`persist_path: /data`), and host port mapping (`18080:8080`) — all in one executable. Its [README](examples/demo/README.md) also documents honestly where v1's networking model stops short (services share one network namespace, so "db not exposed" is not yet true isolation — see [Known Limitations](#known-limitations)).
 
 ```bash
 bash examples/demo/scripts/build-images.sh          # or .ps1 on Windows — needs Docker
 cargo run -p chefer-cli -- build examples/demo/appcipe.yml --out dist
 ./dist/CheferDemo/CheferDemo_<target>                # then curl http://127.0.0.1:18080/
+```
+
+**GUI in one file** — [examples/gui-demo](examples/gui-demo) packages a graphical X11 program (**xeyes**) with `interface_mode: gui`. Run the single file and a window appears: on Linux via X11/Wayland socket passthrough, on Windows via WSLg. Because `fail_fast` tears the app down if the GUI program can't reach the display, "the window shows up and the app keeps running" is itself proof the GUI path works. See its [README](examples/gui-demo/README.md).
+
+```bash
+bash examples/gui-demo/scripts/build-images.sh      # or .ps1 on Windows — needs Docker
+cargo run -p chefer-cli -- build examples/gui-demo/appcipe.yml --out dist
+./dist/CheferGuiDemo/CheferGuiDemo_<target>          # a window with googly eyes appears
 ```
 
 ## CLI Commands
