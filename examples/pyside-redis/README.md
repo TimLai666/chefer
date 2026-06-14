@@ -9,6 +9,12 @@
 
 > GUI 映像含整套 Qt，**較大**（打包出的單檔約數百 MB），屬正常。
 
+> ⚠️ **db 沒對外、但 v1 仍非真正隔離**：`db` 沒有 `ports:`，但 v1 所有服務共用同一
+> network namespace、且 Windows 的 WSL2 `wslrelay` 會把 VM 內監聽埠自動鏡射到
+> Windows localhost——實測執行此 app 時，從 Windows `127.0.0.1:6379` 仍連得到
+> redis（回 `+PONG`）。要真正「不對外」需逐 app netns 隔離（Roadmap）。詳見專案
+> README 的 Known Limitations。
+
 ## 一、產生 image tar（需要 Docker）
 
 ```bash
