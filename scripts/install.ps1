@@ -63,13 +63,39 @@ try {
     $src = Join-Path $tmp "chefer_${ver}_${target}"
     if (-not (Test-Path (Join-Path $src 'chefer.exe'))) { throw "unexpected archive layout (missing chefer.exe)" }
 
+    # Reinstall/repair: this script never uses the existing chefer (it re-downloads from
+    # GitHub), so re-running it always repairs an install even if a bad version broke
+    # `chefer upgrade`.
+    $exeDst = Join-Path $installDir 'chefer.exe'
+    if (Test-Path $exeDst) {
+        $oldver = try { (& $exeDst version 2>$null | Select-Object -First 1) } catch { $null }
+        Write-Host "chefer-install: existing install found ($(if ($oldver) { $oldver } else { 'version unknown' })), overwriting"
+    }
+
     # install: replace only chefer.exe and kit (kit must sit next to chefer.exe)
     New-Item -ItemType Directory -Force $installDir | Out-Null
     $kitDst = Join-Path $installDir 'kit'
     if (Test-Path $kitDst) { Remove-Item -Recurse -Force $kitDst }
     Copy-Item (Join-Path $src 'kit') $kitDst -Recurse -Force
-    Copy-Item (Join-Path $src 'chefer.exe') (Join-Path $installDir 'chefer.exe') -Force
+    # Windows lets you RENAME a running .exe even when it can't be deleted/overwritten,
+    # so move the old one aside first -> reinstall works even while chefer is running.
+    if (Test-Path $exeDst) {
+        $stale = "$exeDst.old-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+        try { Move-Item $exeDst $stale -Force } catch { }
+    }
+    Copy-Item (Join-Path $src 'chefer.exe') $exeDst -Force
+    # best-effort cleanup of any aside copies (a locked one is removed on next run)
+    Get-ChildItem $installDir -Filter 'chefer.exe.old-*' -ErrorAction SilentlyContinue |
+        Remove-Item -Force -ErrorAction SilentlyContinue
     Write-Host "chefer-install: installed to $installDir"
+
+    # post-install smoke test: confirm the freshly-installed binary actually runs
+    try {
+        $v = & $exeDst version 2>$null | Select-Object -First 1
+        Write-Host "chefer-install: verified OK: $v"
+    } catch {
+        Write-Warning "chefer-install: the freshly-installed chefer failed to run 'version' - please report this."
+    }
 
     # PATH (User scope, idempotent)
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -80,6 +106,12 @@ try {
         Write-Host "chefer-install: added $installDir to your user PATH (open a new terminal for it to take effect)."
     }
     $env:Path = "$env:Path;$installDir"
+
+    # warn if a different chefer earlier on PATH would shadow this install
+    $found = (Get-Command chefer -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+    if ($found -and ($found -ne $exeDst)) {
+        Write-Warning "chefer-install: another chefer on PATH ($found) will shadow this install ($exeDst); adjust PATH order or remove the old one."
+    }
     Write-Host "chefer-install: done. Run 'chefer version' to confirm; update later with 'chefer upgrade'."
 } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue

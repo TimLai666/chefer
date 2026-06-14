@@ -84,6 +84,13 @@ tar -xzf "$tmp/$asset" -C "$tmp"
 src="$tmp/chefer_${ver}_${target}"
 [ -f "$src/chefer" ] || err "壓縮包結構非預期（缺 $src/chefer）"
 
+# 重裝／修復情境：本腳本完全不依賴既有的 chefer（純 curl/tar 重新下載安裝），
+# 故即使某一版把 `chefer upgrade` 弄壞，重跑這行安裝指令仍能直接覆蓋救回。
+if [ -x "$INSTALL_DIR/chefer" ]; then
+  oldver="$("$INSTALL_DIR/chefer" version 2>/dev/null | head -n1 || true)"
+  printf 'chefer-install: 偵測到既有安裝（%s），將直接覆蓋重裝\n' "${oldver:-版本未知}"
+fi
+
 # 安裝：只替換 chefer 與 kit（不動安裝目錄內其他東西），kit 必須與 chefer 同層
 mkdir -p "$INSTALL_DIR"
 rm -rf "$INSTALL_DIR/kit"
@@ -91,6 +98,13 @@ cp -R "$src/kit" "$INSTALL_DIR/kit"
 cp -f "$src/chefer" "$INSTALL_DIR/chefer"
 chmod +x "$INSTALL_DIR/chefer" 2>/dev/null || true
 printf 'chefer-install: 已安裝到 %s\n' "$INSTALL_DIR"
+
+# 安裝後煙霧測試：確認剛裝好的 binary 真能跑（重裝／修復最重要的確認）
+if "$INSTALL_DIR/chefer" version >/dev/null 2>&1; then
+  printf 'chefer-install: 驗證 OK：%s\n' "$("$INSTALL_DIR/chefer" version 2>/dev/null | head -n1)"
+else
+  printf 'chefer-install: 警告：剛安裝的 chefer 無法執行 `version`（macOS 可能是 Gatekeeper 攔未簽章檔，於系統設定→隱私權與安全性放行；其餘情況請回報）\n' >&2
+fi
 
 # PATH：把 INSTALL_DIR 加進存在的 shell rc（冪等；kit 與 chefer 同層，故直接把該目錄上 PATH）
 line="export PATH=\"$INSTALL_DIR:\$PATH\""
@@ -102,6 +116,13 @@ for rc in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zshrc"; do
     touched="$touched $rc"
   fi
 done
+
+# 若 PATH 上已有「別的位置」的 chefer，會蓋過本次安裝，提醒使用者（重裝時常見：
+# 之前用原始碼/手動裝在別處）。
+existing="$(command -v chefer 2>/dev/null || true)"
+if [ -n "$existing" ] && [ "$existing" != "$INSTALL_DIR/chefer" ]; then
+  printf 'chefer-install: 注意：PATH 上另有 chefer（%s）會優先於本次安裝（%s/chefer）；\n  要改用本次安裝請調整 PATH 順序或移除舊的那個。\n' "$existing" "$INSTALL_DIR" >&2
+fi
 
 case ":${PATH:-}:" in
   *":$INSTALL_DIR:"*)
