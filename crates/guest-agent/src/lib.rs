@@ -16,6 +16,8 @@ pub mod whiteout;
 #[cfg(target_os = "linux")]
 pub mod exec;
 #[cfg(target_os = "linux")]
+pub mod netns;
+#[cfg(target_os = "linux")]
 pub mod supervisor;
 
 use std::path::{Path, PathBuf};
@@ -78,8 +80,9 @@ mod linux_impl {
     use std::path::Path;
 
     use anyhow::{Result, bail};
+    use chefer_bundle::NetworkMode;
 
-    use crate::{RunConfig, load_manifest, rootfs, supervisor};
+    use crate::{RunConfig, load_manifest, netns, rootfs, supervisor};
 
     pub fn run_bundle_linux(cfg: &RunConfig) -> Result<i32> {
         // 先安裝訊號處理：rootfs 組裝期間收到 SIGTERM/SIGINT 也走相同終止流程
@@ -89,6 +92,25 @@ mod linux_impl {
         let order = chefer_bundle::topo_sort(&manifest.services)?;
 
         validate_services(&order)?;
+
+        // 網路模式：shared 沿用共享 netns（現況）；internal/bridge 建立 per-app netns。
+        // bridge 另起 pasta 提供出網（找不到 pasta 則退化為 internal，由 setup_app_netns 印訊息）。
+        let app_net = match manifest.app.network {
+            NetworkMode::Shared => None,
+            mode @ (NetworkMode::Internal | NetworkMode::Bridge) => {
+                let rootless = !nix::unistd::geteuid().is_root();
+                let bridge = matches!(mode, NetworkMode::Bridge);
+                // bundle 內嵌 pasta 的路徑（agents/pasta-<arch>），供 bridge 出網。
+                let pasta_hint = chefer_bundle::layout::agents_dir(&cfg.bundle_dir)
+                    .join(chefer_bundle::layout::pasta_name(std::env::consts::ARCH));
+                let net = netns::setup_app_netns(rootless, bridge, Some(pasta_hint))?;
+                eprintln!(
+                    "[guest-agent] 網路模式 {}：已建立 per-app network namespace（僅 lo）",
+                    if bridge { "bridge" } else { "internal" }
+                );
+                Some(net)
+            }
+        };
 
         // VM 後端：在 VM 內補起 UDP 埠橋接（背景執行緒，等服務先綁好埠的寬限期）。
         // 原生 Linux（udp_bridge=false）共享 netns，不需也不應綁 LAN IP。
@@ -110,8 +132,21 @@ mod linux_impl {
             leases.push((svc.name.clone(), lease));
         }
 
-        // 依拓撲順序啟動並監控
-        let code = supervisor::run_services(&order, &rootfs_map, &cfg.data_dir)?;
+        // 依拓撲順序啟動並監控（internal/bridge 模式下各服務 setns 進 app netns，
+        // 並為宣告的 port 起跨 netns inbound relay）。
+        let run_result = supervisor::run_services(
+            &order,
+            &rootfs_map,
+            &cfg.data_dir,
+            app_net.as_ref(),
+            &manifest,
+        );
+
+        // app 結束：收掉 netns holder（釋放 app netns）。
+        if let Some(net) = app_net {
+            net.shutdown();
+        }
+        let code = run_result?;
 
         // 未要求保留時，嘗試清掉 rootfs 快取——只有在無其他 instance 使用時
         // （能升級為獨佔鎖）才真正刪除，否則安全跳過。

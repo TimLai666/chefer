@@ -169,7 +169,11 @@ fn start_host_udp_relays(vm_ip: Ipv4Addr, specs: &[(u16, u16)]) -> Result<()> {
         match UdpSocket::bind((Ipv4Addr::LOCALHOST, host)) {
             Ok(sock) => {
                 let target = SocketAddr::from((vm_ip, guest));
-                guest_agent::udp_bridge::spawn_udp_relay(sock, target);
+                guest_agent::udp_bridge::spawn_udp_relay(sock, move || {
+                    let up = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+                    up.connect(target)?;
+                    Ok(up)
+                });
                 eprintln!("[chefer] UDP 埠轉發：127.0.0.1:{host} → {vm_ip}:{guest}");
             }
             Err(e) => failures.push(format!("  - {host}/udp：bind 127.0.0.1:{host} 失敗：{e}")),

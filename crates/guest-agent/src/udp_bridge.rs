@@ -71,7 +71,7 @@ pub fn start_vm_udp_bridges(manifest: &Manifest) {
             match UdpSocket::bind((vm_ip, gp)) {
                 Ok(sock) => {
                     let target = SocketAddr::from((Ipv4Addr::LOCALHOST, gp));
-                    spawn_udp_relay(sock, target);
+                    spawn_udp_relay(sock, move || new_upstream(target));
                     eprintln!("[guest-agent] UDP 橋接已啟動：{vm_ip}:{gp} → 127.0.0.1:{gp}");
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
@@ -87,11 +87,18 @@ pub fn start_vm_udp_bridges(manifest: &Manifest) {
 }
 
 /// 通用的 per-client session UDP relay：`listen` 收到封包後，依來源位址各維護一條
-/// 連到 `target` 的 upstream socket，並各起一條回程執行緒把 `target` 的回應送回該來源。
+/// 由 `make_upstream` 建立的 upstream socket，並各起一條回程執行緒把回應送回該來源。
+///
+/// `make_upstream` 抽象了「upstream 該在哪建立」：VM 橋接用 `new_upstream(target)`
+/// （當前 netns）；per-app netns relay 則用會 `setns` 進 app netns 再 connect 的工廠
+/// （見 `netns::relay`）——關鍵是 upstream socket 必須誕生在服務所在的 netns。
 ///
 /// 比「只記最後來源」正確：多個 client 同時打同一埠時不會互蓋回程。閒置 session
 /// 不主動回收（v1 可接受；來源量大時為輕微記憶體成長）。
-pub fn spawn_udp_relay(listen: UdpSocket, target: SocketAddr) {
+pub fn spawn_udp_relay<F>(listen: UdpSocket, make_upstream: F)
+where
+    F: Fn() -> std::io::Result<UdpSocket> + Send + 'static,
+{
     let listen = Arc::new(listen);
     let sessions: Arc<Mutex<HashMap<SocketAddr, Arc<UdpSocket>>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -114,10 +121,10 @@ pub fn spawn_udp_relay(listen: UdpSocket, target: SocketAddr) {
                 if let Some(up) = map.get(&src) {
                     Arc::clone(up)
                 } else {
-                    let up = match new_upstream(target) {
+                    let up = match make_upstream() {
                         Ok(s) => Arc::new(s),
                         Err(e) => {
-                            eprintln!("[udp-relay] 建立 upstream（{target}）失敗：{e}");
+                            eprintln!("[udp-relay] 建立 upstream 失敗：{e}");
                             continue;
                         }
                     };
@@ -187,7 +194,7 @@ mod tests {
 
         let listen = UdpSocket::bind("127.0.0.1:0").unwrap();
         let relay_addr = listen.local_addr().unwrap();
-        spawn_udp_relay(listen, echo_addr);
+        spawn_udp_relay(listen, move || new_upstream(echo_addr));
 
         for tag in [b"aaa".as_slice(), b"bbb".as_slice()] {
             let client = UdpSocket::bind("127.0.0.1:0").unwrap();

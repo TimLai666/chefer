@@ -377,7 +377,9 @@ pub fn hash_payload(path: &Path, offset: u64, len: u64) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chefer_bundle::{AppMeta, CrashPolicy, Footer, MANIFEST_FORMAT_VERSION, Manifest};
+    use chefer_bundle::{
+        AppMeta, CrashPolicy, Footer, MANIFEST_FORMAT_VERSION, Manifest, NetworkMode,
+    };
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
 
@@ -405,6 +407,7 @@ mod tests {
                 old_names: vec![],
                 data_dir_override: None,
                 crash: CrashPolicy::FailFast,
+                network: NetworkMode::Shared,
                 generated_at_utc: "2026-01-01T00:00:00Z".into(),
                 builder_version: String::new(),
             },

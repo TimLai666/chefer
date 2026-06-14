@@ -165,10 +165,42 @@ jobs:
             stage/SHA256SUMS-${{ matrix.arch }}
           if-no-files-found: error
 
-  # ── 第二階段：每個 host 平台組一份完整 kit（CLI + 全部 runtime + 兩架構 guest-agent）──
+  # 靜態 musl pasta（bridge 網路模式的出網 NAT）；兩 guest 架構各一支。
+  pasta:
+    name: build pasta (${{ matrix.arch }})
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.preflight.outputs.checkout_ref }}
+
+      # aarch64 以 docker --platform 經 qemu binfmt 建置。
+      - name: Set up QEMU (for cross-arch pasta build)
+        if: matrix.arch == 'aarch64'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build static pasta
+        shell: bash
+        run: bash scripts/build-pasta.sh --arch "${{ matrix.arch }}" --out stage
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: pasta-${{ matrix.arch }}
+          path: |
+            stage/pasta-${{ matrix.arch }}
+            stage/SHA256SUMS-pasta-${{ matrix.arch }}
+          if-no-files-found: error
+
+  # ── 第二階段：每個 host 平台組一份完整 kit（CLI + 全部 runtime + 兩架構 guest-agent + pasta）──
   package:
     name: package kit (${{ matrix.host_target }})
-    needs: [preflight, build, appliance]
+    needs: [preflight, build, appliance, pasta]
     strategy:
       fail-fast: false
       matrix:
@@ -213,6 +245,8 @@ jobs:
           cp all/chefer-runtime-* "out/$PKG/kit/"
           # 兩種 guest 架構的靜態 agent
           cp all/guest-agent-x86_64 all/guest-agent-aarch64 "out/$PKG/kit/"
+          # 兩種 guest 架構的靜態 pasta（bridge 出網用）
+          cp all/pasta-x86_64 all/pasta-aarch64 "out/$PKG/kit/"
           # macOS VZ 後端使用的 Linux micro-VM appliance（所有 host kit 都附，方便跨平台打包）
           cp all/chefer-vmlinuz-* all/chefer-initramfs-* "out/$PKG/kit/"
           cp all/BUILDINFO-* all/SHA256SUMS-* "out/$PKG/kit/"

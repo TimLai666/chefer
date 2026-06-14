@@ -131,6 +131,8 @@ required_kit_files=(
   "chefer-runtime-aarch64-apple-darwin"
   "guest-agent-x86_64"
   "guest-agent-aarch64"
+  "pasta-x86_64"
+  "pasta-aarch64"
   "chefer-vmlinuz-x86_64"
   "chefer-initramfs-x86_64"
   "chefer-vmlinuz-aarch64"

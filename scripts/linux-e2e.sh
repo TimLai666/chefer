@@ -103,6 +103,17 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_text(404, "missing\n")
             return
+        if parsed.path == "/egress":
+            # 對外連線探針：bridge 模式（pasta NAT）應成功；internal 應失敗（無對外網路）。
+            import socket
+
+            try:
+                conn = socket.create_connection(("1.1.1.1", 443), timeout=4)
+                conn.close()
+                self.send_text(200, "egress-ok\n")
+            except Exception as exc:  # noqa: BLE001
+                self.send_text(503, f"egress-fail: {exc}\n")
+            return
         if parsed.path == "/shutdown":
             self.send_text(200, "bye\n")
             threading.Thread(target=self.server.shutdown, daemon=True).start()
@@ -112,6 +123,14 @@ class Handler(BaseHTTPRequestHandler):
 
 port = int(os.environ.get("PORT", "8080"))
 server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+
+# 網路隔離 E2E 用：若設了 SECRET_PORT，再於 127.0.0.1 綁一個「未宣告」的 port。
+# shared 模式下它會洩漏到 host loopback；internal/bridge 模式下應從 host 連不到。
+secret = os.environ.get("SECRET_PORT")
+if secret:
+    secret_server = ThreadingHTTPServer(("127.0.0.1", int(secret)), Handler)
+    threading.Thread(target=secret_server.serve_forever, daemon=True).start()
+
 server.serve_forever()
 PY
 }
@@ -166,6 +185,41 @@ services:
     env:
       PORT: "${guest_port}"
     persist_path: /data
+    ports: ["${host_port}:${guest_port}"]
+    interface_mode: none
+YAML
+}
+
+write_netiso_appcipe() {
+  local path="$1"
+  local name="$2"
+  local data_dir="$3"
+  local image_tar="$4"
+  local host_port="$5"
+  local guest_port="$6"
+  local secret_port="$7"
+  local image_platform="$8"
+  local network="$9"
+  mkdir -p "$(dirname "$path")"
+  # 只宣告 host_port:guest_port；secret_port 故意不宣告，用來驗證隔離。
+  cat >"$path" <<YAML
+version: "0.1"
+name: ${name}
+app_version: "e2e"
+data_dir: "${data_dir}"
+crash: fail_fast
+network: ${network}
+services:
+  web:
+    image:
+      source: tar
+      file: "${image_tar}"
+      format: docker-archive
+      platform: ${image_platform}
+    cmd: ["python", "/app/server.py"]
+    env:
+      PORT: "${guest_port}"
+      SECRET_PORT: "${secret_port}"
     ports: ["${host_port}:${guest_port}"]
     interface_mode: none
 YAML
@@ -259,6 +313,30 @@ wait_for_http() {
   done
   cat "$log" >&2 || true
   die "timed out waiting for ${url}"
+}
+
+assert_reachable() {
+  curl -fsS --max-time 4 "$1" >/dev/null 2>&1 || die "expected reachable but was not: $1"
+}
+
+# 連得到就算失敗（用於驗證未宣告的 port 在 internal 模式下不可達）。
+assert_unreachable() {
+  if curl -fsS --max-time 4 "$1" >/dev/null 2>&1; then
+    die "expected UNREACHABLE (network isolation breach): $1"
+  fi
+}
+
+# 驗證 /egress 探針的對外連線結果：ok（bridge 應可出網）或 fail（internal 應無對外網路）。
+assert_egress() {
+  local url="$1"
+  local expect="$2"
+  local body
+  body="$(curl -sS --max-time 10 "$url" 2>/dev/null || true)"
+  case "$expect" in
+    ok) [[ "$body" == egress-ok* ]] || die "expected outbound egress OK, got: ${body:-<none>} (${url})" ;;
+    fail) [[ "$body" == egress-fail* ]] || die "expected NO outbound egress, got: ${body:-<none>} (${url})" ;;
+    *) die "assert_egress: bad expectation ${expect}" ;;
+  esac
 }
 
 assert_namespace_evidence() {
@@ -472,6 +550,82 @@ run_wayland_e2e() {
   note "Wayland E2E socket forwarding verified with headless Weston"
 }
 
+# 網路隔離 E2E：同一個 web image，分別以 shared 與 internal 打包執行。
+#  - shared  ：未宣告的 secret port 在 host loopback 上可達（示範洩漏；驗證測試本身的靈敏度）
+#  - internal：未宣告的 secret port 從 host 連不到（隔離成立）；宣告的 port 仍經 relay 可達
+run_netns_iso_e2e() {
+  local work="$1"
+  local output_target="$2"
+  local image_platform="$3"
+  local cli="$4"
+  local kit="$5"
+  local image_tar="$6"
+
+  local g h s
+  g="$(pick_free_port)"
+  h="$(pick_free_port)"
+  while [[ "$h" == "$g" ]]; do h="$(pick_free_port)"; done
+  s="$(pick_free_port)"
+  while [[ "$s" == "$g" || "$s" == "$h" ]]; do s="$(pick_free_port)"; done
+
+  # --- shared：示範未宣告的 secret port 會洩漏到 host（也驗證 assert_unreachable 有意義）---
+  note "Network E2E (shared): undeclared port ${s} should LEAK to host loopback"
+  write_netiso_appcipe "$work/iso-shared/appcipe.yml" "LinuxNetShared" "$work/iso-shared-data" \
+    "$image_tar" "$h" "$g" "$s" "$image_platform" "shared"
+  "$cli" build "$work/iso-shared/appcipe.yml" --out "$work/out-iso-shared" --kit-dir "$kit" --target "$output_target"
+  local shared_app="$work/out-iso-shared/LinuxNetShared/LinuxNetShared_${output_target}"
+  [[ -f "$shared_app" ]] || die "missing built shared-net app: $shared_app"
+  chmod +x "$shared_app"
+  run_web "$shared_app" "$h" "$work/iso-shared.log"
+  local shared_pid="$RUN_WEB_PID"
+  assert_reachable "http://127.0.0.1:${h}/health"   # 宣告的 port（經 runtime proxy）
+  assert_reachable "http://127.0.0.1:${s}/health"   # 未宣告但 shared → 洩漏可達
+  curl -fsS "http://127.0.0.1:${h}/shutdown" >/dev/null || true
+  wait "$shared_pid" 2>/dev/null || true
+  RUN_WEB_PID=""
+
+  # --- internal：未宣告的 secret port 必須連不到；宣告的 port 仍可達 ---
+  note "Network E2E (internal): declared ${h} reachable via relay, undeclared ${s} ISOLATED"
+  write_netiso_appcipe "$work/iso-internal/appcipe.yml" "LinuxNetInternal" "$work/iso-internal-data" \
+    "$image_tar" "$h" "$g" "$s" "$image_platform" "internal"
+  "$cli" build "$work/iso-internal/appcipe.yml" --out "$work/out-iso-internal" --kit-dir "$kit" --target "$output_target"
+  local internal_app="$work/out-iso-internal/LinuxNetInternal/LinuxNetInternal_${output_target}"
+  [[ -f "$internal_app" ]] || die "missing built internal-net app: $internal_app"
+  chmod +x "$internal_app"
+  run_web "$internal_app" "$h" "$work/iso-internal.log"
+  local internal_pid="$RUN_WEB_PID"
+  assert_reachable "http://127.0.0.1:${h}/health"     # 宣告的 port → 跨 netns relay
+  assert_unreachable "http://127.0.0.1:${s}/health"   # 關鍵：未宣告的 port 被隔離
+  assert_egress "http://127.0.0.1:${h}/egress" fail   # internal：無對外網路
+  curl -fsS "http://127.0.0.1:${h}/shutdown" >/dev/null || true
+  wait "$internal_pid" 2>/dev/null || true
+  RUN_WEB_PID=""
+
+  # --- bridge 模式（需要系統有 pasta；經 PATH 由 guest-agent 找到）---
+  if command -v pasta >/dev/null 2>&1; then
+    note "Network E2E (bridge): declared ${h} reachable, undeclared ${s} isolated, AND outbound works via pasta"
+    write_netiso_appcipe "$work/iso-bridge/appcipe.yml" "LinuxNetBridge" "$work/iso-bridge-data" \
+      "$image_tar" "$h" "$g" "$s" "$image_platform" "bridge"
+    "$cli" build "$work/iso-bridge/appcipe.yml" --out "$work/out-iso-bridge" --kit-dir "$kit" --target "$output_target"
+    local bridge_app="$work/out-iso-bridge/LinuxNetBridge/LinuxNetBridge_${output_target}"
+    [[ -f "$bridge_app" ]] || die "missing built bridge-net app: $bridge_app"
+    chmod +x "$bridge_app"
+    run_web "$bridge_app" "$h" "$work/iso-bridge.log"
+    local bridge_pid="$RUN_WEB_PID"
+    assert_reachable "http://127.0.0.1:${h}/health"     # 宣告的 port → relay
+    assert_unreachable "http://127.0.0.1:${s}/health"   # 未宣告的 port 仍隔離
+    assert_egress "http://127.0.0.1:${h}/egress" ok     # bridge：可出網（pasta NAT）
+    curl -fsS "http://127.0.0.1:${h}/shutdown" >/dev/null || true
+    wait "$bridge_pid" 2>/dev/null || true
+    RUN_WEB_PID=""
+    note "Bridge E2E passed: isolation holds and outbound NAT works via pasta"
+  else
+    note "pasta not installed; skipping bridge outbound assertion (internal isolation already verified)"
+  fi
+
+  note "Network isolation E2E passed: internal isolates undeclared port ${s} (no egress); declared ${h} reachable"
+}
+
 main() {
   [[ "$(uname -s)" == "Linux" ]] || die "Linux E2E must run on Linux"
   ! is_wsl || die "Linux E2E requires a native Linux host, not WSL"
@@ -632,6 +786,9 @@ main() {
     die "expected fail_fast exit code 42, got ${fail_code}"
   fi
 
+  note "Checking network isolation (shared leak vs internal isolation)"
+  run_netns_iso_e2e "$work" "$output_target" "$image_platform" "$cli" "$kit" "$image_tar"
+
   if [[ "${CHEFER_E2E_GUI:-0}" == "1" ]]; then
     run_gui_e2e "$work" "$output_target" "$image_platform" "$cli" "$kit"
     run_wayland_e2e "$work" "$output_target" "$image_platform" "$cli" "$kit"
@@ -640,7 +797,7 @@ main() {
 
   docker image rm "$image" >/dev/null 2>&1 || true
   CLEANUP_IMAGE=""
-  note "Linux E2E passed: docker save -> chefer build -> single-file run, rootless namespaces, persist, fail_fast, host!=guest port mapping${gui_summary}"
+  note "Linux E2E passed: docker save -> chefer build -> single-file run, rootless namespaces, persist, fail_fast, host!=guest port mapping, network isolation${gui_summary}"
 }
 
 main "$@"

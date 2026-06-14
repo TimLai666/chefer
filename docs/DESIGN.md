@@ -276,21 +276,22 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
 
 AppCipe 新增 app 級欄位 **`network`**（appcipe-spec enum，serde rename 小寫；寫進 manifest `app`）：
 
-- **`shared`（v1 預設，現況）**：所有服務共用 host/VM 的 netns；服務間以 `127.0.0.1` 互通；`ports:` 直接生效。缺點：未宣告的 port 仍可從 host 連到（且 WSL2 wslrelay 會鏡射任何 loopback 埠）。沿用現有路徑（含 `--udp-bridge`）。
-- **`isolated`（本次目標）**：整個 app 跑在**自己的一個 network namespace** 內。
-  - guest-agent **建立一個 app netns**（所有服務 `setns` 進同一個 → 服務間仍以 `127.0.0.1` 互通），netns 內僅 `lo`。
-  - 對**每個宣告的 `ports:`** 起一條 **跨 netns 的 userspace relay**：listener 留在 **parent netns**（distro/VM/原生 host 的 netns）上的 `guest` 埠，connector 在 **app netns** 連 `127.0.0.1:guest`，兩端以 fork 前建立的 **socketpair（fd 不受 netns 限制）** 串接——**不需 veth / CAP_NET_ADMIN / iptables / slirp**，rootless 也適用（`unshare(NEWNET)` 在 userns 內可行）。沿用 guest-agent 既有的 per-client session TCP/UDP relay 邏輯（`udp_bridge`），只是改成跨 netns。
-  - **未宣告的 port**：服務只在 app netns 的 `lo` 監聽 → parent netns 無對應 listener → host 連不到、**WSL2 wslrelay 也看不到（服務不在它監看的 netns）→ 真正不對外**。這正是 `isolated` 解決的核心。
-  - host 端機制不變：chefer-runtime 的 TCP/UDP 代理、WSL2 的 localhost forwarding / UDP VM-IP relay 一律打到 **parent netns 上的 relay listener**（與 `shared` 時打服務本身位置等效）。
-  - **限制（誠實）**：`isolated` 的 app netns 只有 `lo` → **服務沒有對外網路（無 internet / DNS）**。適合「內部專用、不需出網」的服務（db、純內部 API）。需要出網的 app 用 `shared`，或等下方 `nat`。
-- **`nat`（未來）**：per-app netns + **bundled `pasta`（passt，userspace、rootless、免 iptables/veth）** 提供出網 NAT + 只轉發宣告的 inbound 埠 = Docker bridge 等價行為。`pasta` 靜態二進位隨 kit 出貨（同 guest-agent）。屆時可考慮把預設改為 `nat`。
+三種模式，**目標預設是 `bridge`**（對齊 Docker：app 有自己的私有網路、可出網、但只有宣告的 port 對外）。所有模式下，**整個 app 跑在自己的一個 network namespace** 內，服務間仍以 `127.0.0.1` 互通；差別只在「對外/出網」的策略：
+
+- **`bridge`（目標預設；對齊 Docker 預設 bridge 網路）**：per-app netns（內有 `lo`）+ **bundled `pasta`（passt，userspace、rootless、免 iptables/veth）** 提供**出網 NAT** + 只轉發**宣告的 inbound 埠** = Docker bridge 等價行為（私有網路、可上網、只開宣告的埠）。guest-agent 從 host netns 以 `pasta --config-net --foreground --netns /proc/<holder>/ns/net [--userns …]` 對 app netns 提供連線；inbound 走下方的跨 netns relay。`pasta` 靜態 musl 二進位隨 kit 出貨並嵌入 bundle 的 `agents/pasta-<arch>`（同 guest-agent）；guest-agent 找 pasta 的順序為 `CHEFER_PASTA` > `agents/pasta-<arch>` > 與 guest-agent 同目錄/`kit/` > PATH。**找不到或啟動失敗時不致命**——`bridge` 退化為 `internal`（只有 lo、無對外網路）並印明確訊息。
+- **`internal`（對齊 Docker compose 的 `internal: true` = 無對外網路）**：同 `bridge` 但**不起 pasta** → app netns 只有 `lo` → **服務沒有對外網路（無 internet / DNS）**。適合「內部專用、不需出網」的服務（db、純內部 API）。是 `bridge` 砍掉出網的子集。
+- **`shared`（legacy／相容現況）**：服務共用 host/VM 的 netns；`ports:` 直接生效。缺點：未宣告的 port 仍可從 host 連到（且 WSL2 wslrelay 會鏡射任何 loopback 埠）→ **不隔離**。沿用現有路徑（含 `--udp-bridge`）。保留給需要「app 直接看到 host 網路環境」的場景。
+
+**inbound（宣告的 `ports:`）跨 netns relay**（`bridge`/`internal` 共用）：guest-agent 對每個宣告的 port 起一條 **跨 netns 的 userspace relay**——listener 留在 **parent netns**（distro/VM/原生 host 的 netns）上的 `guest` 埠，connector 在 **app netns** 連 `127.0.0.1:guest`，兩端以 fork 前建立的 **socketpair（fd 不受 netns 限制）** 串接——**不需 veth / CAP_NET_ADMIN / iptables**，rootless 也適用（`unshare(NEWNET)` 在 userns 內可行）。沿用 guest-agent 既有的 per-client session TCP/UDP relay 邏輯（`udp_bridge`），只是改成跨 netns。
+- **未宣告的 port**：服務只在 app netns 的 `lo` 監聽 → parent netns 無對應 listener → host 連不到、**WSL2 wslrelay 也看不到（服務不在它監看的 netns）→ 真正不對外**。這正是隔離的核心。
+- host 端機制不變：chefer-runtime 的 TCP/UDP 代理、WSL2 的 localhost forwarding / UDP VM-IP relay 一律打到 **parent netns 上的 relay listener**（與 `shared` 時打服務本身位置等效）。
 
 平台對應:
-- **原生 Linux（namespaces）**:app netns 於 guest-agent in-process 建立;relay 跨「host netns ↔ app netns」。
+- **原生 Linux（namespaces）**:app netns 於 guest-agent in-process 建立;relay 跨「host netns ↔ app netns」;`bridge` 的 pasta 在 app netns 內跑。
 - **Windows（wsl2）**:app netns 在 distro 內;relay 跨「distro netns ↔ app netns」;對外仍靠既有 host 代理 + wslrelay/UDP bridge 打到 distro netns 的 listener。附帶好處:**消除 wslrelay 對未宣告埠的鏡射洩漏**。
 - **macOS（vz）**:VM 已與 host 隔離;VM 內同原生 Linux 作法。
 
-實作分期:**P1** `isolated`（lo + 跨 netns relay）於原生 Linux + 單元/E2E 驗證 → **P2** WSL2 路徑 → **P3** `nat`（pasta）出網。`shared` 維持預設直到 `nat` 成熟,避免破壞需要出網的既有 app。
+實作分期（**bridge 優先**，因為它是目標預設）:**P1** 原生 Linux 完整做 `bridge`（app netns + 跨 netns inbound relay + pasta 出網）與 `internal`（同路徑不起 pasta）+ 單元/E2E 驗證 → **P2** WSL2 路徑 → **P3** 把**執行期預設旗標**從 `shared` 翻成 `bridge`。**在 `bridge` 通過 E2E 前,執行期預設先維持 `shared`**,避免 ship 出「預設模式尚未實作」的壞版本;DESIGN 的目標預設則記為 `bridge`。
 
 ### chefer-cli（bin）
 - 子命令：

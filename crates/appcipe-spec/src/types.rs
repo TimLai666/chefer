@@ -23,7 +23,29 @@ pub struct AppCipe {
     /// 當機策略；舊欄位名 `crash_policy` 以 serde alias 相容。
     #[serde(default, alias = "crash_policy")]
     pub crash: CrashPolicy,
+
+    /// app 的網路模式（見 docs/DESIGN.md「網路隔離」節）。
+    #[serde(default)]
+    pub network: NetworkMode,
     pub services: HashMap<String, Service>,
+}
+
+/// app 級網路模式。
+///
+/// **目標預設是 `bridge`**（對齊 Docker：app 有自己的私有網路、可出網、只開宣告的 port）；
+/// 但在 `bridge` 於各後端做完並通過 E2E 前，**`#[default]` 暫時維持 `Shared`**，避免 ship
+/// 出「預設模式尚未實作」的壞版本。待 P3 完成再把預設旗標翻成 `Bridge`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkMode {
+    /// 共用 host/VM 的 netns；`ports:` 直接生效但未宣告的 port 仍可從 host 連到（不隔離）。
+    #[default]
+    Shared,
+    /// 自己的 app netns，只有 `lo`：服務間以 127.0.0.1 互通、宣告的 port 經 relay 對外，
+    /// **無對外網路**（對齊 Docker compose 的 `internal: true`）。
+    Internal,
+    /// 同 `Internal` 再加 bundled pasta 提供出網 NAT（對齊 Docker 預設 bridge 網路）。
+    Bridge,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

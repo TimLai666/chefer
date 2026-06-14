@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use appcipe_spec::{AppCipe, Service};
 use chefer_bundle::{
-    AppMeta, CrashPolicy, LayerRef, MANIFEST_FORMAT_VERSION, Manifest, MountSpec, PortSpec,
-    ServiceEntry, kit, layout,
+    AppMeta, CrashPolicy, LayerRef, MANIFEST_FORMAT_VERSION, Manifest, MountSpec, NetworkMode,
+    PortSpec, ServiceEntry, kit, layout,
 };
 use fs_err as fs;
 
@@ -98,6 +98,7 @@ pub fn pack(app: &AppCipe, opts: &PackOptions) -> Result<PackResult> {
             old_names: app.old_names.clone(),
             data_dir_override: app.data_dir.clone(),
             crash: CrashPolicy::FailFast,
+            network: map_network(app.network),
             generated_at_utc: now_utc_rfc3339(),
             builder_version: opts.builder_version.clone(),
         },
@@ -273,6 +274,31 @@ fn copy_agents(bundle_dir: &Path, manifest: &Manifest, opts: &PackOptions) -> Re
                 );
             }
         }
+
+        // pasta（bridge 出網用）：可選。缺少時僅提示——bridge 模式會在執行期退化為
+        // internal（只有 lo、無對外網路），不影響 shared/internal 的 app。
+        let pasta_name = layout::pasta_name(arch);
+        match kit::find_pasta(&kit_dirs, arch) {
+            Some(src) => {
+                fs::create_dir_all(&agents_dir)?;
+                let dst = agents_dir.join(&pasta_name);
+                fs::copy(&src, &dst)
+                    .with_context(|| format!("複製 pasta 失敗：{}", src.display()))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perm = std::fs::metadata(&dst)?.permissions();
+                    perm.set_mode(0o755);
+                    std::fs::set_permissions(&dst, perm)?;
+                }
+            }
+            None => {
+                eprintln!(
+                    "提示：kit 內找不到 {pasta_name}；以 network: bridge 打包的 app 在執行時\
+                     將退化為 internal（只有 lo、無對外網路）。如需 bridge 出網，請在 kit 附上 pasta-{arch}。"
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -348,6 +374,16 @@ fn format_kit_dirs(kit_dirs: &[PathBuf]) -> String {
 }
 
 /// 目前 UTC 時間的 RFC3339 字串（秒以下截斷，輸出穩定）。
+/// 把 appcipe-spec 的網路模式映射到 bundle manifest 的網路模式。
+/// 兩個 enum 故意各自獨立（spec 跟 appcipe.yml 格式走、manifest 跟協定走）。
+fn map_network(n: appcipe_spec::NetworkMode) -> NetworkMode {
+    match n {
+        appcipe_spec::NetworkMode::Shared => NetworkMode::Shared,
+        appcipe_spec::NetworkMode::Internal => NetworkMode::Internal,
+        appcipe_spec::NetworkMode::Bridge => NetworkMode::Bridge,
+    }
+}
+
 fn now_utc_rfc3339() -> String {
     let now = time::OffsetDateTime::now_utc();
     let now = now.replace_nanosecond(0).unwrap_or(now);

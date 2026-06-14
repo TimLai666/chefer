@@ -20,6 +20,7 @@ use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 
 use crate::exec::{SpawnSpec, spawn_service};
+use crate::netns::AppNet;
 
 /// 一個執行中服務：中繼行程 pid（= pgid）、服務本體（pid-ns init）host pid、名稱。
 struct Running {
@@ -66,7 +67,12 @@ pub fn run_services(
     order: &[&chefer_bundle::ServiceEntry],
     rootfs_map: &BTreeMap<String, PathBuf>,
     data_dir: &Path,
+    app_net: Option<&AppNet>,
+    manifest: &chefer_bundle::Manifest,
 ) -> Result<i32> {
+    // internal/bridge 模式：各服務 setns 進 app netns。
+    let netns_join = app_net.map(|n| n.join());
+
     // 啟動（中途收到關閉訊號 → 終止已啟動者並回 130）
     let mut running: Vec<Running> = Vec::new();
     for svc in order {
@@ -83,6 +89,7 @@ pub fn run_services(
             rootfs,
             data_dir,
             terminal,
+            netns: netns_join,
         })
         .with_context(|| format!("啟動服務 `{}` 失敗", svc.name));
         let spawned = match spawned {
@@ -109,6 +116,12 @@ pub fn run_services(
             "[guest-agent] 服務 `{}` 已啟動（pid {}）",
             svc.name, spawned.pid
         );
+    }
+
+    // internal/bridge：服務都在 app netns 內，為宣告的 port 起跨 netns inbound relay
+    // （parent netns listener → app netns 127.0.0.1:guest）。未宣告的 port 無入口。
+    if let Some(net) = app_net {
+        crate::netns::relay::start_inbound_relays(manifest, net.dialer());
     }
 
     monitor(&mut running)
