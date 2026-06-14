@@ -19,19 +19,24 @@ pub(crate) fn platform_of(svc: &Service) -> String {
     }
 }
 
-/// 取得 service 的 image tar 路徑；非 tar 來源回報「尚未支援」。
-pub(crate) fn image_tar_path<'a>(name: &str, svc: &'a Service) -> Result<&'a str> {
+/// service 的 image 來源：本機 tar 檔，或 registry reference。
+pub(crate) enum ImageSrc<'a> {
+    /// 本機 image tar 檔路徑（docker-archive / oci-archive）。
+    Tar(&'a str),
+    /// registry reference（如 `redis:7.2-alpine` / `ghcr.io/o/i@sha256:…`）。
+    Registry(&'a str),
+}
+
+/// 判別 service 的 image 來源（tar 路徑或 registry ref）。dockerfile 尚未支援。
+pub(crate) fn image_src<'a>(name: &str, svc: &'a Service) -> Result<ImageSrc<'a>> {
     match &svc.image {
-        ImageSourceOrPath::TarPath(p) => Ok(p),
+        ImageSourceOrPath::TarPath(p) => Ok(ImageSrc::Tar(p)),
         ImageSourceOrPath::Full { source, file, .. } => match source {
-            ImageSourceType::Tar => Ok(file),
+            ImageSourceType::Tar => Ok(ImageSrc::Tar(file)),
+            ImageSourceType::Image => Ok(ImageSrc::Registry(file)),
             ImageSourceType::Dockerfile => bail!(
                 "service `{name}`：image.source=dockerfile 尚未支援；\
                  請先以 `docker build` + `docker save -o <file>` 匯出 tar 後改用 source=tar"
-            ),
-            ImageSourceType::Image => bail!(
-                "service `{name}`：image.source=image 尚未支援；\
-                 請先以 `docker save -o <file> <image>` 匯出 tar 後改用 source=tar"
             ),
         },
     }

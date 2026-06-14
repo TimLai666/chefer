@@ -23,11 +23,16 @@ services:
 
   db:                                # 服務名稱；規則：[a-z][a-z0-9_]*，最長 32 字元
     # --- 映像來源 ---
-    image:                           # 必填：容器映像來源（目前僅支援 source: tar）
-      source: tar                    # 必填(就此寫法)：tar = Docker/OCI 規格的 image tar 檔
-      file: ./images/postgres16.tar  # 必填：tar 路徑；可相對於 appcipe.yml（docker save 與 OCI archive 皆可，依內容自動偵測）
-      format: auto                   # 選填：auto | docker-archive | oci-archive（預設 auto）
-      platform: linux/amd64          # 選填：預設 linux/amd64；multi-arch tar 時用來挑平台（另支援 linux/arm64）
+    # 來源二選一：source: tar（本機 docker save / OCI archive）或 source: image（建置時從 registry 拉）。
+    # 最簡：直接給 registry ref → image: postgres:16-alpine（見下方 app1 短寫示範）。
+    image:                           # 必填：容器映像來源
+      source: tar                    # tar = Docker/OCI 規格的 image tar 檔；image = 從 registry 拉
+      file: ./images/postgres16.tar  # source=tar：tar 路徑（可相對 appcipe.yml；docker save 與 OCI archive 皆可，自動偵測）
+                                     # source=image 時，file 改填 registry ref，且必須釘版：
+                                     #   postgres:16-alpine（明確 tag，非 latest）或 …@sha256:<digest>；
+                                     #   未標記或 :latest 會被拒（為了可重現）。公開 image 採匿名拉取。
+      format: auto                   # 選填：auto | docker-archive | oci-archive（預設 auto；僅 source=tar 有意義）
+      platform: linux/amd64          # 選填：預設 linux/amd64；multi-arch 來源用來挑平台（另支援 linux/arm64）
 
     # --- 執行參數 ---
     cmd: ["postgres", "-c", "max_connections=200"]  # 選填：覆蓋 image 的 Cmd（不取代 Entrypoint，語意同 Docker）；可字串或陣列

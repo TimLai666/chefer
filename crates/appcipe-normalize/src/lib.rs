@@ -10,7 +10,7 @@
 use std::path::Path;
 
 use anyhow::Context;
-use appcipe_spec::{AppCipe, ImageSourceOrPath, ImageSourceType};
+use appcipe_spec::{AppCipe, ImageFormat, ImagePlatform, ImageSourceOrPath, ImageSourceType};
 
 /// 將 appcipe 中的 host 路徑以 `base` 為基準絕對化：
 /// - `image.file`（僅 source = tar；TarPath 簡寫形式亦同）
@@ -26,6 +26,20 @@ pub fn normalize(app: &mut AppCipe, base: &Path) -> anyhow::Result<()> {
     }
 
     for (_name, svc) in app.services.iter_mut() {
+        // 簡寫 `image: <字串>`：若看起來是 registry reference（非路徑、帶 tag/digest、檔案不存在），
+        // 轉成 `source: image`（compose 風格的 `image: redis:7.2-alpine`）；否則維持 tar 路徑。
+        if let ImageSourceOrPath::TarPath(p) = &svc.image
+            && looks_like_image_ref(p, base)
+        {
+            let reference = p.clone();
+            svc.image = ImageSourceOrPath::Full {
+                source: ImageSourceType::Image,
+                file: reference,
+                format: ImageFormat::Auto,
+                platform: ImagePlatform::LinuxAmd64,
+            };
+        }
+
         // image.file（Host 路徑；僅 source=tar 或 TarPath 簡寫）
         match &mut svc.image {
             ImageSourceOrPath::TarPath(p) => {
@@ -76,6 +90,42 @@ pub fn load(path: &Path) -> anyhow::Result<AppCipe> {
     app.validate()
         .map_err(|e| anyhow::anyhow!("appcipe.yml 驗證失敗：\n{e}"))?;
     Ok(app)
+}
+
+/// 判斷簡寫 `image: <字串>` 看起來是不是 registry reference（而非本機 tar 路徑）。
+///
+/// 保守判定，避免把既有的 tar 路徑誤判為 ref：明確的路徑徵兆（`.`/`/`/`\`/`~` 開頭、
+/// Windows 磁碟代號、`.tar`/`.tgz`/`.tar.gz` 副檔名、或檔案實際存在）一律當路徑；
+/// 其餘**帶 `@digest` 或最後一段含 `:tag`** 的才視為 ref。tag 是否合法（禁 latest 等）
+/// 留給 `validate()`。
+fn looks_like_image_ref(s: &str, base: &Path) -> bool {
+    let s = s.trim();
+    if s.is_empty() {
+        return false;
+    }
+    let first = s.as_bytes()[0];
+    if matches!(first, b'.' | b'/' | b'\\' | b'~') {
+        return false;
+    }
+    // Windows 磁碟代號：X:\ 或 X:/
+    let b = s.as_bytes();
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'\\' | b'/') {
+        return false;
+    }
+    let lower = s.to_ascii_lowercase();
+    if lower.ends_with(".tar") || lower.ends_with(".tgz") || lower.ends_with(".tar.gz") {
+        return false;
+    }
+    // 確實存在的檔案 → 當 tar 路徑。
+    if Path::new(s).is_file() || base.join(s).is_file() {
+        return false;
+    }
+    // 釘版徵兆：有 @digest，或「最後一段路徑」含 ':'（tag）。
+    if s.contains('@') {
+        return true;
+    }
+    let last_segment = s.rsplit('/').next().unwrap_or(s);
+    last_segment.contains(':')
 }
 
 /// 相對路徑以 base 補全；絕對路徑原樣保留。
@@ -277,6 +327,44 @@ services:
         normalize(&mut app, &base).unwrap();
         assert_eq!(app.services["db"].mounts[0], "no-colon");
         assert!(app.validate().is_err());
+    }
+
+    // ---------- 簡寫 image ref 偵測 ----------
+
+    #[test]
+    fn normalize_detects_short_form_registry_ref() {
+        let base = abs_base();
+        let mut app = parse_raw(
+            "version: \"0.1\"\nname: App\nservices:\n  db: { image: \"redis:7.2-alpine\" }\n  web: { image: \"ghcr.io/o/i:1.0\" }\n",
+        );
+        normalize(&mut app, &base).unwrap();
+        for (svc, want) in [("db", "redis:7.2-alpine"), ("web", "ghcr.io/o/i:1.0")] {
+            match &app.services[svc].image {
+                ImageSourceOrPath::Full {
+                    source: ImageSourceType::Image,
+                    file,
+                    ..
+                } => assert_eq!(file, want, "{svc} 應轉成 image ref 且不絕對化"),
+                other => panic!("{svc} 應為 source:image，實為 {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn normalize_keeps_tar_paths_as_tar() {
+        let base = abs_base();
+        // 各種「明顯是路徑」的簡寫都不可被誤判為 ref。
+        let app_yaml = "version: \"0.1\"\nname: App\nservices:\n  a: { image: \"./db.tar\" }\n  b: { image: \"images/x.tar\" }\n  c: { image: \"plainname\" }\n";
+        let mut app = parse_raw(app_yaml);
+        normalize(&mut app, &base).unwrap();
+        for svc in ["a", "b", "c"] {
+            match &app.services[svc].image {
+                ImageSourceOrPath::TarPath(p) => {
+                    assert!(Path::new(p).is_absolute(), "{svc} tar 路徑應被絕對化：{p}");
+                }
+                other => panic!("{svc} 應維持 tar 路徑，實為 {other:?}"),
+            }
+        }
     }
 
     // ---------- load：端到端 ----------

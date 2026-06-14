@@ -166,7 +166,8 @@ bundle/
   - `persist_path` 必須以 `/` 開頭。
   - `depends_on`：必須指向存在的 service；不得有循環；不得指向自己。
   - env key：`[A-Za-z_][A-Za-z0-9_]*`。
-  - `image.source` 目前僅支援 `tar`（dockerfile/image 回報「尚未支援」）。
+  - `image.source` 支援 `tar`（本機 docker save / OCI archive）與 `image`（建置時從 registry 拉取）；`dockerfile` 仍回報「尚未支援」。`source: image` 的 `file` 是 registry reference，**必須釘版**：明確且非 `latest` 的 tag，或 `@<algo>:<hex>` digest（`check_image_reference`）；未標記/`latest` 一律拒絕（可重現性）。
+- **簡寫 `image: <字串>` 的判別（`appcipe-normalize::looks_like_image_ref`）**：非路徑徵兆（不以 `.`/`/`/`\`/`~` 開頭、非 Windows 磁碟代號、非 `.tar`/`.tgz`/`.tar.gz`、且檔案不存在）且帶 `@digest` 或「最後一段含 `:tag`」→ 轉成 `source: image`（compose 風格）；否則維持 tar 路徑。tag 合法性仍由 `validate()` 把關。
 - `AppCipe` 衍生 `Clone`。
 
 ### appcipe-normalize（改為 lib）
@@ -180,8 +181,10 @@ bundle/
 - `pub struct PackResult { pub bundle_dir: PathBuf, pub manifest: chefer_bundle::Manifest }`
 - `pub fn pack(app: &AppCipe, opts: &PackOptions) -> anyhow::Result<PackResult>`
 - 行為：
-  0. image tar 先安全解壓到暫存目錄再解析（OCI blobs 需隨機存取）；各層 blob 的解壓/雜湊/重壓全程串流。
-  1. 對每個 service 讀 image tar，**自動偵測格式**（看內容不看副檔名）：
+  0. 取得每個 service 的 image，收斂成同一個 `ResolvedImage`（config + 各層 blob 檔），來源二擇一：
+     - **`source: tar`**：image tar 先安全解壓到暫存目錄再解析（OCI blobs 需隨機存取）。
+     - **`source: image`**：以 `oci-client`（rustls）依 `platform` 從 registry 拉 manifest+config+layers（`chefer-pack::registry`，pack 同步流程內 `block_on` 一個 tokio runtime；匿名，僅公開 image），layer blob 寫進暫存目錄。之後與 tar 共用同一條 repack。各層 blob 的解壓/雜湊/重壓全程串流。
+  1. `source: tar` 時**自動偵測格式**（看內容不看副檔名）：
      - docker-archive：根目錄有 `manifest.json`（JSON 陣列，元素含 `Config`/`Layers`）。
      - oci-archive：根目錄有 `index.json` + `blobs/`（layout 可含 `oci-layout`）。
   2. multi-arch：oci index 依 service `platform` 挑 manifest；找不到該平台→報錯列出可用平台。docker-archive 多筆 entry 時亦同（依 config 的 os/architecture）。

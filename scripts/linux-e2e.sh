@@ -661,6 +661,50 @@ YAML
   note "Network isolation E2E passed: internal isolates undeclared port ${s} (no egress); declared ${h} reachable"
 }
 
+# Registry pull E2E：用 `source: image` 直接從 registry 拉一個小公開 image（alpine，釘版），
+# 不經 docker save，打包成單檔並執行，驗證 pull → repack → assemble → run 全鏈。需要對外網路。
+run_registry_pull_e2e() {
+  local work="$1"
+  local output_target="$2"
+  local image_platform="$3"
+  local cli="$4"
+  local kit="$5"
+  local ref="${CHEFER_E2E_REGISTRY_REF:-alpine:3.20}"
+
+  note "Registry pull E2E: image ${ref} pulled straight from registry (no docker save)"
+  mkdir -p "$work/reg"
+  cat >"$work/reg/appcipe.yml" <<YAML
+version: "0.1"
+name: LinuxRegPull
+app_version: "e2e"
+data_dir: "$work/reg-data"
+crash: fail_fast
+network: shared
+services:
+  app:
+    image:
+      source: image
+      file: "${ref}"
+      platform: ${image_platform}
+    cmd: ["sh", "-c", "echo CHEFER_REGISTRY_PULL_OK"]
+    interface_mode: none
+YAML
+  "$cli" build "$work/reg/appcipe.yml" --out "$work/out-reg" --kit-dir "$kit" --target "$output_target"
+  local reg_app="$work/out-reg/LinuxRegPull/LinuxRegPull_${output_target}"
+  [[ -f "$reg_app" ]] || die "missing built registry-pull app: $reg_app"
+  chmod +x "$reg_app"
+  local reg_log="$work/reg.log"
+  set +e
+  "$reg_app" >"$reg_log" 2>&1
+  local reg_code=$?
+  set -e
+  if [[ "$reg_code" -ne 0 ]] || ! grep -q "CHEFER_REGISTRY_PULL_OK" "$reg_log"; then
+    cat "$reg_log" >&2 || true
+    die "Registry pull E2E failed: exit=${reg_code}, expected CHEFER_REGISTRY_PULL_OK"
+  fi
+  note "Registry pull E2E passed: ${ref} pulled, packed, ran"
+}
+
 main() {
   [[ "$(uname -s)" == "Linux" ]] || die "Linux E2E must run on Linux"
   ! is_wsl || die "Linux E2E requires a native Linux host, not WSL"
@@ -823,6 +867,9 @@ main() {
 
   note "Checking network isolation (shared leak vs internal isolation)"
   run_netns_iso_e2e "$work" "$output_target" "$image_platform" "$cli" "$kit" "$image_tar"
+
+  note "Checking registry image pull (source: image)"
+  run_registry_pull_e2e "$work" "$output_target" "$image_platform" "$cli" "$kit"
 
   if [[ "${CHEFER_E2E_GUI:-0}" == "1" ]]; then
     run_gui_e2e "$work" "$output_target" "$image_platform" "$cli" "$kit"
