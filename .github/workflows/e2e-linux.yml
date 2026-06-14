@@ -103,6 +103,18 @@ jobs:
             exit 1
           fi
 
+      # virtiofsd 以 `--sandbox namespace`（uid-map 的前提）需要非特權 user namespaces；
+      # Ubuntu 24.04 預設以 apparmor 限制，這裡放行（與 native E2E job 一致）。
+      - name: Enable unprivileged user namespaces
+        shell: bash
+        run: |
+          if [[ -e /proc/sys/kernel/unprivileged_userns_clone ]]; then
+            sudo sysctl -w kernel.unprivileged_userns_clone=1
+          fi
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          fi
+
       - name: Docker info
         run: docker info
 

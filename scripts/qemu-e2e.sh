@@ -305,17 +305,22 @@ start_virtiofsd() {
   local shared_dir="$3"
   local log="$4"
   rm -f "$socket"
-  # --sandbox=none：不做 chroot（CI 環境非 root，無法 pivot_root）。
   # 關鍵：guest（VM 內 root，uid 0）對 virtiofs 的寫入會要求 virtiofsd setfsuid(0)，
   # 但 virtiofsd 以非 root（runner uid）執行，無法切到 uid 0 → 寫入 EPERM
-  # （persist 資料寫回 host 即在此失敗）。用 --uid-map/--gid-map 把 guest uid/gid 0
-  # 雙向映射到 runner 自身的 uid/gid：guest root 的寫入改以 runner 身份落地，
-  # 而 runner 擁有 shared_dir，故可寫；反向讓 host 端 runner 擁有的檔案在 guest 內顯示為 root。
+  # （persist 資料寫回 host 即在此失敗）。解法：--sandbox namespace 讓 virtiofsd 進入
+  # 一個非特權 user namespace，再以 --uid-map/--gid-map 把 sandbox 內的 uid/gid 0
+  # 映射到 runner 自身的 uid/gid → guest root 的寫入以 runner 身份落地（runner 擁有
+  # shared_dir 故可寫），反向讓 host 端 runner 擁有的檔案在 guest 內顯示為 root。
   #
-  # 注意：rust virtiofsd 的旗標是 `--uid-map`/`--gid-map`（非 `--translate-uid`，後者
-  # 不存在於目前版本，會以「unexpected argument」中止）；格式為
-  # `:<guest_uid>:<host_uid>:<count>:`（前後皆有冒號為分隔）。count=1 只映射 uid 0，
-  # 足敷以容器 root（uid 0）執行的服務寫入 persist 之用。
+  # 注意事項（皆為實測踩到的點）：
+  #  - 旗標是 rust virtiofsd 的 `--uid-map`/`--gid-map`（非 `--translate-uid`，後者在
+  #    目前版本不存在，會以「unexpected argument」中止）；格式
+  #    `:<guest_uid>:<host_uid>:<count>:`（前後皆有冒號）。count=1 只映射 uid 0，
+  #    足敷以容器 root（uid 0）執行的服務寫入 persist。
+  #  - `--uid-map` 只能在 `--sandbox namespace` 下使用；`--sandbox=none` 會以
+  #    「uid_map can only be used ... where sandbox mod is namespace」退出 → socket
+  #    建不起來、QEMU 連 vhost-user-fs 失敗而秒退。namespace 模式需要非特權 user
+  #    namespaces（workflow 以 sysctl 開啟，與 native E2E 一致）。
   local huid hgid
   huid="$(id -u)"
   hgid="$(id -g)"
@@ -323,7 +328,7 @@ start_virtiofsd() {
     --socket-path="$socket" \
     --shared-dir="$shared_dir" \
     --cache=never \
-    --sandbox=none \
+    --sandbox namespace \
     --uid-map ":0:${huid}:1:" \
     --gid-map ":0:${hgid}:1:" >"$log" 2>&1 &
   local pid=$!
