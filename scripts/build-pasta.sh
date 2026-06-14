@@ -77,7 +77,8 @@ main() {
     -v "$out_dir:/out" \
     "$container" \
     sh -eu -c '
-      apk add --no-cache git make gcc musl-dev linux-headers >/dev/null
+      # coreutils 提供 fmt（passt 的 seccomp.sh 需要；busybox 沒有）。
+      apk add --no-cache git make gcc musl-dev linux-headers coreutils >/dev/null
       git clone "$PASST_REPO" /src
       cd /src
       if [ -n "${PASST_REF:-}" ]; then
