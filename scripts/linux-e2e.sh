@@ -174,6 +174,7 @@ name: ${name}
 app_version: "e2e"
 data_dir: "${data_dir}"
 crash: fail_fast
+network: shared
 services:
   web:
     image:
@@ -237,6 +238,7 @@ name: LinuxE2EFail
 app_version: "e2e"
 data_dir: "${data_dir}"
 crash: fail_fast
+network: shared
 services:
   fail:
     image:
@@ -261,6 +263,7 @@ name: LinuxGuiE2E
 app_version: "e2e"
 data_dir: "${data_dir}"
 crash: fail_fast
+network: shared
 services:
   gui:
     image:
@@ -285,6 +288,7 @@ name: LinuxWaylandE2E
 app_version: "e2e"
 data_dir: "${data_dir}"
 crash: fail_fast
+network: shared
 services:
   wayland:
     image:
@@ -567,6 +571,37 @@ run_netns_iso_e2e() {
   while [[ "$h" == "$g" ]]; do h="$(pick_free_port)"; done
   s="$(pick_free_port)"
   while [[ "$s" == "$g" || "$s" == "$h" ]]; do s="$(pick_free_port)"; done
+
+  # --- 預設模式：省略 network: 應為 bridge（驗證 spec→manifest→inspect 的預設翻轉）---
+  note "Network E2E (default): omitting network: should pack as bridge"
+  mkdir -p "$work/iso-default"
+  cat >"$work/iso-default/appcipe.yml" <<YAML
+version: "0.1"
+name: LinuxNetDefault
+app_version: "e2e"
+data_dir: "$work/iso-default-data"
+crash: fail_fast
+services:
+  web:
+    image:
+      source: tar
+      file: "${image_tar}"
+      format: docker-archive
+      platform: ${image_platform}
+    cmd: ["python", "/app/server.py"]
+    env: { PORT: "${g}" }
+    ports: ["${h}:${g}"]
+    interface_mode: none
+YAML
+  "$cli" build "$work/iso-default/appcipe.yml" --out "$work/out-iso-default" --kit-dir "$kit" --target "$output_target"
+  local default_app="$work/out-iso-default/LinuxNetDefault/LinuxNetDefault_${output_target}"
+  [[ -f "$default_app" ]] || die "missing built default-net app: $default_app"
+  # 直接檢查 bundle manifest（穩定，不受 inspect 表格寬度/CJK 換行影響）。
+  local default_manifest="$work/out-iso-default/LinuxNetDefault/bundle/manifest.json"
+  [[ -f "$default_manifest" ]] || die "missing default-net bundle manifest: $default_manifest"
+  grep -q '"network"[[:space:]]*:[[:space:]]*"bridge"' "$default_manifest" \
+    || die "default network should be bridge; manifest says: $(grep -o '"network"[^,]*' "$default_manifest")"
+  note "Default network confirmed: bridge"
 
   # --- shared：示範未宣告的 secret port 會洩漏到 host（也驗證 assert_unreachable 有意義）---
   note "Network E2E (shared): undeclared port ${s} should LEAK to host loopback"

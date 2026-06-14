@@ -11,11 +11,12 @@ data_dir: "D:/Apps/StudioPro"       # 選填：覆蓋預設資料目錄位置；
                                     #   Linux:   $XDG_DATA_HOME/{name} 或 ~/.local/share/{name}
 crash: fail_fast                    # 選填：崩潰策略；目前僅支援 fail_fast（任一服務非 0 退出→整體退出並透傳該 exit code）
                                     #   舊欄位名 crash_policy 仍相容（serde alias）
-network: shared                     # 選填：網路模式（預設 shared）。三選一：
-                                    #   shared   — 共用 host 網路；未宣告的 port 也能從 host 連到（不隔離；現況）
-                                    #   internal — app 專屬網路，只有宣告的 ports: 對外，且「無對外網路」(類似 Docker 的 internal)
-                                    #   bridge   — 同 internal 但可出網（類似 Docker 預設 bridge）；為未來的目標預設
-                                    #   注意：internal/bridge 目前於原生 Linux 後端可用；bridge 的「出網」仍在接上 pasta（見 roadmap）
+network: bridge                     # 選填：網路模式（預設 bridge）。三選一：
+                                    #   bridge   — app 專屬網路、只開宣告的 ports:、可出網（NAT，類似 Docker 預設）；預設
+                                    #   internal — 同 bridge 但「無對外網路」(類似 Docker compose 的 internal: true)
+                                    #   shared   — 共用 host 網路；未宣告的 port 也能從 host 連到（不隔離；舊行為）
+                                    #   注意：省略此欄＝bridge＝隔離。要回到「未宣告 port 也可從 host 連到」請顯式寫 shared。
+                                    #   bridge 出網需 kit 內含 pasta（官方 release kit 已附）；缺 pasta 時自動退化為 internal。
 
 # === 服務定義 ===
 services:

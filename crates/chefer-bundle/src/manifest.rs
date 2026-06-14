@@ -118,17 +118,19 @@ pub enum CrashPolicy {
 
 /// app 網路模式（見 docs/DESIGN.md「網路隔離」節）。
 ///
-/// guest-agent 依此決定是否建立 per-app netns、是否起 pasta 出網。目標預設為 `Bridge`，
-/// 但在各後端做完前 serde 預設暫維持 `Shared`（沿用現況、不破壞既有 bundle）。
+/// guest-agent 依此決定是否建立 per-app netns、是否起 pasta 出網。**預設為 `Bridge`**。
+/// 注意：舊 bundle 的 manifest 無此欄位 → serde 反序列化時會套用此預設（`Bridge`），
+/// 等同把舊 bundle 視為 bridge；如需沿用舊「共用 host 網路」行為請以新版重打包並寫
+/// `network: shared`。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NetworkMode {
     /// 共用 host/VM netns（不隔離；現況）。
-    #[default]
     Shared,
     /// 自己的 app netns，只有 lo；宣告的 port 經 relay 對外；無對外網路。
     Internal,
     /// 同 Internal 再加 pasta 出網 NAT（Docker 預設 bridge 等價）。
+    #[default]
     Bridge,
 }
 
