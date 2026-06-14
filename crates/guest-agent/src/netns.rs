@@ -23,6 +23,7 @@ use std::ffi::OsString;
 use std::io::{self, IoSlice, IoSliceMut, Read};
 use std::net::{Ipv4Addr, TcpStream, UdpSocket};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -35,19 +36,22 @@ use nix::sys::socket::{
     sendmsg, socketpair,
 };
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
-use nix::unistd::{ForkResult, Pid, fork};
+use nix::unistd::{ForkResult, Gid, Pid, Uid, fork, setgid, setgroups, setuid};
 
 pub mod relay;
 
 const PROTO_TCP: u8 = 1;
 const PROTO_UDP: u8 = 2;
+/// netns holder 與 pasta 在 root 後端改以此非特權 uid/gid 執行（nobody）：pasta 以 root
+/// 執行會自我停用、且無法存取 root 擁有的 ns；以非特權身分執行則與 rootless 路徑等效。
+const NOBODY_ID: u32 = 65534;
 
 /// 已建立的 app netns：持有 holder pid、其 ns fd，與通往 holder socket factory 的通道。
 pub struct AppNet {
     holder: Pid,
     /// `/proc/<holder>/ns/net`。
     net_fd: OwnedFd,
-    /// `/proc/<holder>/ns/user`（僅 rootless）。
+    /// `/proc/<holder>/ns/user`（holder 一律有 user ns，owner = net_uid；供 pasta `--userns`）。
     user_fd: Option<OwnedFd>,
     rootless: bool,
     /// bridge 模式下提供出網 NAT 的 pasta 子行程（找不到 pasta 時為 None → 退化成 internal）。
@@ -131,10 +135,16 @@ pub struct NetnsJoin {
 
 impl AppNet {
     /// 取得供服務中繼行程 `setns` 用的 raw fd。
+    /// `user` 僅 rootless 時提供：rootless 服務需加入 holder user ns 取得 caps；root 後端的
+    /// 服務只 `setns` 進 netns、**不**加入 user ns（保持真實 root → chown/gosu 可用）。
     pub fn join(&self) -> NetnsJoin {
         NetnsJoin {
             net: self.net_fd.as_raw_fd(),
-            user: self.user_fd.as_ref().map(|f| f.as_raw_fd()),
+            user: if self.rootless {
+                self.user_fd.as_ref().map(|f| f.as_raw_fd())
+            } else {
+                None
+            },
         }
     }
 
@@ -170,10 +180,11 @@ impl AppNet {
     }
 }
 
-/// 建立 app netns：fork holder、`unshare` 出新 netns、拉起 `lo`，回傳可加入該 netns 的控制把手。
+/// 建立 app netns：fork holder、`unshare` 出新 user+net ns、拉起 `lo`，回傳控制把手。
 ///
-/// `rootless`：非 root 時 holder 另 `unshare(NEWUSER)` 並寫單一 uid/gid map（同
-/// rootless 服務的身分模型），如此 holder 在自己的 user ns 內為 root，得以拉起 `lo`。
+/// holder **一律**建立 user ns（owner = net_uid：rootless 為呼叫者、root 後端為 nobody），
+/// 使 netns 由非特權 user ns 擁有，bridge 的 pasta（同以 net_uid 執行）才 `--userns` 進得來。
+/// rootless 服務會加入此 user ns 取得 caps；root 後端的服務只 `setns` 進 netns、保持真實 root。
 ///
 /// `bridge`：為 true 時額外嘗試啟動 bundled `pasta` 對該 netns 提供出網 NAT
 /// （= Docker bridge 等價）。找不到 pasta 或啟動失敗時**不報錯**——退化成 internal
@@ -184,6 +195,17 @@ pub fn setup_app_netns(
     bridge: bool,
     pasta_hint: Option<PathBuf>,
 ) -> Result<AppNet> {
+    // holder 與 pasta 執行用的 uid/gid：rootless 沿用呼叫者自身；root 後端降到 nobody
+    //（pasta 以 root 無法運作，且 root 擁有的 ns 在 pasta 降權後存取不到）。
+    let (net_uid, net_gid) = if rootless {
+        (
+            nix::unistd::getuid().as_raw(),
+            nix::unistd::getgid().as_raw(),
+        )
+    } else {
+        (NOBODY_ID, NOBODY_ID)
+    };
+
     // 就緒/錯誤回報管線：holder 設定完成後寫 1 byte（1=ok / 0=fail）。
     let (rd, wr) =
         nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).context("建立 netns 就緒管線失敗")?;
@@ -202,7 +224,7 @@ pub fn setup_app_netns(
         ForkResult::Child => {
             drop(rd);
             drop(sv_parent);
-            holder_main(rootless, wr, sv_holder) // 不返回（factory 迴圈 → pause）
+            holder_main(net_uid, net_gid, wr, sv_holder) // 不返回（factory 迴圈 → pause）
         }
         ForkResult::Parent { child } => {
             drop(wr);
@@ -226,20 +248,18 @@ pub fn setup_app_netns(
                     }
                 );
             }
-            // 開啟 holder 的 ns fd（供服務與 relay factory setns）。
+            // 開啟 holder 的 ns fd。holder 一律有 user ns（owner = net_uid）：net 供服務與
+            // SCM_RIGHTS factory；user 供 pasta `--userns`。服務是否加入 user ns 由 join() 依
+            // rootless 決定（root 後端的服務不加入 → 保持真實 root，chown/gosu 不受影響）。
             let net_fd = open_ns_fd(child, "net").inspect_err(|_| {
                 let _ = kill(child, Signal::SIGKILL);
             })?;
-            let user_fd = if rootless {
-                Some(open_ns_fd(child, "user").inspect_err(|_| {
-                    let _ = kill(child, Signal::SIGKILL);
-                })?)
-            } else {
-                None
-            };
-            // bridge：嘗試起 pasta 提供出網（失敗則退化為 internal，不致命）。
+            let user_fd = Some(open_ns_fd(child, "user").inspect_err(|_| {
+                let _ = kill(child, Signal::SIGKILL);
+            })?);
+            // bridge：嘗試起 pasta（以 net_uid 執行）提供出網（失敗則退化為 internal，不致命）。
             let pasta = if bridge {
-                start_pasta(child, rootless, pasta_hint)
+                start_pasta(child, net_uid, net_gid, pasta_hint)
             } else {
                 None
             };
@@ -258,9 +278,10 @@ pub fn setup_app_netns(
 /// bridge 模式：對 holder 的 netns 啟動 pasta（passt 的 netns 模式）提供出網 NAT。
 /// 從 host netns（guest-agent 所在）執行，以 `--netns`/`--userns` 指向 holder 的 ns。
 /// 找不到 pasta 或啟動失敗回 None（呼叫端據此退化為 internal）。
-fn start_pasta(holder: Pid, rootless: bool, hint: Option<PathBuf>) -> Option<Child> {
+fn start_pasta(holder: Pid, net_uid: u32, net_gid: u32, hint: Option<PathBuf>) -> Option<Child> {
     let prog = locate_pasta(hint);
     let net_ns = format!("/proc/{}/ns/net", holder.as_raw());
+    let user_ns = format!("/proc/{}/ns/user", holder.as_raw());
     let mut cmd = Command::new(&prog);
     // --config-net：在目標 netns 內自動配置位址/路由/DNS；--foreground：由我們掌控其生命週期。
     cmd.arg("--config-net").arg("--foreground");
@@ -272,10 +293,11 @@ fn start_pasta(holder: Pid, rootless: bool, hint: Option<PathBuf>) -> Option<Chi
     cmd.arg("--tcp-ns").arg("none");
     cmd.arg("--udp-ns").arg("none");
     cmd.arg("--netns").arg(&net_ns);
-    if rootless {
-        cmd.arg("--userns")
-            .arg(format!("/proc/{}/ns/user", holder.as_raw()));
-    }
+    // 一律帶 --userns（holder 一律有 user ns）：pasta 須先進入擁有此 netns 的 user ns 才存取得到。
+    cmd.arg("--userns").arg(&user_ns);
+    // 以 net_uid/gid 執行 pasta：pasta 以 root 會自我停用，必須非特權執行。net_uid 即 holder
+    // user ns 的 owner（rootless=呼叫者；root 後端=nobody），故 pasta 進得了該 user ns。
+    cmd.uid(net_uid).gid(net_gid);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -339,7 +361,7 @@ fn open_ns_fd(pid: Pid, which: &str) -> Result<OwnedFd> {
 /// holder 子行程：unshare 出 netns（rootless 另含 user ns + uid map），拉起 lo，回報就緒後
 /// 進入 socket factory 迴圈（為 supervisor 建立 app-netns 內的 upstream 並以 SCM_RIGHTS 回傳），
 /// 通道關閉後 pause() 常駐以維持 netns 存活。`wr` 為就緒回報管線，`factory` 為 SCM_RIGHTS 通道。
-fn holder_main(rootless: bool, wr: OwnedFd, factory: OwnedFd) -> ! {
+fn holder_main(net_uid: u32, net_gid: u32, wr: OwnedFd, factory: OwnedFd) -> ! {
     // 父行程（supervisor）若先死，holder 連帶被 SIGKILL，避免遺留 netns。
     unsafe {
         libc::prctl(
@@ -356,27 +378,42 @@ fn holder_main(rootless: bool, wr: OwnedFd, factory: OwnedFd) -> ! {
         let _ = nix::unistd::write(&wr, &b);
     };
 
-    // **在 unshare(NEWUSER) 之前**取得真實 uid/gid：unshare 後在新 user ns 內、map 尚未
-    // 寫入時，getuid()/getgid() 會回傳 overflow id（65534）。單行非特權 uid_map 必須把
-    // 「寫入者在 parent ns 的 euid」映射進去，若誤用 65534 會被核心拒絕（EPERM）。
+    // root 後端：先降權到非特權 net_uid（nobody）。如此 holder 的 user ns owner = nobody，
+    // pasta（同樣以 nobody 執行）才進得了；服務則仍以真實 root 只 setns 進 netns（見 join()）。
+    // 先 setgroups→setgid→setuid（setuid 後即失去改 gid/groups 的權限）。
+    if nix::unistd::geteuid().as_raw() != net_uid {
+        if let Err(e) = setgroups(&[]) {
+            eprintln!("[guest-agent] netns holder setgroups 失敗：{e}");
+            report(false);
+            unsafe { libc::_exit(1) }
+        }
+        if setgid(Gid::from_raw(net_gid)).is_err() || setuid(Uid::from_raw(net_uid)).is_err() {
+            eprintln!("[guest-agent] netns holder 降權到 nobody 失敗");
+            report(false);
+            unsafe { libc::_exit(1) }
+        }
+        // setuid 降權會清掉 dumpable 旗標 → /proc/self/* 變成 root 擁有、本行程寫不了
+        // （setgroups/uid_map 會 EPERM）。重設 dumpable=1 恢復對自身 /proc 的寫入權。
+        unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) };
+    }
+
+    // **一律**先單獨 unshare user ns、寫單行 uid/gid map，再建 netns。
+    // 即使最終服務以 root 執行，netns 也由 holder 自己的 user ns（owner = net_uid）擁有，
+    // 好讓 bridge 的 pasta（以 net_uid 執行、會降權）`--userns` 進得來；root 服務不加入此 ns。
+    // 此處 getuid() 已是 net_uid（root 後端已降權）。
     let real_uid = nix::unistd::getuid().as_raw();
     let real_gid = nix::unistd::getgid().as_raw();
-
-    // rootless：先單獨 unshare user ns、寫單行 uid/gid map，再建 netns
-    //（慣用的 `unshare -U` → map → 建 netns 流程）。
-    if rootless {
-        if let Err(e) = unshare(CloneFlags::CLONE_NEWUSER) {
-            eprintln!("[guest-agent] netns holder unshare(user) 失敗：{e}");
-            report(false);
-            unsafe { libc::_exit(1) }
-        }
-        if let Err(e) = write_self_id_maps(real_uid, real_gid) {
-            eprintln!("[guest-agent] netns holder 寫入 uid/gid map 失敗：{e:#}");
-            report(false);
-            unsafe { libc::_exit(1) }
-        }
+    if let Err(e) = unshare(CloneFlags::CLONE_NEWUSER) {
+        eprintln!("[guest-agent] netns holder unshare(user) 失敗：{e}");
+        report(false);
+        unsafe { libc::_exit(1) }
     }
-    // 此時（rootless 下已是 user ns 內 root，持 CAP_NET_ADMIN）再建 net ns。
+    if let Err(e) = write_self_id_maps(real_uid, real_gid) {
+        eprintln!("[guest-agent] netns holder 寫入 uid/gid map 失敗：{e:#}");
+        report(false);
+        unsafe { libc::_exit(1) }
+    }
+    // 此時已是 user ns 內 root（持 CAP_NET_ADMIN），再建 net ns。
     if let Err(e) = unshare(CloneFlags::CLONE_NEWNET) {
         eprintln!("[guest-agent] netns holder unshare(net) 失敗：{e}");
         report(false);
