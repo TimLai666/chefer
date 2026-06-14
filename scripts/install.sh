@@ -99,9 +99,10 @@ cp -f "$src/chefer" "$INSTALL_DIR/chefer"
 chmod +x "$INSTALL_DIR/chefer" 2>/dev/null || true
 printf 'chefer-install: 已安裝到 %s\n' "$INSTALL_DIR"
 
-# 安裝後煙霧測試：確認剛裝好的 binary 真能跑（重裝／修復最重要的確認）
+# 安裝後煙霧測試：確認剛裝好的 binary 真能跑（重裝／修復最重要的確認）。
+# 看 exit code 即可——`version` 印的是表格，首行可能空白/含 ANSI，不適合直接回顯。
 if "$INSTALL_DIR/chefer" version >/dev/null 2>&1; then
-  printf 'chefer-install: 驗證 OK：%s\n' "$("$INSTALL_DIR/chefer" version 2>/dev/null | head -n1)"
+  printf 'chefer-install: 驗證 OK（chefer 可執行）\n'
 else
   printf 'chefer-install: 警告：剛安裝的 chefer 無法執行 `version`（macOS 可能是 Gatekeeper 攔未簽章檔，於系統設定→隱私權與安全性放行；其餘情況請回報）\n' >&2
 fi

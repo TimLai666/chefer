@@ -90,11 +90,13 @@ try {
     Write-Host "chefer-install: installed to $installDir"
 
     # post-install smoke test: confirm the freshly-installed binary actually runs
-    try {
-        $v = & $exeDst version 2>$null | Select-Object -First 1
-        Write-Host "chefer-install: verified OK: $v"
-    } catch {
-        Write-Warning "chefer-install: the freshly-installed chefer failed to run 'version' - please report this."
+    # (check the exit code, not stdout: `version` prints a styled table whose first
+    # line is blank/ANSI, so don't try to echo a version string here)
+    & $exeDst version *> $null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "chefer-install: verified OK (chefer runs)."
+    } else {
+        Write-Warning "chefer-install: the freshly-installed chefer failed to run 'version' (exit $LASTEXITCODE) - please report this."
     }
 
     # PATH (User scope, idempotent)
