@@ -42,8 +42,9 @@ usage() {
 main() {
   local arch="" out_dir=""
   local passt_repo="${CHEFER_PASST_REPO:-https://passt.top/passt}"
-  # 預設指向一個已知可建置的 passt tag；可由 --passt-ref / CHEFER_PASST_REF 覆寫成更新版本。
-  local passt_ref="${CHEFER_PASST_REF:-2024_11_27.e0ed2c6}"
+  # 未指定 ref 時，於容器內取「最新的 release tag」（reproducible at build time，
+  # 避免在此硬寫一個會猜錯的 commit）；可由 --passt-ref / CHEFER_PASST_REF 釘選特定版本。
+  local passt_ref="${CHEFER_PASST_REF:-}"
   local container="${CHEFER_PASTA_CONTAINER:-alpine:3.20}"
 
   while [[ $# -gt 0 ]]; do
@@ -57,7 +58,6 @@ main() {
   done
 
   [[ -n "$arch" ]] || { usage; die "缺少 --arch"; }
-  [[ -n "$passt_ref" ]] || die "缺少 passt ref（--passt-ref 或 CHEFER_PASST_REF）"
   command -v docker >/dev/null 2>&1 || die "需要 docker 才能建置 pasta"
 
   local root; root="$(repo_root)"
@@ -67,7 +67,7 @@ main() {
   out_dir="$(cd "$out_dir" && pwd)"
 
   local platform; platform="$(docker_platform "$arch")"
-  note "建置 pasta（$arch，passt ref=$passt_ref）於容器 $container（$platform）"
+  note "建置 pasta（$arch，passt ref=${passt_ref:-<latest tag>}）於容器 $container（$platform）"
 
   # 在容器內：取得建置相依 → clone 指定 ref → make static → strip → 輸出 pasta-<arch>。
   docker run --rm --platform "$platform" \
@@ -80,7 +80,13 @@ main() {
       apk add --no-cache git make gcc musl-dev linux-headers >/dev/null
       git clone "$PASST_REPO" /src
       cd /src
-      git checkout --detach "$PASST_REF"
+      if [ -n "${PASST_REF:-}" ]; then
+        git checkout --quiet "$PASST_REF"
+      else
+        PASST_REF="$(git describe --tags --abbrev=0)"
+        echo "using latest passt tag: $PASST_REF"
+        git checkout --quiet "$PASST_REF"
+      fi
       # static 目標把 passt/pasta 連成靜態（無 .so 相依）。
       make static
       # passt 與 pasta 同一支二進位；命名為 pasta-<arch> 即以 pasta 模式執行。
