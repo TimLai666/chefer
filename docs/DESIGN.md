@@ -252,6 +252,17 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
   - **純邏輯（跨平台可測，`vz_util.rs` 內）**：appliance 檔在 bundle 內的查找（`layout::vm_dir` / `kernel_name` / `initramfs_name`）、kernel command line 組裝、VM 資源（CPU/RAM）計算、guest 路徑映射、錯誤訊息——皆為純函式並有單元測試（在 Windows/Linux 上即可跑）。
   - **macOS 專屬層（`#[cfg(target_os = "macos")]`）**：以 objc2-virtualization 驅動上述組態並開機；此層只能在實體 Mac 驗證（GHA macOS runner 為巢狀虛擬化、開不了 VZ guest，僅能 compile-check）。
   - **Appliance 建置**：`vm/chefer-vmlinuz-*` 與 `vm/chefer-initramfs-*` 由獨立的 Linux 建置流程產生，並可在 **Linux + QEMU**（同樣 virtio 開機）上做 E2E 驗證，與 macOS 無關——這是讓 vz 後端可信的關鍵前置，且不需 Mac。
+  - **架構對應（Intel vs Apple Silicon）**：VZ 是虛擬化非模擬，**guest 架構必須 == host 架構**。Apple Silicon → arm64 guest（需 `aarch64` appliance/agent 與 `platform: linux/arm64` 的 image）；Intel Mac → x86_64 guest（需 `x86_64` 與 `linux/amd64`）。kit 兩架構皆出貨、macOS 目標分 `x86_64-apple-darwin` / `aarch64-apple-darwin`；但**打包出來 app 的 image `platform:` 必須對上該 Mac 的 CPU**（不跨架構）。Apple Silicon 另有 **`VZLinuxRosettaDirectoryShare`**：可讓 arm64 guest 以 Rosetta 跑 x86_64 Linux 執行檔（未來可據此讓 `linux/amd64` image 在 Apple Silicon 上執行）；Intel 無此項。
+
+  - **GUI（規劃；macOS 顯示 Linux app 視窗）— 採「virtio-gpu + 內嵌 kiosk compositor」路線**：
+
+    macOS 無內建 X11/Wayland、且 app 跑在 micro-VM 內，無法沿用 Linux/WSL 的「傳 unix socket 給既有顯示伺服器」做法。採自包路線（零安裝、符合單檔精神）：
+
+    - **Guest（appliance）**：kernel 開 `CONFIG_DRM_VIRTIO_GPU`（+ DRM/evdev）；initramfs 內嵌極小 kiosk Wayland compositor **`cage`** + Mesa（llvmpipe 軟算繪，或 virtio-gpu 加速）+ **Xwayland**（讓 X11 app 也能跑）。guest-agent 對 `interface_mode: gui/both` 的服務改以 `cage -- <服務命令>` 啟動（設好 `WAYLAND_DISPLAY`），算繪到 virtio-gpu scanout。`cage` 的「全螢幕單一 app」模型恰好對上 chefer「一個 app 至多一個介面服務」。
+    - **Host（vz 後端，`#[cfg(target_os = "macos")]`）**：VM 組態加 `VZVirtioGraphicsDeviceConfiguration`（一個 scanout）+ USB 鍵盤/指標裝置；開一個 AppKit 視窗承載 `VZVirtualMachineView` 綁該 VM → 顯示 guest framebuffer，VZ 自動把鍵鼠 HID 轉進 guest。代表 macOS 版 chefer 在 gui 模式時要成為「有 NSApplication 事件迴圈的 GUI 程式」；非 gui 維持 headless。
+    - **生命週期 / 輸入 / 剪貼簿**：`cage` 內 app 結束 → 沿用 guest-agent 既有「介面服務結束＝收掉 app」→ VM 關、視窗關。鍵鼠走 VZ→USB HID→evdev→cage，免額外處理。macOS↔guest 剪貼簿需另開一條 **vsock** + 小 agent 同步，列為後續加強。
+    - **分期**：① vz 後端先點亮（非 GUI）→ ② appliance 加 virtio-gpu + cage + Xwayland，先在 **QEMU** 驗 GUI app 能算繪 → ③ 真 Mac 接 `VZVirtualMachineView` + HID → ④ 剪貼簿/縮放打磨。全程依賴實體 Mac 才能完成 ③ 之後。
+    - **替代（不採用）**：X11 → 要求使用者裝 **XQuartz**、X11 經 vsock 轉發——較快但破壞零安裝、過 VM 邊界延遲高、XQuartz 老舊，故不採。
 
 ### guest-agent（lib + bin；Linux 專屬邏輯 cfg 隔離）
 - lib：`pub struct RunConfig { pub bundle_dir: PathBuf, pub data_dir: PathBuf, pub cache_dir: Option<PathBuf>, pub keep_rootfs: bool, pub udp_bridge: bool }`
