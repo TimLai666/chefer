@@ -293,7 +293,9 @@ AppCipe 新增 app 級欄位 **`network`**（appcipe-spec enum，serde rename �
 
 實作分期（**已全部完成**）:**P1** 原生 Linux 完整做 `bridge`（app netns + 跨 netns inbound relay + pasta 出網）與 `internal`（同路徑不起 pasta）+ 單元/E2E 驗證（CI e2e-linux，amd64+arm64 rootless）→ **P2** WSL2 路徑（internal 在實機驗證:宣告 port 經 wslrelay 可達、未宣告 port 隔離）→ **P3** **執行期預設已從 `shared` 翻成 `bridge`**（spec 與 manifest 的 `NetworkMode::default()` 皆為 `Bridge`）。
 
-> **inbound relay 的 fd 來源（重要實作細節）**:rootless 下 supervisor 在 init user ns、無 `CAP_SYS_ADMIN`，**不能** `setns(NEWNET)` 進 app netns（且執行緒不能 `setns(NEWUSER)`）。故由**已在 netns+userns 內為 root 的 holder 行程當 socket factory**:supervisor 經 SEQPACKET socketpair 送 `(proto,port)`，holder 在 netns 內建立連到 `127.0.0.1:guest` 的 socket，以 **SCM_RIGHTS** 傳回 fd，bidir 搬運留在 parent netns。holder 建 netns 時須**先單獨 `unshare(NEWUSER)`、在 unshare 前先取得真實 uid/gid 寫單行 map**（unshare 後 `getuid()` 會回 overflow id），再 `unshare(NEWNET)`。bridge 的 pasta 須加 `-t none -u none -T none -U none` 關閉其預設的雙向 port 轉發（否則會在 netns 內搶占服務要綁的 port）。
+> **inbound relay 的 fd 來源（重要實作細節）**:rootless 下 supervisor 在 init user ns、無 `CAP_SYS_ADMIN`，**不能** `setns(NEWNET)` 進 app netns（且執行緒不能 `setns(NEWUSER)`）。故由**已在 netns+userns 內為 root 的 holder 行程當 socket factory**:supervisor 經 SEQPACKET socketpair 送 `(proto,port)`，holder 在 netns 內建立連到 `127.0.0.1:guest` 的 socket，以 **SCM_RIGHTS** 傳回 fd，bidir 搬運留在 parent netns。holder 建 netns 時須**先單獨 `unshare(NEWUSER)`、在 unshare 前先取得真實 uid/gid 寫單行 map**（unshare 後 `getuid()` 會回 overflow id），再 `unshare(NEWNET)`。
+>
+> **bridge 出網（pasta）與 root 後端**:`pasta` 是 rootless-only——以 root 執行會自我停用、降權到 nobody 後又開不了 root 擁有的 ns。故 holder 與 pasta **一律以非特權 uid 執行**（rootless=呼叫者；WSL2 / VM / native-root 後端=**nobody**），netns 由該非特權 user ns 擁有，pasta 以 `--userns` 進入。root 後端 holder 降權時須在 `setuid` 後 `prctl(PR_SET_DUMPABLE,1)`，否則 `/proc/self/{setgroups,uid_map}` 變 root 擁有而寫不了。服務不受影響:root 後端服務仍以**真實 root** 只 `setns` 進 netns（不加入該 user ns）→ chown/gosu 照常。pasta 另須 `-t none -u none -T none -U none` 關閉預設的雙向 port 轉發（否則會在 netns 內搶占服務要綁的 port）。已於原生 Linux（CI）與實機 WSL2 驗證 `internal` 隔離與 `bridge` 出網。
 
 ### chefer-cli（bin）
 - 子命令：
