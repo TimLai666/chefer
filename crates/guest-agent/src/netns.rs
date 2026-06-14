@@ -264,6 +264,13 @@ fn start_pasta(holder: Pid, rootless: bool, hint: Option<PathBuf>) -> Option<Chi
     let mut cmd = Command::new(&prog);
     // --config-net：在目標 netns 內自動配置位址/路由/DNS；--foreground：由我們掌控其生命週期。
     cmd.arg("--config-net").arg("--foreground");
+    // 關閉 pasta 的「自動轉發所有 port」——否則它會在 netns 內搶先 bind 服務要用的 port
+    // （服務隨後 bind 同 port → EADDRINUSE）。inbound 由我們自己的 relay 負責；pasta 僅需提供
+    // app 主動發起的 outbound NAT（與這些 listening-port 轉發無關，仍正常運作）。
+    cmd.arg("--tcp-ports").arg("none");
+    cmd.arg("--udp-ports").arg("none");
+    cmd.arg("--tcp-ns").arg("none");
+    cmd.arg("--udp-ns").arg("none");
     cmd.arg("--netns").arg(&net_ns);
     if rootless {
         cmd.arg("--userns")
