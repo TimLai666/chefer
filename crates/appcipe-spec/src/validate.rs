@@ -85,10 +85,11 @@ impl AppCipe {
                         "service `{name}`：image.source = dockerfile 尚未支援（目前僅支援 tar；\
                          請先以 `docker build` + `docker save` 產生 tar 後改用 source: tar）"
                     )),
-                    ImageSourceType::Image => errs.push(format!(
-                        "service `{name}`：image.source = image 尚未支援（目前僅支援 tar；\
-                         請先以 `docker pull` + `docker save` 產生 tar 後改用 source: tar）"
-                    )),
+                    ImageSourceType::Image => {
+                        if let Err(e) = check_image_reference(file) {
+                            errs.push(format!("service `{name}` 的 image ref `{file}` 無效：{e}"));
+                        }
+                    }
                 },
             }
 
@@ -225,6 +226,57 @@ fn check_service_name(name: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// 驗證 `source: image` 的 registry reference。
+///
+/// 為了**可重現**，必須釘住版本：要嘛帶 `@<algo>:<hex>` digest（最穩），要嘛帶明確且
+/// 非 `latest` 的 tag。未標記（會被當成 `latest`）或顯式 `:latest` 一律拒絕。
+fn check_image_reference(r: &str) -> Result<(), String> {
+    let r = r.trim();
+    if r.is_empty() {
+        return Err("不可為空".into());
+    }
+    // digest 形式：<name>@<algo>:<hex> —— 釘到內容，最可重現，直接接受。
+    if let Some((name, digest)) = r.split_once('@') {
+        if name.is_empty() {
+            return Err("`@` 前的 image 名稱不可為空".into());
+        }
+        let Some((algo, hex)) = digest.split_once(':') else {
+            return Err(format!(
+                "digest `{digest}` 格式錯誤（應為 <algo>:<hex>，如 sha256:…）"
+            ));
+        };
+        if algo.is_empty() || hex.len() < 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!(
+                "digest `{digest}` 格式錯誤（hex 過短或含非十六進位字元）"
+            ));
+        }
+        return Ok(());
+    }
+    // tag 形式：tag 在「最後一段路徑」的 ':' 之後（避免把 registry 埠 `host:5000/…` 誤判為 tag）。
+    let last_segment = r.rsplit('/').next().unwrap_or(r);
+    match last_segment.rsplit_once(':') {
+        Some((name, tag)) => {
+            if name.is_empty() {
+                return Err("image 名稱不可為空".into());
+            }
+            if tag.is_empty() {
+                return Err("tag 不可為空".into());
+            }
+            if tag == "latest" {
+                return Err(
+                    "不接受 `latest`：為了可重現，請指定明確版本（如 redis:7.2-alpine）或 @sha256 digest"
+                        .into(),
+                );
+            }
+            Ok(())
+        }
+        None => Err(
+            "未指定 tag（會被當成 latest）：為了可重現，請指定明確版本（如 redis:7.2-alpine）或 @sha256 digest"
+                .into(),
+        ),
+    }
 }
 
 /// env key 規則：[A-Za-z_][A-Za-z0-9_]*。
@@ -618,7 +670,7 @@ services:
     // ---------- image.source ----------
 
     #[test]
-    fn rejects_dockerfile_and_image_sources() {
+    fn rejects_dockerfile_source() {
         let e = validate_err(
             r#"
 version: "0.1"
@@ -628,14 +680,46 @@ services:
     image:
       source: dockerfile
       file: ./Dockerfile
-  b:
-    image:
-      source: image
-      file: postgres:16
 "#,
         );
         assert!(e.contains("dockerfile 尚未支援"), "{e}");
-        assert!(e.contains("image 尚未支援"), "{e}");
+    }
+
+    #[test]
+    fn accepts_pinned_image_reference() {
+        // source: image 帶明確 tag / digest 應通過（不再一律拒絕）。
+        for r in [
+            "postgres:16",
+            "redis:7.2-alpine",
+            "ghcr.io/owner/app:1.2.3",
+            "localhost:5000/team/svc:v2",
+            "alpine@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ] {
+            let app = parse_raw(&format!(
+                "version: \"0.1\"\nname: App\nservices:\n  a:\n    image:\n      source: image\n      file: \"{r}\"\n"
+            ));
+            assert!(
+                app.validate().is_ok(),
+                "image ref `{r}` 應通過：{:?}",
+                app.validate()
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_unpinned_or_latest_image_reference() {
+        // 未標記 / :latest / 空 tag 一律拒絕（不可重現）。
+        for r in [
+            "redis",
+            "redis:latest",
+            "ghcr.io/owner/app",
+            "localhost:5000/team/svc",
+        ] {
+            let e = validate_err(&format!(
+                "version: \"0.1\"\nname: App\nservices:\n  a:\n    image:\n      source: image\n      file: \"{r}\"\n"
+            ));
+            assert!(e.contains("image ref"), "image ref `{r}` 應被拒：{e}");
+        }
     }
 
     #[test]

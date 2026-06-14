@@ -13,6 +13,7 @@ mod archive;
 mod convert;
 mod image;
 mod layers;
+mod registry;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -143,26 +144,34 @@ fn pack_service(
     opts: &PackOptions,
 ) -> Result<ServiceEntry> {
     let platform = convert::platform_of(svc);
-    let tar_path_str = convert::image_tar_path(name, svc)?;
-    let tar_path = Path::new(tar_path_str);
-    if !tar_path.is_file() {
-        bail!(
-            "image tar 不存在：{}；請確認 appcipe.yml 的 image 路徑，或先以 `docker save -o <file> <image>` 匯出",
-            tar_path.display()
-        );
-    }
 
-    // 1) 安全解開 image tar 到暫存目錄（離開作用域自動清除）。
+    // 暫存目錄：tar 解壓內容或 registry 拉下的 layer blob 都放這；持有到 repack 完成。
     let tmp = tempfile::Builder::new()
         .prefix("chefer-pack-")
         .tempdir()
         .context("建立暫存目錄失敗")?;
-    archive::extract_tar_to_dir(tar_path, tmp.path())
-        .with_context(|| format!("解開 image tar 失敗：{}", tar_path.display()))?;
 
-    // 2) 偵測格式並依 platform 解析出 config 與層 blob。
-    let resolved = image::resolve_image(tmp.path(), &platform)
-        .with_context(|| format!("解析 image archive 失敗：{}", tar_path.display()))?;
+    // 取得 config + 各層 blob 路徑——本機 tar 與 registry 兩條來源都收斂成同一個 ResolvedImage。
+    let resolved = match convert::image_src(name, svc)? {
+        convert::ImageSrc::Tar(tar_path_str) => {
+            let tar_path = Path::new(tar_path_str);
+            if !tar_path.is_file() {
+                bail!(
+                    "image tar 不存在：{}；請確認 appcipe.yml 的 image 路徑，或先以 `docker save -o <file> <image>` 匯出（或改用 source: image 直接從 registry 拉取）",
+                    tar_path.display()
+                );
+            }
+            archive::extract_tar_to_dir(tar_path, tmp.path())
+                .with_context(|| format!("解開 image tar 失敗：{}", tar_path.display()))?;
+            image::resolve_image(tmp.path(), &platform)
+                .with_context(|| format!("解析 image archive 失敗：{}", tar_path.display()))?
+        }
+        convert::ImageSrc::Registry(reference) => {
+            eprintln!("[chefer] 從 registry 拉取 image：{reference}（{platform}）…");
+            registry::pull_image(reference, &platform, tmp.path())
+                .with_context(|| format!("從 registry 拉取 image `{reference}` 失敗"))?
+        }
+    };
 
     let diff_ids: &[String] = resolved
         .config
