@@ -36,7 +36,7 @@ jobs:
           - name: linux-arm64
             runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       # 用 runner 的 host 原生 gnu target 建置（免 musl C 交叉工具鏈）。
       - name: Install Rust
@@ -82,7 +82,7 @@ jobs:
             runner: ubuntu-24.04-arm
             guest_target: aarch64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -128,7 +128,7 @@ jobs:
         run: echo "CHEFER_QEMU_APPLIANCE_DIR=$HOME/.cache/chefer-appliance" >> "$GITHUB_ENV"
 
       - name: Cache appliance (kernel + initramfs)
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/chefer-appliance
           key: appliance-${{ matrix.name }}-${{ env.CHEFER_LINUX_REF }}-${{ hashFiles('scripts/build-appliance.sh', 'scripts/appliance/**') }}
