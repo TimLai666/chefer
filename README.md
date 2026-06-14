@@ -222,7 +222,7 @@ Honest list of what doesn't work (yet):
 - **Linux containers only** (`linux/amd64`, `linux/arm64`); `windows/*` containers are rejected at validation.
 - `depends_on` controls **start order only** — there are no health checks in v1.
 - At most **one** service per app may use `interface_mode: terminal` or `both`; host ports must be unique across the whole app.
-- On Windows the runtime requires **WSL2** (`wsl --install` once, if not present).
+- **On Windows the runtime currently requires WSL2** (`wsl --install` once, if not present) — a chefer-packaged app cannot run on a Windows machine without WSL2 today. Running without WSL2, by booting the bundled Linux micro-VM on the Windows Hypervisor Platform, is on the [Roadmap](#roadmap) below.
 
 ## Roadmap
 
