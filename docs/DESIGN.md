@@ -291,7 +291,9 @@ AppCipe 新增 app 級欄位 **`network`**（appcipe-spec enum，serde rename �
 - **Windows（wsl2）**:app netns 在 distro 內;relay 跨「distro netns ↔ app netns」;對外仍靠既有 host 代理 + wslrelay/UDP bridge 打到 distro netns 的 listener。附帶好處:**消除 wslrelay 對未宣告埠的鏡射洩漏**。
 - **macOS（vz）**:VM 已與 host 隔離;VM 內同原生 Linux 作法。
 
-實作分期（**bridge 優先**，因為它是目標預設）:**P1** 原生 Linux 完整做 `bridge`（app netns + 跨 netns inbound relay + pasta 出網）與 `internal`（同路徑不起 pasta）+ 單元/E2E 驗證 → **P2** WSL2 路徑 → **P3** 把**執行期預設旗標**從 `shared` 翻成 `bridge`。**在 `bridge` 通過 E2E 前,執行期預設先維持 `shared`**,避免 ship 出「預設模式尚未實作」的壞版本;DESIGN 的目標預設則記為 `bridge`。
+實作分期（**已全部完成**）:**P1** 原生 Linux 完整做 `bridge`（app netns + 跨 netns inbound relay + pasta 出網）與 `internal`（同路徑不起 pasta）+ 單元/E2E 驗證（CI e2e-linux，amd64+arm64 rootless）→ **P2** WSL2 路徑（internal 在實機驗證:宣告 port 經 wslrelay 可達、未宣告 port 隔離）→ **P3** **執行期預設已從 `shared` 翻成 `bridge`**（spec 與 manifest 的 `NetworkMode::default()` 皆為 `Bridge`）。
+
+> **inbound relay 的 fd 來源（重要實作細節）**:rootless 下 supervisor 在 init user ns、無 `CAP_SYS_ADMIN`，**不能** `setns(NEWNET)` 進 app netns（且執行緒不能 `setns(NEWUSER)`）。故由**已在 netns+userns 內為 root 的 holder 行程當 socket factory**:supervisor 經 SEQPACKET socketpair 送 `(proto,port)`，holder 在 netns 內建立連到 `127.0.0.1:guest` 的 socket，以 **SCM_RIGHTS** 傳回 fd，bidir 搬運留在 parent netns。holder 建 netns 時須**先單獨 `unshare(NEWUSER)`、在 unshare 前先取得真實 uid/gid 寫單行 map**（unshare 後 `getuid()` 會回 overflow id），再 `unshare(NEWNET)`。bridge 的 pasta 須加 `-t none -u none -T none -U none` 關閉其預設的雙向 port 轉發（否則會在 netns 內搶占服務要綁的 port）。
 
 ### chefer-cli（bin）
 - 子命令：

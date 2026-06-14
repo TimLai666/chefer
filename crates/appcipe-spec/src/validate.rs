@@ -715,9 +715,10 @@ services:
     // ---------- network ----------
 
     #[test]
-    fn network_defaults_to_shared() {
+    fn network_defaults_to_bridge() {
+        // 省略 network: 時預設為 bridge（隔離 + 出網，對齊 Docker 預設）。
         let app = parse_raw("version: \"0.1\"\nname: App\nservices:\n  db: { image: ./db.tar }\n");
-        assert_eq!(app.network, crate::NetworkMode::Shared);
+        assert_eq!(app.network, crate::NetworkMode::Bridge);
         assert!(app.validate().is_ok());
     }
 
