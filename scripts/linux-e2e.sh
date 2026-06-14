@@ -596,7 +596,11 @@ YAML
   "$cli" build "$work/iso-default/appcipe.yml" --out "$work/out-iso-default" --kit-dir "$kit" --target "$output_target"
   local default_app="$work/out-iso-default/LinuxNetDefault/LinuxNetDefault_${output_target}"
   [[ -f "$default_app" ]] || die "missing built default-net app: $default_app"
-  "$cli" inspect "$default_app" | grep -qi "bridge" || die "default network should be bridge (inspect did not report bridge)"
+  # 直接檢查 bundle manifest（穩定，不受 inspect 表格寬度/CJK 換行影響）。
+  local default_manifest="$work/out-iso-default/LinuxNetDefault/bundle/manifest.json"
+  [[ -f "$default_manifest" ]] || die "missing default-net bundle manifest: $default_manifest"
+  grep -q '"network"[[:space:]]*:[[:space:]]*"bridge"' "$default_manifest" \
+    || die "default network should be bridge; manifest says: $(grep -o '"network"[^,]*' "$default_manifest")"
   note "Default network confirmed: bridge"
 
   # --- shared：示範未宣告的 secret port 會洩漏到 host（也驗證 assert_unreachable 有意義）---
