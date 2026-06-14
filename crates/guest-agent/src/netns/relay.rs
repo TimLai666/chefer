@@ -1,108 +1,29 @@
 //! per-app netns 的 inbound port relay（`internal` / `bridge` 共用）。
 //!
 //! supervisor 在 **parent netns** 為每個宣告的 `ports:` 開 listener；連入的流量轉到
-//! **app netns** 內的 `127.0.0.1:guest`。因 netns 是 per-thread，本模組起一條常駐的
-//! **app-netns socket factory** 執行緒（`setns` 進 app netns 後不再離開），負責建立
-//! 連到 `127.0.0.1:guest` 的 upstream socket；listener / 位元組搬運則留在 parent netns。
-//! socket fd 一旦建立即與 netns 無關，可跨執行緒自由讀寫。
+//! **app netns** 內的 `127.0.0.1:guest`。upstream socket 必須誕生在 app netns，但 rootless
+//! 下 supervisor 無法 `setns` 進該 netns（見 `netns` 模組說明）。故透過 [`netns::Dialer`]
+//! 向 **holder socket factory** 請求 upstream（holder 在 netns 內建立 socket、以 SCM_RIGHTS
+//! 傳回），listener 與位元組搬運則留在 parent netns。
 //!
 //! 未宣告的 port 不開 listener → parent netns 無對應入口 → host 連不到（隔離核心）。
 
 use std::collections::BTreeSet;
 use std::io;
 use std::net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket};
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
-use std::sync::mpsc::{Sender, SyncSender, channel, sync_channel};
 use std::thread;
 
 use chefer_bundle::{Manifest, PortProto};
 
-use crate::netns;
+use crate::netns::Dialer;
 use crate::udp_bridge::spawn_udp_relay;
-
-/// 對 app-netns socket factory 的請求：建立連到 `127.0.0.1:port` 的 upstream，
-/// 透過 reply channel 回傳建立好的 fd。
-enum DialReq {
-    Tcp(u16, SyncSender<io::Result<OwnedFd>>),
-    Udp(u16, SyncSender<io::Result<OwnedFd>>),
-}
-
-/// app-netns socket factory 的把手（可 clone，供多個 relay listener 共用）。
-#[derive(Clone)]
-struct Dialer {
-    tx: Sender<DialReq>,
-}
-
-impl Dialer {
-    fn tcp(&self, port: u16) -> io::Result<TcpStream> {
-        let (rtx, rrx) = sync_channel(0);
-        self.tx
-            .send(DialReq::Tcp(port, rtx))
-            .map_err(|_| io::Error::other("app-netns dialer 已結束"))?;
-        let fd = rrx
-            .recv()
-            .map_err(|_| io::Error::other("app-netns dialer 無回應"))??;
-        // SAFETY: fd 由 factory 以 IntoRawFd 釋出，所有權移交給此 TcpStream。
-        Ok(unsafe { TcpStream::from_raw_fd(fd.into_raw_fd()) })
-    }
-
-    fn udp(&self, port: u16) -> io::Result<UdpSocket> {
-        let (rtx, rrx) = sync_channel(0);
-        self.tx
-            .send(DialReq::Udp(port, rtx))
-            .map_err(|_| io::Error::other("app-netns dialer 已結束"))?;
-        let fd = rrx
-            .recv()
-            .map_err(|_| io::Error::other("app-netns dialer 無回應"))??;
-        Ok(unsafe { UdpSocket::from_raw_fd(fd.into_raw_fd()) })
-    }
-}
-
-/// 啟動 app-netns socket factory：常駐執行緒先 `setns` 進 app netns，再依請求建立 upstream。
-/// 回傳 `Dialer`；若 factory 無法進入 netns，回 None（呼叫端據此放棄起 relay）。
-fn start_dialer(net_fd: RawFd) -> Option<Dialer> {
-    let (tx, rx) = channel::<DialReq>();
-    let (ready_tx, ready_rx) = sync_channel::<bool>(0);
-    thread::spawn(move || {
-        if let Err(e) = netns::enter_netns(net_fd) {
-            eprintln!("[guest-agent] inbound relay factory 無法進入 app netns：{e:#}");
-            let _ = ready_tx.send(false);
-            return;
-        }
-        let _ = ready_tx.send(true);
-        // 此執行緒自此常駐於 app netns，逐一回應建立 upstream 的請求。
-        while let Ok(req) = rx.recv() {
-            match req {
-                DialReq::Tcp(port, reply) => {
-                    let r = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).map(OwnedFd::from);
-                    let _ = reply.send(r);
-                }
-                DialReq::Udp(port, reply) => {
-                    let r = connect_udp(port).map(OwnedFd::from);
-                    let _ = reply.send(r);
-                }
-            }
-        }
-    });
-    match ready_rx.recv() {
-        Ok(true) => Some(Dialer { tx }),
-        _ => None,
-    }
-}
-
-/// 在「當前 netns」建立一條連到 `127.0.0.1:port` 的 UDP socket。
-fn connect_udp(port: u16) -> io::Result<UdpSocket> {
-    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-    sock.connect((Ipv4Addr::LOCALHOST, port))?;
-    Ok(sock)
-}
 
 /// 依 manifest 為所有宣告的 inbound port 起跨 netns relay（parent netns ↔ app netns）。
 ///
-/// `net_fd` 為 app netns 的 net ns fd。relay 執行緒皆為 daemon 性質，隨行程結束消滅。
+/// `dialer` 為通往 holder socket factory 的把手。relay 執行緒皆為 daemon 性質，隨行程結束消滅。
 /// listener 綁 `127.0.0.1:guest`（parent netns）——與 `shared` 模式下服務自己綁 loopback
 /// 等效，故 chefer-runtime 既有的 host→`127.0.0.1:guest` 代理無需改動。
-pub fn start_inbound_relays(manifest: &Manifest, net_fd: RawFd) {
+pub fn start_inbound_relays(manifest: &Manifest, dialer: Dialer) {
     let tcp_ports: BTreeSet<u16> = manifest
         .services
         .iter()
@@ -121,14 +42,6 @@ pub fn start_inbound_relays(manifest: &Manifest, net_fd: RawFd) {
     if tcp_ports.is_empty() && udp_ports.is_empty() {
         return; // 無宣告 port → 完全不開對外入口（純內部 app）。
     }
-
-    let Some(dialer) = start_dialer(net_fd) else {
-        eprintln!(
-            "[guest-agent] 無法啟動 inbound relay（app netns 進入失敗）；\
-             宣告的 port 將無法從 host 連入"
-        );
-        return;
-    };
 
     for gp in tcp_ports {
         match TcpListener::bind((Ipv4Addr::LOCALHOST, gp)) {

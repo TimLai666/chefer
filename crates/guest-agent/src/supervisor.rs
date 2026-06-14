@@ -121,7 +121,7 @@ pub fn run_services(
     // internal/bridge：服務都在 app netns 內，為宣告的 port 起跨 netns inbound relay
     // （parent netns listener → app netns 127.0.0.1:guest）。未宣告的 port 無入口。
     if let Some(net) = app_net {
-        crate::netns::relay::start_inbound_relays(manifest, net.net_raw());
+        crate::netns::relay::start_inbound_relays(manifest, net.dialer());
     }
 
     monitor(&mut running)

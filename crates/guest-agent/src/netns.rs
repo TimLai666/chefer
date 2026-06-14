@@ -7,33 +7,42 @@
 //!   存活並可被 `setns` 加入。`/proc/<holder>/ns/net` 即 app netns 的 fd 來源。
 //! - **每個服務**在 fork 出的中繼行程裡 `setns` 進這個 app netns（rootless 另先
 //!   `setns` 進 holder 的 user ns 以取得 caps），再 `unshare(MNT|PID)`——見 `exec.rs`。
-//! - **宣告的 inbound port** 由 supervisor 在 **parent netns** 開 listener，轉進
-//!   app netns 的 `127.0.0.1:guest`。關鍵：**netns 是 per-thread**，故同一行程內可以
-//!   「listener 執行緒留在 parent netns、另一條 factory 執行緒 `setns` 進 app netns
-//!   負責建立 upstream socket」，fd 一旦建立即與 netns 無關，可跨執行緒讀寫——
-//!   不需要 veth / iptables，也不需要跨行程 SCM_RIGHTS 傳 fd（見 `relay` 模組）。
-//!
-//! 權限模型：rootless 時 holder 以自身 uid 為 owner 建 user+net ns；supervisor
-//! 行程（在祖先 user ns、euid == owner）對該 netns 持有 CAP_SYS_ADMIN，故 relay
-//! factory 執行緒能直接 `setns(NEWNET)` 而**不必**也加入 user ns（保留 host 身分）。
+//! - **宣告的 inbound port** 由 supervisor 在 **parent netns** 開 listener，需把流量轉進
+//!   app netns 的 `127.0.0.1:guest`。upstream socket 必須誕生在 app netns 內，但 rootless
+//!   下 supervisor（在 init user ns、無 CAP_SYS_ADMIN）**無法** `setns(NEWNET)`
+//!   ——`setns` 進 netns 需要「呼叫者當前 user ns」與「netns 擁有者 user ns」**兩邊**都有
+//!   CAP_SYS_ADMIN；而執行緒又不能 `setns(NEWUSER)`（須單執行緒）。故由**已在 netns+userns
+//!   內為 root 的 holder 行程當 socket factory**：supervisor 透過一條 socketpair 送出
+//!   `(proto, port)` 請求，holder 建立連到 `127.0.0.1:guest` 的 socket，再以 **SCM_RIGHTS**
+//!   把 fd 傳回 supervisor。fd 一旦建立即與 netns 無關，bidir 搬運留在 parent netns。
+//!   ——不需要 veth / iptables / slirp。
 //!
 //! 本模組於 `lib.rs` 以 `#[cfg(target_os = "linux")]` 限定。
 
 use std::ffi::OsString;
-use std::io::{self, Read};
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::io::{self, IoSlice, IoSliceMut, Read};
+use std::net::{Ipv4Addr, TcpStream, UdpSocket};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
-use nix::sched::{CloneFlags, setns, unshare};
+use nix::sched::{CloneFlags, unshare};
 use nix::sys::signal::{Signal, kill};
+use nix::sys::socket::{
+    AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag, SockType, recvmsg,
+    sendmsg, socketpair,
+};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, fork};
 
 pub mod relay;
 
-/// 已建立的 app netns：持有 holder pid 與其 ns fd。
+const PROTO_TCP: u8 = 1;
+const PROTO_UDP: u8 = 2;
+
+/// 已建立的 app netns：持有 holder pid、其 ns fd，與通往 holder socket factory 的通道。
 pub struct AppNet {
     holder: Pid,
     /// `/proc/<holder>/ns/net`。
@@ -43,6 +52,72 @@ pub struct AppNet {
     rootless: bool,
     /// bridge 模式下提供出網 NAT 的 pasta 子行程（找不到 pasta 時為 None → 退化成 internal）。
     pasta: Option<Child>,
+    /// 通往 holder socket factory 的 socketpair 端點（送 (proto,port)、收 SCM_RIGHTS fd）。
+    factory: Arc<Mutex<OwnedFd>>,
+}
+
+/// 向 holder socket factory 請求「連到 app netns 內 `127.0.0.1:port` 的 socket」的把手。
+/// 可 clone，供多個 relay listener 共用（同一 socketpair 以 Mutex 串行化請求/回應）。
+#[derive(Clone)]
+pub struct Dialer {
+    sock: Arc<Mutex<OwnedFd>>,
+}
+
+impl Dialer {
+    /// 取得一條（app netns 內）已連到 `127.0.0.1:port` 的 TCP socket。
+    pub fn tcp(&self, port: u16) -> io::Result<TcpStream> {
+        let fd = self.dial(PROTO_TCP, port)?;
+        Ok(TcpStream::from(fd))
+    }
+
+    /// 取得一條（app netns 內）已 connect 到 `127.0.0.1:port` 的 UDP socket。
+    pub fn udp(&self, port: u16) -> io::Result<UdpSocket> {
+        let fd = self.dial(PROTO_UDP, port)?;
+        Ok(UdpSocket::from(fd))
+    }
+
+    fn dial(&self, proto: u8, port: u16) -> io::Result<OwnedFd> {
+        let guard = self
+            .sock
+            .lock()
+            .map_err(|_| io::Error::other("factory 通道毒化"))?;
+        let req = [proto, (port & 0xff) as u8, (port >> 8) as u8];
+        // 請求：3-byte (proto, port_le)。
+        nix::unistd::write(&*guard, &req).map_err(io::Error::from)?;
+        // 回應：1-byte status（0=ok）+（成功時）SCM_RIGHTS 夾帶的 fd。
+        let mut status = [0u8; 1];
+        let mut iov = [IoSliceMut::new(&mut status)];
+        let mut cmsg = nix::cmsg_space!([RawFd; 1]);
+        let msg = recvmsg::<()>(
+            guard.as_raw_fd(),
+            &mut iov,
+            Some(&mut cmsg),
+            MsgFlags::empty(),
+        )
+        .map_err(io::Error::from)?;
+        let mut got: Option<RawFd> = None;
+        for c in msg.cmsgs().map_err(io::Error::from)? {
+            if let ControlMessageOwned::ScmRights(fds) = c {
+                for f in fds {
+                    if got.is_none() {
+                        got = Some(f);
+                    } else {
+                        // SAFETY: 多餘 fd（不應發生）直接關閉避免洩漏。
+                        let _ = unsafe { OwnedFd::from_raw_fd(f) };
+                    }
+                }
+            }
+        }
+        match (status[0], got) {
+            // SAFETY: fd 由 holder 經 SCM_RIGHTS 傳來，所有權移交給此 OwnedFd。
+            (0, Some(fd)) => Ok(unsafe { OwnedFd::from_raw_fd(fd) }),
+            (_, Some(fd)) => {
+                let _ = unsafe { OwnedFd::from_raw_fd(fd) };
+                Err(io::Error::other("holder 回報建立 upstream 失敗"))
+            }
+            _ => Err(io::Error::other("holder 未回傳 upstream fd")),
+        }
+    }
 }
 
 /// 傳給服務中繼行程、用以 `setns` 進 app netns 的 raw fd 集合。
@@ -63,9 +138,11 @@ impl AppNet {
         }
     }
 
-    /// app netns 的 net ns fd（供 relay factory `setns` 用）。
-    pub fn net_raw(&self) -> RawFd {
-        self.net_fd.as_raw_fd()
+    /// 取得向 holder socket factory 請求 app-netns upstream 的把手。
+    pub fn dialer(&self) -> Dialer {
+        Dialer {
+            sock: Arc::clone(&self.factory),
+        }
     }
 
     pub fn rootless(&self) -> bool {
@@ -110,15 +187,26 @@ pub fn setup_app_netns(
     // 就緒/錯誤回報管線：holder 設定完成後寫 1 byte（1=ok / 0=fail）。
     let (rd, wr) =
         nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).context("建立 netns 就緒管線失敗")?;
+    // socket factory 通道：SEQPACKET 保訊息邊界；parent 送 (proto,port)、holder 回 SCM_RIGHTS fd。
+    let (sv_parent, sv_holder) = socketpair(
+        AddressFamily::Unix,
+        SockType::SeqPacket,
+        None,
+        SockFlag::SOCK_CLOEXEC,
+    )
+    .context("建立 netns factory socketpair 失敗")?;
 
-    // SAFETY: fork 後 holder 子行程僅呼叫 async-signal 相對安全的系統呼叫，最終 pause()。
+    // SAFETY: fork 後 holder 子行程僅呼叫相對安全的系統呼叫；holder 為 fork-without-exec
+    //（在尚未生成任何執行緒的早期階段建立，見 run_bundle_linux 的呼叫順序）。
     match unsafe { fork() }.context("fork netns holder 失敗")? {
         ForkResult::Child => {
             drop(rd);
-            holder_main(rootless, wr) // 不返回（pause 迴圈）
+            drop(sv_parent);
+            holder_main(rootless, wr, sv_holder) // 不返回（factory 迴圈 → pause）
         }
         ForkResult::Parent { child } => {
             drop(wr);
+            drop(sv_holder);
             // 等 holder 完成 lo 設定。
             let mut byte = [0u8; 1];
             let ok = {
@@ -161,6 +249,7 @@ pub fn setup_app_netns(
                 user_fd,
                 rootless,
                 pasta,
+                factory: Arc::new(Mutex::new(sv_parent)),
             })
         }
     }
@@ -230,7 +319,6 @@ fn locate_pasta(hint: Option<PathBuf>) -> OsString {
 
 /// 開啟 `/proc/<pid>/ns/<which>` 為 CLOEXEC fd。
 fn open_ns_fd(pid: Pid, which: &str) -> Result<OwnedFd> {
-    use std::os::fd::FromRawFd;
     let path = format!("/proc/{}/ns/{}\0", pid.as_raw(), which);
     // O_RDONLY | O_CLOEXEC；ns fd 不需可寫。
     let raw = unsafe { libc::open(path.as_ptr() as *const libc::c_char, libc::O_CLOEXEC) };
@@ -241,9 +329,10 @@ fn open_ns_fd(pid: Pid, which: &str) -> Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
-/// holder 子行程：unshare 出 netns（rootless 另含 user ns + uid map），拉起 lo，
-/// 回報就緒後 pause() 常駐。`wr` 為就緒回報管線寫入端。
-fn holder_main(rootless: bool, wr: OwnedFd) -> ! {
+/// holder 子行程：unshare 出 netns（rootless 另含 user ns + uid map），拉起 lo，回報就緒後
+/// 進入 socket factory 迴圈（為 supervisor 建立 app-netns 內的 upstream 並以 SCM_RIGHTS 回傳），
+/// 通道關閉後 pause() 常駐以維持 netns 存活。`wr` 為就緒回報管線，`factory` 為 SCM_RIGHTS 通道。
+fn holder_main(rootless: bool, wr: OwnedFd, factory: OwnedFd) -> ! {
     // 父行程（supervisor）若先死，holder 連帶被 SIGKILL，避免遺留 netns。
     unsafe {
         libc::prctl(
@@ -293,10 +382,64 @@ fn holder_main(rootless: bool, wr: OwnedFd) -> ! {
     }
     report(true);
     drop(wr);
-    // 常駐：netns 由本行程維持存活，直到被 supervisor SIGKILL。
+    // socket factory：服務 upstream 必須誕生在此（app netns 內）。處理請求直到通道關閉。
+    factory_loop(&factory);
+    drop(factory);
+    // 通道關閉（supervisor 不再需要 relay，或正在收尾）：常駐維持 netns 存活直到被 SIGKILL。
     loop {
         unsafe { libc::pause() };
     }
+}
+
+/// holder 的 socket factory 迴圈（在 app netns 內執行）：
+/// 收 3-byte 請求 `(proto, port_le)` → 建立連到 `127.0.0.1:port` 的 socket → 以 SCM_RIGHTS 回傳。
+/// 通道 EOF/錯誤即返回（由呼叫端轉入 pause）。
+fn factory_loop(sock: &OwnedFd) {
+    loop {
+        let mut req = [0u8; 3];
+        match nix::unistd::read(sock, &mut req) {
+            Ok(3) => {}
+            _ => return, // EOF / 短讀 / 錯誤 → 結束 factory
+        }
+        let proto = req[0];
+        let port = u16::from_le_bytes([req[1], req[2]]);
+        match make_upstream(proto, port) {
+            Ok(fd) => send_upstream_fd(sock, fd.as_raw_fd()),
+            Err(_) => send_status(sock, 1),
+        }
+    }
+}
+
+/// 在當前（app）netns 內建立連到 `127.0.0.1:port` 的 socket。
+fn make_upstream(proto: u8, port: u16) -> io::Result<OwnedFd> {
+    match proto {
+        PROTO_TCP => Ok(OwnedFd::from(TcpStream::connect((
+            Ipv4Addr::LOCALHOST,
+            port,
+        ))?)),
+        PROTO_UDP => {
+            let s = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+            s.connect((Ipv4Addr::LOCALHOST, port))?;
+            Ok(OwnedFd::from(s))
+        }
+        _ => Err(io::Error::other("未知 proto")),
+    }
+}
+
+/// 回傳成功狀態（status=0）＋夾帶的 upstream fd（SCM_RIGHTS）。
+fn send_upstream_fd(sock: &OwnedFd, fd: RawFd) {
+    let payload = [0u8];
+    let iov = [IoSlice::new(&payload)];
+    let fds = [fd];
+    let cmsg = [ControlMessage::ScmRights(&fds)];
+    let _ = sendmsg::<()>(sock.as_raw_fd(), &iov, &cmsg, MsgFlags::empty(), None);
+}
+
+/// 回傳失敗狀態（無 fd）。
+fn send_status(sock: &OwnedFd, status: u8) {
+    let payload = [status];
+    let iov = [IoSlice::new(&payload)];
+    let _ = sendmsg::<()>(sock.as_raw_fd(), &iov, &[], MsgFlags::empty(), None);
 }
 
 /// 在新建的 user ns 內把 uid/gid 0 映射到呼叫者自身（單一映射；同 exec.rs 的 rootless 模型）。
@@ -341,12 +484,4 @@ fn bring_lo_up() -> Result<()> {
     })();
     unsafe { libc::close(sock) };
     result
-}
-
-/// 讓「當前執行緒」加入 app netns（供 relay factory 使用）。只動 netns，不動 user ns
-/// （supervisor 對該 netns 已持 CAP_SYS_ADMIN）。
-pub fn enter_netns(net_fd: RawFd) -> Result<()> {
-    let fd = unsafe { BorrowedFd::borrow_raw(net_fd) };
-    setns(fd, CloneFlags::CLONE_NEWNET).context("relay factory setns(NEWNET) 失敗")?;
-    Ok(())
 }
