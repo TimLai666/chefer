@@ -354,14 +354,12 @@ fn middle_child(
         );
         return 126;
     }
-    if !real_root {
-        if let Err(e) = write_id_maps(plan.uid, plan.gid) {
-            eprintln!(
-                "[guest-agent] 服務 `{}` 寫入 uid/gid map 失敗：{e:#}",
-                plan.name
-            );
-            return 126;
-        }
+    if !real_root && let Err(e) = write_id_maps(plan.uid, plan.gid) {
+        eprintln!(
+            "[guest-agent] 服務 `{}` 寫入 uid/gid map 失敗：{e:#}",
+            plan.name
+        );
+        return 126;
     }
 
     // unshare(PID) 只影響之後 fork 的子行程 → 再 fork 一次，孫行程成為新 ns 的 pid 1
@@ -643,10 +641,11 @@ fn resolve_program(program: &str, path_env: &str) -> Result<CString> {
     }
     for dir in path_env.split(':').filter(|d| !d.is_empty()) {
         let cand = Path::new(dir).join(program);
-        if let Ok(md) = cand.metadata() {
-            if md.is_file() && (md.permissions().mode() & 0o111) != 0 {
-                return CString::new(cand.as_os_str().as_bytes()).context("執行檔路徑含 NUL 字元");
-            }
+        if let Ok(md) = cand.metadata()
+            && md.is_file()
+            && (md.permissions().mode() & 0o111) != 0
+        {
+            return CString::new(cand.as_os_str().as_bytes()).context("執行檔路徑含 NUL 字元");
         }
     }
     bail!(

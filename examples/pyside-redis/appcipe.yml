@@ -1,0 +1,24 @@
+# Chefer demo：PySide6 GUI + redis，兩個容器打成一個單檔。
+#
+# 打包前先用 scripts/build-images.sh（或 .ps1）產生 images/db.tar、images/gui.tar，
+# 再 `chefer build examples/pyside-redis/appcipe.yml`。
+version: "0.1"
+name: CheferPysideRedis
+app_version: "1.0.0"
+
+services:
+  # 資料庫：官方 redis（WSL2/VM/原生-root 後端會以真實 root 執行 entrypoint 的
+  # chown/gosu，故官方映像可直接用）。只綁 loopback、不開對外埠。
+  db:
+    image: ./images/db.tar
+    persist_path: /data
+    interface_mode: none
+
+  # GUI：PySide6 視窗，連同一個 app 的 redis（127.0.0.1，內部網路）。
+  gui:
+    image: ./images/gui.tar
+    interface_mode: gui          # chefer 掛 X11/Wayland socket、設 DISPLAY
+    env:
+      REDIS_HOST: "127.0.0.1"
+      REDIS_PORT: "6379"
+    depends_on: [db]
