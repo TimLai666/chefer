@@ -32,6 +32,9 @@ pub struct AppMeta {
     pub data_dir_override: Option<String>,
     #[serde(default)]
     pub crash: CrashPolicy,
+    /// app 網路模式（見 docs/DESIGN.md「網路隔離」節）。舊 bundle 無此欄位 → 預設 `shared`。
+    #[serde(default)]
+    pub network: NetworkMode,
     pub generated_at_utc: String,
     /// 打包此 app 的 chefer 版本（`chefer build` 寫入；供 `chefer inspect` 與
     /// runtime 顯示「這是哪一版 chefer 包的」）。舊 bundle 無此欄位 → 反序列化為空字串。
@@ -111,6 +114,22 @@ pub enum CmdSpec {
 pub enum CrashPolicy {
     #[default]
     FailFast,
+}
+
+/// app 網路模式（見 docs/DESIGN.md「網路隔離」節）。
+///
+/// guest-agent 依此決定是否建立 per-app netns、是否起 pasta 出網。目標預設為 `Bridge`，
+/// 但在各後端做完前 serde 預設暫維持 `Shared`（沿用現況、不破壞既有 bundle）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkMode {
+    /// 共用 host/VM netns（不隔離；現況）。
+    #[default]
+    Shared,
+    /// 自己的 app netns，只有 lo；宣告的 port 經 relay 對外；無對外網路。
+    Internal,
+    /// 同 Internal 再加 pasta 出網 NAT（Docker 預設 bridge 等價）。
+    Bridge,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -275,6 +294,7 @@ mod tests {
                 old_names: vec![],
                 data_dir_override: None,
                 crash: CrashPolicy::FailFast,
+                network: NetworkMode::Shared,
                 generated_at_utc: "2026-01-01T00:00:00Z".into(),
                 builder_version: "9.9.9".into(),
             },

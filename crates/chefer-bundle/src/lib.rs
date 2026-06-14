@@ -17,7 +17,7 @@ pub use footer::{FLAG_ZSTD, FOOTER_LEN, Footer, MAGIC};
 pub use limit::{LimitedReader, bomb_limit_for};
 pub use manifest::{
     AppMeta, CmdSpec, CrashPolicy, ImageConfig, InterfaceMode, LayerRef, MANIFEST_FORMAT_VERSION,
-    Manifest, ServiceEntry,
+    Manifest, NetworkMode, ServiceEntry,
 };
 pub use mounts::MountSpec;
 pub use ports::{PortProto, PortSpec};

@@ -712,6 +712,38 @@ services:
         assert!(app.validate().is_ok());
     }
 
+    // ---------- network ----------
+
+    #[test]
+    fn network_defaults_to_shared() {
+        let app = parse_raw("version: \"0.1\"\nname: App\nservices:\n  db: { image: ./db.tar }\n");
+        assert_eq!(app.network, crate::NetworkMode::Shared);
+        assert!(app.validate().is_ok());
+    }
+
+    #[test]
+    fn network_parses_all_modes() {
+        for (s, want) in [
+            ("shared", crate::NetworkMode::Shared),
+            ("internal", crate::NetworkMode::Internal),
+            ("bridge", crate::NetworkMode::Bridge),
+        ] {
+            let app = parse_raw(&format!(
+                "version: \"0.1\"\nname: App\nnetwork: {s}\nservices:\n  db: {{ image: ./db.tar }}\n"
+            ));
+            assert_eq!(app.network, want, "network `{s}` 應解析為 {want:?}");
+            assert!(app.validate().is_ok(), "network `{s}` 應通過驗證");
+        }
+    }
+
+    #[test]
+    fn network_rejects_unknown_mode() {
+        let bad: Result<crate::AppCipe, _> = serde_yaml::from_str(
+            "version: \"0.1\"\nname: App\nnetwork: wormhole\nservices:\n  db: { image: ./db.tar }\n",
+        );
+        assert!(bad.is_err(), "未知 network 模式應解析失敗");
+    }
+
     // ---------- 錯誤彙整 ----------
 
     #[test]

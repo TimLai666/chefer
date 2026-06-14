@@ -52,6 +52,12 @@ pub fn find_guest_agent(kit_dirs: &[PathBuf], arch: &str) -> Option<PathBuf> {
     find_first(kit_dirs, &names)
 }
 
+/// 尋找指定 guest 架構的靜態 musl pasta（bridge 出網用；可選——缺少時 bridge 退化為 internal）。
+pub fn find_pasta(kit_dirs: &[PathBuf], arch: &str) -> Option<PathBuf> {
+    let names = [crate::layout::pasta_name(arch)];
+    find_first(kit_dirs, &names)
+}
+
 /// 尋找 macOS micro-VM appliance（kernel + initramfs）；兩者皆存在才回傳。
 /// 供 chefer-pack 在打包 macOS 目標時內嵌進 bundle 的 `vm/`。
 pub fn find_appliance(kit_dirs: &[PathBuf], arch: &str) -> Option<(PathBuf, PathBuf)> {

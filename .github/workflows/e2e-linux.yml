@@ -58,6 +58,11 @@ jobs:
       - name: Install GUI E2E tools
         run: sudo apt-get update && sudo apt-get install -y xvfb x11-utils weston wayland-utils
 
+      # passt 提供 pasta：網路隔離 E2E 的 bridge 情境（出網 NAT）需要它；
+      # 缺少時 linux-e2e.sh 會跳過 bridge 斷言（internal 隔離仍會驗證）。
+      - name: Install pasta (passt) for bridge networking E2E
+        run: sudo apt-get install -y passt
+
       - name: Docker info
         run: docker info
 

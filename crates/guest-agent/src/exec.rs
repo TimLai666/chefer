@@ -22,10 +22,12 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use std::os::fd::BorrowedFd;
+
 use anyhow::{Context, Result, bail};
 use nix::errno::Errno;
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
-use nix::sched::{CloneFlags, unshare};
+use nix::sched::{CloneFlags, setns, unshare};
 use nix::sys::signal::{SigHandler, Signal, signal};
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid, fork, setpgid};
@@ -39,6 +41,9 @@ pub struct SpawnSpec<'a> {
     pub data_dir: &'a Path,
     /// 是否為 terminal 介面服務（stdio 直通、不加前綴）。
     pub terminal: bool,
+    /// internal/bridge 模式：要 setns 進入的 app netns（含 rootless 時的 user ns fd）。
+    /// shared 模式為 None（不隔離網路，沿用共享 netns）。
+    pub netns: Option<crate::netns::NetnsJoin>,
 }
 
 /// 已啟動的服務（pid 為中繼行程；其 pgid 與 pid 相同，供整組送訊號）。
@@ -81,6 +86,8 @@ struct ChildPlan {
     uid: u32,
     gid: u32,
     terminal: bool,
+    /// internal/bridge：要 setns 進入的 app netns；None = shared（共享 netns）。
+    netns: Option<crate::netns::NetnsJoin>,
 }
 
 /// 把容器內絕對路徑接到 rootfs 下（含安全檢查，拒絕 `..` 等）。
@@ -287,6 +294,7 @@ fn build_plan(spec: &SpawnSpec) -> Result<ChildPlan> {
         uid: nix::unistd::getuid().as_raw(),
         gid: nix::unistd::getgid().as_raw(),
         terminal: spec.terminal,
+        netns: spec.netns,
     })
 }
 
@@ -337,29 +345,39 @@ fn middle_child(
     // 非 root（原生 Linux rootless）才需要 NEWUSER 取得 ns 內 root 以做 pivot_root/mount；
     // 此情境下單一 uid 映射為其固有限制（同 podman rootless 需 /etc/subuid 委派）。
     let real_root = nix::unistd::geteuid().is_root();
-    let mut flags = CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID;
-    if !real_root {
-        flags |= CloneFlags::CLONE_NEWUSER;
-    }
-    if let Err(e) = unshare(flags) {
-        eprintln!(
-            "[guest-agent] 服務 `{}` unshare({}) 失敗：{e}；\
-             請確認核心允許 unprivileged user namespaces（/proc/sys/kernel/unprivileged_userns_clone = 1）",
-            plan.name,
-            if real_root {
-                "mount+pid"
-            } else {
-                "user+mount+pid"
-            }
-        );
-        return 126;
-    }
-    if !real_root && let Err(e) = write_id_maps(plan.uid, plan.gid) {
-        eprintln!(
-            "[guest-agent] 服務 `{}` 寫入 uid/gid map 失敗：{e:#}",
-            plan.name
-        );
-        return 126;
+    if let Some(join) = plan.netns {
+        // internal/bridge：加入既有的 app netns（rootless 另先加入 holder 的 user ns
+        // 以取得 caps，並沿用 holder 已寫好的單一 uid/gid map → 自己不再 unshare/寫 map）。
+        if let Err(code) = join_app_netns(&plan.name, join, real_root) {
+            return code;
+        }
+    } else {
+        // shared：沿用共享 netns。以真實 root 執行時不開 user ns（chown/gosu 直接可行）；
+        // 非 root 才開 user ns + 寫單一 uid/gid map。
+        let mut flags = CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID;
+        if !real_root {
+            flags |= CloneFlags::CLONE_NEWUSER;
+        }
+        if let Err(e) = unshare(flags) {
+            eprintln!(
+                "[guest-agent] 服務 `{}` unshare({}) 失敗：{e}；\
+                 請確認核心允許 unprivileged user namespaces（/proc/sys/kernel/unprivileged_userns_clone = 1）",
+                plan.name,
+                if real_root {
+                    "mount+pid"
+                } else {
+                    "user+mount+pid"
+                }
+            );
+            return 126;
+        }
+        if !real_root && let Err(e) = write_id_maps(plan.uid, plan.gid) {
+            eprintln!(
+                "[guest-agent] 服務 `{}` 寫入 uid/gid map 失敗：{e:#}",
+                plan.name
+            );
+            return 126;
+        }
     }
 
     // unshare(PID) 只影響之後 fork 的子行程 → 再 fork 一次，孫行程成為新 ns 的 pid 1
@@ -396,6 +414,39 @@ fn middle_child(
             126
         }
     }
+}
+
+/// internal/bridge 模式：把當前（中繼）行程加入既有的 app netns，再 unshare(MNT|PID)。
+///
+/// - **rootless**（`join.user` 為 Some）：先 `setns` 進 holder 的 user ns（取得 ns 內
+///   root 與 CAP_SYS_ADMIN，並沿用 holder 已寫的單一 uid/gid map），再 `setns` 進 netns，
+///   最後 `unshare(NEWNS|NEWPID)`。**不**再開新 user ns、**不**重寫 uid map。
+/// - **root**（`join.user` 為 None）：直接 `setns` 進 netns，再 `unshare(NEWNS|NEWPID)`。
+///
+/// 失敗回 `Err(126)`（與其他啟動前置失敗一致）。
+fn join_app_netns(name: &str, join: crate::netns::NetnsJoin, _real_root: bool) -> Result<(), i32> {
+    if let Some(user_fd) = join.user {
+        // SAFETY: user_fd 由 supervisor 經 fork 繼承，於本行程使用期間有效。
+        let fd = unsafe { BorrowedFd::borrow_raw(user_fd) };
+        if let Err(e) = setns(fd, CloneFlags::CLONE_NEWUSER) {
+            eprintln!("[guest-agent] 服務 `{name}` 加入 app user ns 失敗：{e}");
+            return Err(126);
+        }
+    }
+    // SAFETY: net_fd 由 supervisor 經 fork 繼承，於本行程使用期間有效。
+    let net = unsafe { BorrowedFd::borrow_raw(join.net) };
+    if let Err(e) = setns(net, CloneFlags::CLONE_NEWNET) {
+        eprintln!("[guest-agent] 服務 `{name}` 加入 app network ns 失敗：{e}");
+        return Err(126);
+    }
+    if let Err(e) = unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID) {
+        eprintln!(
+            "[guest-agent] 服務 `{name}` unshare(mount+pid) 失敗：{e}；\
+             請確認核心允許所需的 namespaces"
+        );
+        return Err(126);
+    }
+    Ok(())
 }
 
 /// 在新 user namespace 內設定**單一** uid/gid 映射（只在非 root 的原生 Linux

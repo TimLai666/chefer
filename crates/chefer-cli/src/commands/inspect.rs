@@ -17,6 +17,16 @@ use crate::ui;
 /// manifest.json 的大小上限（防禦損毀檔案宣告超大 entry 導致 OOM）。
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 
+/// 網路模式的人類可讀標籤（含對外可達性的一句話說明）。
+fn network_label(n: chefer_bundle::NetworkMode) -> &'static str {
+    use chefer_bundle::NetworkMode::*;
+    match n {
+        Shared => "shared（共用 host 網路，未宣告的 port 也可達）",
+        Internal => "internal（隔離；只開宣告的 port，無對外網路）",
+        Bridge => "bridge（隔離；只開宣告的 port，可出網）",
+    }
+}
+
 /// 解壓輸出總量上限：bundle 佈局中 manifest.json 之前只有 agents/（數 MB）
 /// 與 appcipe.yml，256 MiB 足以涵蓋並讀到 manifest，遠低於 OOM 門檻。
 /// 套在 tar 之前以擋下長檔名/pax 標頭撐爆 read_to_end 的解壓炸彈。
@@ -161,6 +171,10 @@ fn render_manifest_summary(m: &chefer_bundle::Manifest) {
         Cell::new("Crash Policy").fg(Color::Cyan),
         Cell::new(format!("{:?}", m.app.crash)).fg(Color::Yellow),
     ]);
+    t.add_row(vec![
+        Cell::new("Network").fg(Color::Cyan),
+        Cell::new(network_label(m.app.network)).fg(Color::Yellow),
+    ]);
     if let Some(d) = &m.app.data_dir_override {
         t.add_row(vec![
             Cell::new("Data Dir Override").fg(Color::Cyan),
@@ -268,7 +282,7 @@ fn render_manifest_summary(m: &chefer_bundle::Manifest) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chefer_bundle::{AppMeta, CrashPolicy, MANIFEST_FORMAT_VERSION, Manifest};
+    use chefer_bundle::{AppMeta, CrashPolicy, MANIFEST_FORMAT_VERSION, Manifest, NetworkMode};
 
     /// 建一個最小 bundle + 假 runtime，用 chefer-assembler 組成單檔。
     fn make_single_file(dir: &Path) -> std::path::PathBuf {
@@ -283,6 +297,7 @@ mod tests {
                 old_names: vec![],
                 data_dir_override: None,
                 crash: CrashPolicy::FailFast,
+                network: NetworkMode::Shared,
                 generated_at_utc: "2026-01-01T00:00:00Z".into(),
                 builder_version: "1.2.3".into(),
             },

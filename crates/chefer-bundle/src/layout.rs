@@ -27,6 +27,12 @@ pub fn guest_agent_name(arch: &str) -> String {
     format!("guest-agent-{arch}")
 }
 
+/// 內嵌 pasta（bridge 出網用，靜態 musl）的檔名（arch ∈ "x86_64", "aarch64"）。
+/// 與 guest-agent 同放 `agents/`；bridge 模式時 guest-agent 會找它來提供出網 NAT。
+pub fn pasta_name(arch: &str) -> String {
+    format!("pasta-{arch}")
+}
+
 /// macOS micro-VM appliance（kernel + initramfs）目錄。
 pub fn vm_dir(bundle_dir: &Path) -> PathBuf {
     bundle_dir.join("vm")

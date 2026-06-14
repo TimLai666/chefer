@@ -193,7 +193,7 @@ fn is_single_path_segment(old: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chefer_bundle::CrashPolicy;
+    use chefer_bundle::{CrashPolicy, NetworkMode};
     use std::fs;
 
     fn app_meta(name: &str, override_dir: Option<String>, old_names: Vec<String>) -> AppMeta {
@@ -204,6 +204,7 @@ mod tests {
             old_names,
             data_dir_override: override_dir,
             crash: CrashPolicy::FailFast,
+            network: NetworkMode::Shared,
             generated_at_utc: "2026-01-01T00:00:00Z".into(),
             builder_version: String::new(),
         }
