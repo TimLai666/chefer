@@ -1,6 +1,8 @@
-//! 服務生命週期監控（fail_fast）：
+//! 服務生命週期監控（fail_fast + 介面服務生命週期）：
 //! 依拓撲順序啟動全部服務 → 任一服務以非零結束 → SIGTERM 其餘 → 5 秒後 SIGKILL
-//! → 回傳該 exit code；全部正常結束 → 0；收到 SIGTERM/SIGINT → 同終止程序 → 130。
+//! → 回傳該 exit code；**介面服務（gui/terminal/both）即使 exit 0 也收掉整個 app**
+//! （關窗/關終端 = app 結束）；非介面服務 exit 0 屬背景/一次性、其餘繼續；
+//! 全部正常結束 → 0；收到 SIGTERM/SIGINT → 同終止程序 → 130。
 //!
 //! 本模組於 `lib.rs` 以 `#[cfg(target_os = "linux")]` 限定，故此處不再重複內層 cfg。
 
