@@ -264,13 +264,33 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
 - 服務啟動（Linux）：
   - 依 `topo_sort` 順序啟動（v1：先後順序即依賴語意，無健康檢查；文件註明）。
   - 每個服務：依執行身分決定 namespace——**以真實 root 執行（WSL2 distro、macOS VM、或原生 Linux 以 root 執行）時 `unshare(mount+pid)`、不開 user namespace**，服務直接以 root 跑，容器 entrypoint 的 `chown`/`gosu`/`setuid` 到服務專用 uid（官方 redis/postgres 的 999…）可直接成功；**非 root（原生 Linux rootless）才 `unshare(user+mount+pid)` 並寫單一 uid 映射**（`0 <uid> 1`，因核心規定 unshare 後自寫 uid_map 只能映射單一 id；範圍映射需由仍持 CAP_SETUID 的 parent 代寫，故 rootless 下 chown 到其他 uid 的映像受限，屬 rootless 固有限制）→ 掛 `/proc` → bind `/dev/{null,zero,random,urandom,tty}`、`/dev/pts`、`/dev/shm`(tmpfs) → bind persist（`<data_dir>/data/<svc>` ↔ persist_path，host 端先 `create_dir_all`）→ bind mounts（host 路徑不存在→啟動前報錯）→ interface_mode 含 gui 時 bind `/tmp/.X11-unix` 與 `$XDG_RUNTIME_DIR/wayland-*` socket（存在且為 socket 才掛；WSLg 內若未提供 `XDG_RUNTIME_DIR` 但 `/mnt/wslg/runtime-dir` 存在，則以該目錄作為 Wayland fallback）並傳遞 `DISPLAY`/`XDG_RUNTIME_DIR`/`WAYLAND_DISPLAY`（`WAYLAND_DISPLAY` 僅沿用實際已掛 socket，否則取排序後第一個）→ `pivot_root` → `chdir(workdir)` → env 合併（§3）→ exec 有效命令。
-  - 網路：**不** unshare netns（共享網路 → ports 直接生效，WSL2 下 TCP 由 localhost forwarding 對外、UDP 由 `--udp-bridge` 起的 VM 內橋接 + host 端 relay 對外）。
+  - 網路（v1 預設 = `shared`）：**不** unshare netns（共享網路 → ports 直接生效，WSL2 下 TCP 由 localhost forwarding 對外、UDP 由 `--udp-bridge` 起的 VM 內橋接 + host 端 relay 對外）。**已知缺口**：未宣告的 port 仍可從 host 連到（共用 netns + WSL2 wslrelay 鏡射）。真正隔離見下方「網路隔離」設計。
   - 監控（fail_fast + 介面服務生命週期）：
     - 任一服務 exit ≠ 0 → 終止其餘全部（SIGTERM → 等 5s → SIGKILL，對中繼 pgid 與 pid-ns init 雙送）→ 回傳該 exit code。
     - **介面服務（interface_mode 含 gui/terminal/both）即使 exit 0 也視為「整個 app 結束」**（使用者關掉視窗/終端 = app 該收掉）→ 終止其餘、回 0。否則 GUI app 關窗後背景服務（如 db）會殘留、佔住埠、無法重啟。
     - 非介面（none）服務 exit 0 → 屬背景/一次性任務，其餘繼續跑；全部結束 → 0。
   - `interface_mode=terminal/both`：該服務 stdio 直通（v1：所有服務 stdout/stderr 都加 `[svc]` 前綴轉發；terminal 服務 stdin 直通——僅允許一個服務宣告 terminal/both，多個→驗證期報錯）。
 - musl 靜態建置：`cargo build -p guest-agent --target x86_64-unknown-linux-musl --release` 必須可行（避免依賴需要 cc 的 crate；zstd 解壓用純 Rust 的 ruzstd）。musl 目標的 linker 統一為 rust-lld（`.cargo/config.toml` 已設定，跨 host 一致）。
+
+### 網路隔離（per-app netns）— 設計
+
+AppCipe 新增 app 級欄位 **`network`**（appcipe-spec enum，serde rename 小寫；寫進 manifest `app`）：
+
+- **`shared`（v1 預設，現況）**：所有服務共用 host/VM 的 netns；服務間以 `127.0.0.1` 互通；`ports:` 直接生效。缺點：未宣告的 port 仍可從 host 連到（且 WSL2 wslrelay 會鏡射任何 loopback 埠）。沿用現有路徑（含 `--udp-bridge`）。
+- **`isolated`（本次目標）**：整個 app 跑在**自己的一個 network namespace** 內。
+  - guest-agent **建立一個 app netns**（所有服務 `setns` 進同一個 → 服務間仍以 `127.0.0.1` 互通），netns 內僅 `lo`。
+  - 對**每個宣告的 `ports:`** 起一條 **跨 netns 的 userspace relay**：listener 留在 **parent netns**（distro/VM/原生 host 的 netns）上的 `guest` 埠，connector 在 **app netns** 連 `127.0.0.1:guest`，兩端以 fork 前建立的 **socketpair（fd 不受 netns 限制）** 串接——**不需 veth / CAP_NET_ADMIN / iptables / slirp**，rootless 也適用（`unshare(NEWNET)` 在 userns 內可行）。沿用 guest-agent 既有的 per-client session TCP/UDP relay 邏輯（`udp_bridge`），只是改成跨 netns。
+  - **未宣告的 port**：服務只在 app netns 的 `lo` 監聽 → parent netns 無對應 listener → host 連不到、**WSL2 wslrelay 也看不到（服務不在它監看的 netns）→ 真正不對外**。這正是 `isolated` 解決的核心。
+  - host 端機制不變：chefer-runtime 的 TCP/UDP 代理、WSL2 的 localhost forwarding / UDP VM-IP relay 一律打到 **parent netns 上的 relay listener**（與 `shared` 時打服務本身位置等效）。
+  - **限制（誠實）**：`isolated` 的 app netns 只有 `lo` → **服務沒有對外網路（無 internet / DNS）**。適合「內部專用、不需出網」的服務（db、純內部 API）。需要出網的 app 用 `shared`，或等下方 `nat`。
+- **`nat`（未來）**：per-app netns + **bundled `pasta`（passt，userspace、rootless、免 iptables/veth）** 提供出網 NAT + 只轉發宣告的 inbound 埠 = Docker bridge 等價行為。`pasta` 靜態二進位隨 kit 出貨（同 guest-agent）。屆時可考慮把預設改為 `nat`。
+
+平台對應:
+- **原生 Linux（namespaces）**:app netns 於 guest-agent in-process 建立;relay 跨「host netns ↔ app netns」。
+- **Windows（wsl2）**:app netns 在 distro 內;relay 跨「distro netns ↔ app netns」;對外仍靠既有 host 代理 + wslrelay/UDP bridge 打到 distro netns 的 listener。附帶好處:**消除 wslrelay 對未宣告埠的鏡射洩漏**。
+- **macOS（vz）**:VM 已與 host 隔離;VM 內同原生 Linux 作法。
+
+實作分期:**P1** `isolated`（lo + 跨 netns relay）於原生 Linux + 單元/E2E 驗證 → **P2** WSL2 路徑 → **P3** `nat`（pasta）出網。`shared` 維持預設直到 `nat` 成熟,避免破壞需要出網的既有 app。
 
 ### chefer-cli（bin）
 - 子命令：
