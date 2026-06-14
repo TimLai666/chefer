@@ -277,7 +277,7 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
   - `inspect <single-file>`：讀 footer + 解出 manifest.json 摘要（不執行）；含 **「Packed by chefer」**＝打包該單檔的 chefer 版本（取自 manifest 的 `app.builder_version`，由 `build` 寫入自身 `CARGO_PKG_VERSION`；舊 bundle 無此欄位則顯示 unknown）。
   - `version` / `upgrade`：repo = `TimLai666/chefer`（常數修正）。`upgrade` 經 HTTPS（rustls）自 GitHub Releases 取得**目前 host target 的完整 kit 壓縮包**並**同時替換 `chefer` 二進位與整個 `kit/`**（sha256 驗證、含 rollback），而不是只替換單一二進位——CLI 與 kit 永遠同版本、不會漂移。
     - asset 命名沿用 release workflow：`chefer_<tag>_<target>.zip`（Windows）或 `chefer_<tag>_<target>.tar.gz`（Linux/macOS）；`<tag>` 取自 GitHub Release tag/version，不在程式碼硬寫。
-  - `uninstall [-y]`：移除 chefer 本身——以 self-replace 的 `self_delete` 刪掉 CLI 執行檔、刪掉同層且確為 chefer kit 的 `kit/`、並盡力清掉安裝腳本加到 PATH 的設定（Unix 改 rc 檔、Windows 過濾使用者 PATH）。**不**動使用者打包出的 app 單檔、app 持久化資料、或 WSL distro（僅提示）。
+  - `selfrm [-y]`：移除 chefer 本身——以 self-replace 的 `self_delete` 刪掉 CLI 執行檔、刪掉同層且確為 chefer kit 的 `kit/`、並盡力清掉安裝腳本加到 PATH 的設定（Unix 改 rc 檔、Windows 過濾使用者 PATH）。**不**動使用者打包出的 app 單檔、app 持久化資料、或 WSL distro（僅提示）。命名用 `selfrm` 而非 `uninstall`，以免誤讀成「chefer 去移除別的東西」。
 - **安裝**：`scripts/install.sh`（Linux/macOS）與 `scripts/install.ps1`（Windows）一行安裝——偵測 OS/arch、抓對應 release asset、驗 sha256、解壓到 `~/.chefer`（Windows `%LOCALAPPDATA%\chefer`）、加進 PATH；完全不依賴既有 chefer，故可重裝救回壞掉的版本。`install.ps1` 全 ASCII（避開 Windows PowerShell 5.1 對無 BOM UTF-8 的 ANSI 誤判）。
     - 必須同時下載同名 `.sha256`，計算壓縮包 SHA-256 並比對後才解壓；`.sha256` 內容採 `sha256sum` 格式（`<hex>  <filename>`），只信任第一欄 64 位十六進位。
     - 解壓到同目錄暫存資料夾；安全檢查每個 archive entry（拒絕絕對路徑、Windows 前綴、`..`、空路徑）。解壓後必須剛好得到 `chefer_<tag>_<target>/` 根目錄，內含 `chefer[.exe]` 與 `kit/chefer-runtime-*`、`kit/guest-agent-x86_64`、`kit/guest-agent-aarch64`。

@@ -96,7 +96,8 @@ enum Cmd {
     },
 
     /// 移除 chefer 本身（CLI 執行檔 + kit）；不會動到你打包好的 app 或其資料
-    Uninstall {
+    #[command(name = "selfrm")]
+    Selfrm {
         /// 不詢問直接移除
         #[arg(long, short = 'y')]
         yes: bool,
@@ -162,7 +163,7 @@ fn main() -> Result<()> {
             to,
             check_only,
         } => commands::upgrade::cmd_upgrade(&channel, to.as_deref(), check_only),
-        Cmd::Uninstall { yes } => commands::uninstall::cmd_uninstall(yes),
+        Cmd::Selfrm { yes } => commands::selfrm::cmd_selfrm(yes),
     }
 }
 

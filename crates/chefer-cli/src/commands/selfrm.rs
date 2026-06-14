@@ -1,4 +1,4 @@
-//! `chefer uninstall` — 移除 chefer 本身（CLI 執行檔 + 同層的 kit/）。
+//! `chefer selfrm` — 移除 chefer 本身（CLI 執行檔 + 同層的 kit/）。
 //!
 //! 只移除 chefer 工具本身；**不會**動到：
 //! - 你用 chefer 打包出來的 app 單檔（那是獨立檔案）
@@ -15,7 +15,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
 
-pub fn cmd_uninstall(yes: bool) -> Result<()> {
+pub fn cmd_selfrm(yes: bool) -> Result<()> {
     let exe = std::env::current_exe().context("取得 chefer 執行檔路徑失敗")?;
     let install_dir = exe
         .parent()

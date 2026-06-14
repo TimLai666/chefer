@@ -138,7 +138,7 @@ cargo run -p chefer-cli -- build examples/gui-demo/appcipe.yml --out dist
 | `chefer inspect <file>` | Show the footer and embedded manifest summary of a Chefer single-file executable (no execution, no extraction). |
 | `chefer version` | Show Chefer and environment version info. |
 | `chefer upgrade [--channel stable] [--to <ver>] [--check-only]` | Self-update from GitHub Releases — replaces **both** the `chefer` binary and the whole `kit/` together (sha256-verified, with rollback), so the CLI and kit never drift apart. |
-| `chefer uninstall [-y]` | Remove Chefer itself (the `chefer` binary + its `kit/`) and clean the installer's PATH entry. Does **not** touch apps you packaged, their data, or WSL distros. |
+| `chefer selfrm [-y]` | Remove Chefer itself (the `chefer` binary + its `kit/`) and clean the installer's PATH entry. Does **not** touch apps you packaged, their data, or WSL distros. |
 
 > `chefer inspect` now also shows **"Packed by chefer"** — the chefer version that built that single-file app (recorded in its manifest), so you can always tell which version produced a given artifact.
 
@@ -223,3 +223,14 @@ Honest list of what doesn't work (yet):
 - `depends_on` controls **start order only** — there are no health checks in v1.
 - At most **one** service per app may use `interface_mode: terminal` or `both`; host ports must be unique across the whole app.
 - On Windows the runtime requires **WSL2** (`wsl --install` once, if not present).
+
+## Roadmap
+
+Planned, not yet implemented:
+
+- **Pull images straight from a registry** (like Docker Compose) — write `image: redis:7.2-alpine` and have `chefer build` fetch it, instead of `docker save`-ing to a tar first. **`latest` (and untagged) will be rejected — a specific version tag or digest is required**, so a build is always reproducible.
+- **Build from a Dockerfile** (`source: dockerfile`) and other `source:` kinds, beyond today's `source: tar`.
+- **Per-app network isolation** (a dedicated netns per app) so a service with no `ports:` is *truly* unreachable from the host — closing the v1 "db not exposed" gap.
+- **`depends_on` health checks** (wait-until-ready), not just start order.
+- **Rootless Linux support for chown/gosu images** via `newuidmap` + `/etc/subuid` delegation (works today on the root backends: WSL2 / macOS VM / native-root).
+- **macOS VZ boot validated on real Apple Silicon** — the guest path is already QEMU-verified; the host Virtualization.framework shim needs bare-metal hardware to certify.
