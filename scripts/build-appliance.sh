@@ -90,6 +90,11 @@ main() {
     out_dir="$root/dist/appliance"
   fi
   mkdir -p "$out_dir"
+  # 絕對化：下面以 `-v "$out_dir:/out"` 掛進容器。Docker 對**相對路徑**的 -v 來源
+  # 會當成「具名 volume」而非綁定主機目錄（例如 `--out stage` 會把產物寫進名為
+  # stage 的 volume，主機 ./stage 仍是空的 → release workflow 找不到檔案而失敗）。
+  # 故一律轉成絕對路徑，讓任何呼叫端（含 `--out stage` 這種相對路徑）都能正確綁定。
+  out_dir="$(cd "$out_dir" && pwd)"
 
   local linux_repo="${CHEFER_LINUX_REPO:-https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git}"
   local image="${CHEFER_APPLIANCE_CONTAINER:-debian:bookworm-slim}"
