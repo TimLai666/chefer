@@ -85,10 +85,13 @@ service 名規則：`[a-z][a-z0-9_]*`，≤32。
 ## 真實映像的陷阱（實測過）
 
 - **官方 redis/postgres/nginx 等**的 entrypoint 常在以 root 執行時 `chown`+`gosu` 切到
-  服務專用 uid（如 999）。Chefer 以 root 執行時會嘗試「完整 uid 範圍映射」讓它成功；
-  但在 **WSL2（巢狀 userns）會退回單一 uid 映射**，那些映像的 chown 會 `EINVAL` 而起不來。
-  → 在 WSL2 上，優先用**以 root 直接執行、不 chown** 的映像（例：自建 `alpine + apk add redis`，
-  `CMD ["redis-server", ...]`），或映像本身就以非 root 跑。參考 `examples/demo/db/Dockerfile`。
+  服務專用 uid（如 999）。這類映像在 **WSL2、macOS VM、以及原生 Linux 以 root 執行**時
+  可直接使用——這些後端讓服務以真實 root 執行（不開 user namespace），chown/gosu 到任何
+  uid 都成功（官方 `redis` 已在 WSL2 實測通過）。**唯一受限**是原生 Linux 的 **rootless**
+  路徑（以非 root 使用者執行單檔）：核心規定 `unshare(NEWUSER)` 後只能自映射單一 uid，那些
+  映像可能 `chown` `EINVAL` 而起不來——此為 rootless 固有限制（同 rootless podman 需
+  `/etc/subuid` 委派）。若要支援 rootless，改用**以容器 root 直接執行、不 chown** 的映像
+  （例：自建 `alpine + apk add redis`，`CMD ["redis-server", ...]`）。參考 `examples/demo/db/Dockerfile`。
 - `format` 用**連字號**：`docker-archive` / `oci-archive`（底線形式也接受，但文件統一用連字號）。
 - `image.source` 只支援 `tar`：要打包 registry 映像先 `docker pull` + `docker save`。
 

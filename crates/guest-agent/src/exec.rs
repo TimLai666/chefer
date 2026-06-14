@@ -1,13 +1,16 @@
-//! 以 Linux namespaces（user + mount + pid）啟動單一服務並 exec 有效命令。
+//! 以 Linux namespaces（mount + pid，rootless 時另加 user）啟動單一服務並 exec 有效命令。
 //!
 //! 流程（docs/DESIGN.md §6）：
-//! supervisor fork 出「中繼行程」→ 中繼行程 unshare(USER|MNT|PID) 並寫入
-//! uid/gid map → 再 fork 一次，孫行程成為新 pid namespace 的 pid 1 →
+//! supervisor fork 出「中繼行程」→ 中繼行程依執行身分 unshare namespaces
+//! （**真實 root：MNT|PID，不開 user ns**；**非 root（rootless）：USER|MNT|PID
+//! 並寫單一 uid/gid map**）→ 再 fork 一次，孫行程成為新 pid namespace 的 pid 1 →
 //! 孫行程完成掛載（proc、dev、persist、bind mounts、GUI socket）→
 //! pivot_root → chdir → execve。中繼行程等待孫行程並轉送 exit code。
 //!
 //! 網路 **不** unshare（共享 host 網路 → ports 直接生效）。
-//! image_config.user 在 v1 忽略：單一 uid map（目前 uid ↔ 0）下無對應意義。
+//! 以真實 root 執行時不開 user namespace、服務以 root 跑——官方會 `chown`/`gosu` 到
+//! 服務專用 uid（redis/postgres 999…）的映像因此可用；非 root 才開 user ns + 單一
+//! uid map（uid ↔ 0）。image_config.user 在 v1 忽略。
 #![cfg(target_os = "linux")]
 
 use std::convert::Infallible;
@@ -321,22 +324,43 @@ fn middle_child(
         let _ = signal(Signal::SIGINT, SigHandler::SigIgn);
     }
 
-    if let Err(e) =
-        unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID)
-    {
+    // 以真實 root 執行時（WSL2 distro、macOS VM 內），**不**開 user namespace：
+    // root 對完整 uid 範圍本就有 CAP_SETUID/CAP_CHOWN，容器 entrypoint 的
+    // chown/gosu/setuid 到服務專用 uid（官方 redis/postgres 的 999…）可直接成功。
+    //
+    // 為何不在 NEWUSER 內做範圍映射：核心規定「unshare(NEWUSER) 後由行程自寫
+    // 自身 uid_map」只允許單一 uid；範圍映射需由仍在 parent ns、持有 CAP_SETUID 的
+    // 父行程代寫 /proc/<child>/uid_map。故自寫範圍永遠退化成單一 uid，那些會 chown
+    // 到其他 uid 的映像就會失敗——即便我們是 root。直接以 root 執行則無此限制。
+    //
+    // 非 root（原生 Linux rootless）才需要 NEWUSER 取得 ns 內 root 以做 pivot_root/mount；
+    // 此情境下單一 uid 映射為其固有限制（同 podman rootless 需 /etc/subuid 委派）。
+    let real_root = nix::unistd::geteuid().is_root();
+    let mut flags = CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID;
+    if !real_root {
+        flags |= CloneFlags::CLONE_NEWUSER;
+    }
+    if let Err(e) = unshare(flags) {
         eprintln!(
-            "[guest-agent] 服務 `{}` unshare(user+mount+pid) 失敗：{e}；\
+            "[guest-agent] 服務 `{}` unshare({}) 失敗：{e}；\
              請確認核心允許 unprivileged user namespaces（/proc/sys/kernel/unprivileged_userns_clone = 1）",
-            plan.name
+            plan.name,
+            if real_root {
+                "mount+pid"
+            } else {
+                "user+mount+pid"
+            }
         );
         return 126;
     }
-    if let Err(e) = write_id_maps(plan.uid, plan.gid) {
-        eprintln!(
-            "[guest-agent] 服務 `{}` 寫入 uid/gid map 失敗：{e:#}",
-            plan.name
-        );
-        return 126;
+    if !real_root {
+        if let Err(e) = write_id_maps(plan.uid, plan.gid) {
+            eprintln!(
+                "[guest-agent] 服務 `{}` 寫入 uid/gid map 失敗：{e:#}",
+                plan.name
+            );
+            return 126;
+        }
     }
 
     // unshare(PID) 只影響之後 fork 的子行程 → 再 fork 一次，孫行程成為新 ns 的 pid 1
@@ -375,30 +399,14 @@ fn middle_child(
     }
 }
 
-/// 子 user namespace 可映射的 uid/gid 範圍大小（特權路徑）。
-/// 涵蓋容器內常見的服務專用 uid（redis 999、postgres 999、www-data 33…）。
-const ID_MAP_RANGE: u32 = 65536;
-
-/// 在新 user namespace 內設定 uid/gid 映射。
+/// 在新 user namespace 內設定**單一** uid/gid 映射（只在非 root 的原生 Linux
+/// rootless 路徑呼叫；root 不開 NEWUSER，見 `middle_child` 內的 `real_root` 分支）。
 ///
-/// 兩條路徑：
-/// - **特權（uid==0，即 WSL2 / VM 內以 root 執行）**：映射完整範圍
-///   `0 0 65536`（identity），並 **allow** setgroups。如此容器內的
-///   `chown`/`gosu`/`setuid` 到服務專用 uid（redis 999、postgres 999…）
-///   才能成功——大量真實映像的 entrypoint 都會這麼做。寫多行/跨 uid 映射
-///   需要 parent ns 的 CAP_SETUID/CAP_SETGID，root 具備。
-/// - **非特權（原生 Linux rootless 的一般使用者）**：只能映射呼叫者自身的
-///   單一 uid（`0 <uid> 1`），且須先 **deny** setgroups。會 chown 到其他
-///   uid 的映像在此情境受限（未來可用 newuidmap + /etc/subuid 擴充）。
+/// 把容器內 uid/gid 0 映射到呼叫者自身的 uid/gid，並先 **deny** setgroups。
+/// 核心規定：unshare(NEWUSER) 後行程自寫自身 uid_map 只能映射單一 id（範圍映射需由
+/// 仍持 CAP_SETUID 的 parent 代寫），故 rootless 下會 chown 到其他服務 uid 的映像
+/// 受限——這是 rootless 的固有限制（等同 podman rootless 需 /etc/subuid 委派）。
 fn write_id_maps(uid: u32, gid: u32) -> Result<()> {
-    // 以 root 執行時先嘗試「特權範圍映射」；成功則回。失敗（例如 WSL2 把 distro
-    // root 放在巢狀 userns，對範圍缺 CAP_SETUID 而回 EPERM）則退回單一 uid 映射。
-    // uid_map 只能成功寫入一次；失敗的寫入不消耗該次，故可安全退回重試。
-    if uid == 0 && gid == 0 && try_privileged_range_map().is_ok() {
-        return Ok(());
-    }
-
-    // 單一 uid 映射（原生 Linux rootless，或上面範圍映射失敗的退回路徑）。
     // 寫單行 gid_map 前必須 deny setgroups。
     match fs::write("/proc/self/setgroups", "deny") {
         Ok(()) => {}
@@ -410,21 +418,6 @@ fn write_id_maps(uid: u32, gid: u32) -> Result<()> {
         .context("寫入 /proc/self/uid_map 失敗")?;
     fs::write("/proc/self/gid_map", format!("0 {gid} 1"))
         .context("寫入 /proc/self/gid_map 失敗")?;
-    Ok(())
-}
-
-/// 嘗試特權範圍映射 `0 0 65536`（identity）並 allow setgroups，
-/// 讓容器內 chown/gosu 到服務專用 uid 能成功（真實映像常見）。
-/// 任一步失敗即回 Err，由呼叫端退回單一 uid 映射。
-fn try_privileged_range_map() -> Result<()> {
-    // setgroups=allow 須在 gid_map 之前；NotFound（舊核心）視為可接受。
-    match fs::write("/proc/self/setgroups", "allow") {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(anyhow::anyhow!("setgroups=allow 失敗：{e}")),
-    }
-    fs::write("/proc/self/uid_map", format!("0 0 {ID_MAP_RANGE}")).context("uid_map 範圍")?;
-    fs::write("/proc/self/gid_map", format!("0 0 {ID_MAP_RANGE}")).context("gid_map 範圍")?;
     Ok(())
 }
 
