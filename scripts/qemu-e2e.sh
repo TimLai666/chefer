@@ -221,6 +221,29 @@ wait_for_socket() {
   die "等待 virtiofsd socket 逾時：$socket"
 }
 
+# 失敗時把所有與本次 VM 相關的 log 全倒出來：guest console、QEMU 自身的 stderr
+# （QEMU 啟動失敗只會寫這裡，不會進 guest console）、兩個 virtiofsd 的 log。
+# 這些路徑由 start_qemu 設為全域變數。
+dump_vm_logs() {
+  local console_log="${1:-}"
+  if [[ -n "$console_log" ]]; then
+    echo "===== guest console（${console_log}）=====" >&2
+    cat "$console_log" >&2 2>/dev/null || true
+  fi
+  if [[ -n "${QEMU_STDERR_LOG:-}" ]]; then
+    echo "===== qemu stderr（${QEMU_STDERR_LOG}）=====" >&2
+    cat "$QEMU_STDERR_LOG" >&2 2>/dev/null || true
+  fi
+  if [[ -n "${VIRTIOFS_BUNDLE_LOG:-}" ]]; then
+    echo "===== virtiofsd bundle（${VIRTIOFS_BUNDLE_LOG}）=====" >&2
+    cat "$VIRTIOFS_BUNDLE_LOG" >&2 2>/dev/null || true
+  fi
+  if [[ -n "${VIRTIOFS_DATA_LOG:-}" ]]; then
+    echo "===== virtiofsd data（${VIRTIOFS_DATA_LOG}）=====" >&2
+    cat "$VIRTIOFS_DATA_LOG" >&2 2>/dev/null || true
+  fi
+}
+
 wait_for_http() {
   local url="$1"
   local qemu_pid="$2"
@@ -233,12 +256,12 @@ wait_for_http() {
       return 0
     fi
     if ! kill -0 "$qemu_pid" 2>/dev/null; then
-      cat "$log" >&2 || true
+      dump_vm_logs "$log"
       die "VM 在 ${url} 可連線前就已結束"
     fi
     sleep 0.5
   done
-  cat "$log" >&2 || true
+  dump_vm_logs "$log"
   die "等待 ${url} 逾時"
 }
 
@@ -325,8 +348,12 @@ start_qemu() {
 
   local bundle_sock="$WORK_DIR/sockets/${run_name}-bundle.sock"
   local data_sock="$WORK_DIR/sockets/${run_name}-data.sock"
-  start_virtiofsd "$virtiofsd" "$bundle_sock" "$bundle_dir" "$WORK_DIR/${run_name}-virtiofs-bundle.log"
-  start_virtiofsd "$virtiofsd" "$data_sock" "$data_dir" "$WORK_DIR/${run_name}-virtiofs-data.log"
+  # 全域記下本次 VM 的 log 路徑，供 dump_vm_logs 在任何失敗路徑倒出。
+  VIRTIOFS_BUNDLE_LOG="$WORK_DIR/${run_name}-virtiofs-bundle.log"
+  VIRTIOFS_DATA_LOG="$WORK_DIR/${run_name}-virtiofs-data.log"
+  QEMU_STDERR_LOG="$WORK_DIR/${run_name}-qemu.stderr"
+  start_virtiofsd "$virtiofsd" "$bundle_sock" "$bundle_dir" "$VIRTIOFS_BUNDLE_LOG"
+  start_virtiofsd "$virtiofsd" "$data_sock" "$data_dir" "$VIRTIOFS_DATA_LOG"
 
   local accel="tcg"
   local cpu="max"
@@ -383,7 +410,7 @@ start_qemu() {
     -device vhost-user-fs-pci,chardev=fsbundle,tag=chefer-bundle \
     -chardev "socket,id=fsdata,path=${data_sock}" \
     -device vhost-user-fs-pci,chardev=fsdata,tag=chefer-data \
-    >"$WORK_DIR/${run_name}-qemu.stderr" 2>&1 &
+    >"$QEMU_STDERR_LOG" 2>&1 &
   QEMU_PID=$!
 }
 
@@ -400,11 +427,11 @@ wait_qemu_exit_code() {
   code="$(sed -n 's/.*CHEFER_GUEST_EXIT=\([0-9][0-9]*\).*/\1/p' "$console_log" | tail -n 1)"
   cleanup_vm_processes
   if [[ -z "$code" ]]; then
-    cat "$console_log" >&2 || true
+    dump_vm_logs "$console_log"
     die "${label}: 找不到 CHEFER_GUEST_EXIT 標記"
   fi
   if [[ "$code" != "$expected" ]]; then
-    cat "$console_log" >&2 || true
+    dump_vm_logs "$console_log"
     die "${label}: 預期 guest exit ${expected}，實際為 ${code}"
   fi
 }

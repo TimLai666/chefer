@@ -106,6 +106,19 @@ jobs:
       - name: Docker info
         run: docker info
 
+      # 把預編的 appliance（kernel + initramfs）放到 $HOME 下的穩定路徑，並快取之；
+      # qemu-e2e.sh 認得 CHEFER_QEMU_APPLIANCE_DIR：存在就重用、不存在才以
+      # build-appliance.sh 重建（約 10 分鐘的 kernel build）。快取命中時整個 E2E 約 3 分鐘。
+      - name: Resolve appliance cache dir
+        shell: bash
+        run: echo "CHEFER_QEMU_APPLIANCE_DIR=$HOME/.cache/chefer-appliance" >> "$GITHUB_ENV"
+
+      - name: Cache appliance (kernel + initramfs)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/chefer-appliance
+          key: appliance-${{ matrix.name }}-${{ env.CHEFER_LINUX_REF }}-${{ hashFiles('scripts/build-appliance.sh', 'scripts/appliance/**') }}
+
       - name: Run QEMU appliance E2E
         shell: bash
         run: bash scripts/qemu-e2e.sh
