@@ -39,7 +39,7 @@ Cargo workspace under `crates/`. The data flow is:
 
 **Kit:** `chefer build` needs prebuilt binaries — `chefer-runtime-<target-triple>[.exe]` per output target, `guest-agent-<arch>` (musl static; embedded into bundles for Windows/macOS targets), and for macOS targets `chefer-vmlinuz-<arch>` / `chefer-initramfs-<arch>` appliance files. Search order: `--kit-dir` > `CHEFER_KIT_DIR` > `<exe dir>/kit/` > `<exe dir>`.
 
-**chefer-cli** is the user-facing CLI (`init`, `check`, `build`, `run`, `inspect`, `version`, `upgrade`), one file per command under `src/commands/`. Its `build.rs` injects `BUILD_TIME` and `BUILD_TARGET`; the supported spec version is the `APPCIPE_SPEC_VERSION` constant in `src/main.rs`.
+**chefer-cli** is the user-facing CLI (`init`, `check`, `build`, `run`, `inspect`, `version`, `upgrade`, `uninstall`), one file per command under `src/commands/`. `upgrade` replaces both the binary and the whole `kit/` together (no drift); `build` records its own `CARGO_PKG_VERSION` into `manifest.app.builder_version` (shown by `inspect` as "Packed by chefer" and in the runtime startup log); `uninstall` self-deletes the binary + kit and cleans the installer's PATH entry. Its `build.rs` injects `BUILD_TIME` and `BUILD_TARGET`; the supported spec version is the `APPCIPE_SPEC_VERSION` constant in `src/main.rs`.
 
 ## AppCipe Format Notes
 

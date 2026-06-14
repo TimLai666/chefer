@@ -137,7 +137,10 @@ cargo run -p chefer-cli -- build examples/gui-demo/appcipe.yml --out dist
 | `chefer run [path] [build options]` | Build for the host target, then run the artifact immediately (stdio passthrough, exit code propagated). |
 | `chefer inspect <file>` | Show the footer and embedded manifest summary of a Chefer single-file executable (no execution, no extraction). |
 | `chefer version` | Show Chefer and environment version info. |
-| `chefer upgrade [--channel stable] [--to <ver>] [--check-only]` | Self-update from GitHub Releases. |
+| `chefer upgrade [--channel stable] [--to <ver>] [--check-only]` | Self-update from GitHub Releases — replaces **both** the `chefer` binary and the whole `kit/` together (sha256-verified, with rollback), so the CLI and kit never drift apart. |
+| `chefer uninstall [-y]` | Remove Chefer itself (the `chefer` binary + its `kit/`) and clean the installer's PATH entry. Does **not** touch apps you packaged, their data, or WSL distros. |
+
+> `chefer inspect` now also shows **"Packed by chefer"** — the chefer version that built that single-file app (recorded in its manifest), so you can always tell which version produced a given artifact.
 
 `[path]` defaults to `./appcipe.yml`; a directory argument means `<dir>/appcipe.yml`.
 

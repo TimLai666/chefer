@@ -42,6 +42,9 @@ pub struct PackOptions {
     pub require_agents: bool,
     /// 層重壓所用的 zstd 壓縮等級。
     pub zstd_level: i32,
+    /// 打包此 app 的 chefer 版本（寫入 manifest 的 `app.builder_version`）。
+    /// CLI 傳入自身的 `CARGO_PKG_VERSION`；其他呼叫端可留空字串。
+    pub builder_version: String,
 }
 
 /// 打包結果。
@@ -96,6 +99,7 @@ pub fn pack(app: &AppCipe, opts: &PackOptions) -> Result<PackResult> {
             data_dir_override: app.data_dir.clone(),
             crash: CrashPolicy::FailFast,
             generated_at_utc: now_utc_rfc3339(),
+            builder_version: opts.builder_version.clone(),
         },
         services,
     };

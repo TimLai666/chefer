@@ -17,14 +17,19 @@ pub fn run(bundle_dir: &Path, keep_tmp: bool) -> Result<i32> {
     let manifest_path = chefer_bundle::layout::manifest_path(bundle_dir);
     let manifest = Manifest::load(&manifest_path)?;
     tracing::info!(
-        "app：{}{}",
+        "app：{}{}{}",
         manifest.app.name,
         manifest
             .app
             .app_version
             .as_deref()
             .map(|v| format!(" v{v}"))
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        if manifest.app.builder_version.is_empty() {
+            String::new()
+        } else {
+            format!("（由 chefer {} 打包）", manifest.app.builder_version)
+        }
     );
 
     // data dir：override 優先，否則平台預設；遷移檢查必須在 create_dir_all 之前。
@@ -200,6 +205,7 @@ mod tests {
             data_dir_override: override_dir,
             crash: CrashPolicy::FailFast,
             generated_at_utc: "2026-01-01T00:00:00Z".into(),
+            builder_version: String::new(),
         }
     }
 

@@ -94,6 +94,13 @@ enum Cmd {
         #[arg(long, help = "Only check for updates, do not perform upgrade")]
         check_only: bool,
     },
+
+    /// 移除 chefer 本身（CLI 執行檔 + kit）；不會動到你打包好的 app 或其資料
+    Uninstall {
+        /// 不詢問直接移除
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 /// build / run 共用的參數（run 固定使用本機 target，故 --target 不在此）。
@@ -155,6 +162,7 @@ fn main() -> Result<()> {
             to,
             check_only,
         } => commands::upgrade::cmd_upgrade(&channel, to.as_deref(), check_only),
+        Cmd::Uninstall { yes } => commands::uninstall::cmd_uninstall(yes),
     }
 }
 

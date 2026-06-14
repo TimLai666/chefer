@@ -69,6 +69,7 @@ pub fn cmd_build(
         target_triples: targets.clone(),
         require_agents,
         zstd_level: opts.zstd_level,
+        builder_version: env!("CARGO_PKG_VERSION").to_string(),
     };
     let pack_res = chefer_pack::pack(&app, &pack_opts).context("打包 bundle 失敗")?;
     println!("📦 Bundle: {}", pack_res.bundle_dir.display());

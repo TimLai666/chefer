@@ -177,6 +177,14 @@ fn render_manifest_summary(m: &chefer_bundle::Manifest) {
         Cell::new("Generated At (UTC)").fg(Color::Cyan),
         Cell::new(&m.app.generated_at_utc),
     ]);
+    t.add_row(vec![
+        Cell::new("Packed by chefer").fg(Color::Cyan),
+        Cell::new(if m.app.builder_version.is_empty() {
+            "(unknown / pre-0.x bundle)"
+        } else {
+            m.app.builder_version.as_str()
+        }),
+    ]);
 
     println!("{}", "▎App (manifest)".bold());
     println!("{t}");
@@ -276,6 +284,7 @@ mod tests {
                 data_dir_override: None,
                 crash: CrashPolicy::FailFast,
                 generated_at_utc: "2026-01-01T00:00:00Z".into(),
+                builder_version: "1.2.3".into(),
             },
             services: vec![],
         };

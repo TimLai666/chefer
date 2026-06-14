@@ -33,6 +33,10 @@ pub struct AppMeta {
     #[serde(default)]
     pub crash: CrashPolicy,
     pub generated_at_utc: String,
+    /// 打包此 app 的 chefer 版本（`chefer build` 寫入；供 `chefer inspect` 與
+    /// runtime 顯示「這是哪一版 chefer 包的」）。舊 bundle 無此欄位 → 反序列化為空字串。
+    #[serde(default)]
+    pub builder_version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,6 +276,7 @@ mod tests {
                 data_dir_override: None,
                 crash: CrashPolicy::FailFast,
                 generated_at_utc: "2026-01-01T00:00:00Z".into(),
+                builder_version: "9.9.9".into(),
             },
             services: vec![svc("a")],
         };

@@ -207,6 +207,7 @@ fn default_opts(out: &Path) -> PackOptions {
         target_triples: vec![],
         require_agents: false,
         zstd_level: 3,
+        builder_version: "test".into(),
     }
 }
 
