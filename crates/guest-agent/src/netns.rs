@@ -260,17 +260,21 @@ fn holder_main(rootless: bool, wr: OwnedFd) -> ! {
         let _ = nix::unistd::write(&wr, &b);
     };
 
-    // rootless：**先單獨** unshare user ns 再寫單行 uid/gid map。
-    // 不可把 NEWUSER 與 NEWNET 併在同一個 unshare()——某些核心在「同一呼叫同時建
-    // user ns 與其他 ns」時，會拒絕之後的非特權單行 uid_map 寫入（EPERM）。
-    // 分兩步（同 `unshare -U` → 寫 map → 再建 netns 的慣用法）即可正常。
+    // **在 unshare(NEWUSER) 之前**取得真實 uid/gid：unshare 後在新 user ns 內、map 尚未
+    // 寫入時，getuid()/getgid() 會回傳 overflow id（65534）。單行非特權 uid_map 必須把
+    // 「寫入者在 parent ns 的 euid」映射進去，若誤用 65534 會被核心拒絕（EPERM）。
+    let real_uid = nix::unistd::getuid().as_raw();
+    let real_gid = nix::unistd::getgid().as_raw();
+
+    // rootless：先單獨 unshare user ns、寫單行 uid/gid map，再建 netns
+    //（慣用的 `unshare -U` → map → 建 netns 流程）。
     if rootless {
         if let Err(e) = unshare(CloneFlags::CLONE_NEWUSER) {
             eprintln!("[guest-agent] netns holder unshare(user) 失敗：{e}");
             report(false);
             unsafe { libc::_exit(1) }
         }
-        if let Err(e) = write_self_id_maps() {
+        if let Err(e) = write_self_id_maps(real_uid, real_gid) {
             eprintln!("[guest-agent] netns holder 寫入 uid/gid map 失敗：{e:#}");
             report(false);
             unsafe { libc::_exit(1) }
@@ -296,9 +300,8 @@ fn holder_main(rootless: bool, wr: OwnedFd) -> ! {
 }
 
 /// 在新建的 user ns 內把 uid/gid 0 映射到呼叫者自身（單一映射；同 exec.rs 的 rootless 模型）。
-fn write_self_id_maps() -> Result<()> {
-    let uid = nix::unistd::getuid().as_raw();
-    let gid = nix::unistd::getgid().as_raw();
+/// `uid`/`gid` 必須是 **unshare(NEWUSER) 之前**取得的真實 id（之後 getuid 會回 overflow id）。
+fn write_self_id_maps(uid: u32, gid: u32) -> Result<()> {
     match std::fs::write("/proc/self/setgroups", "deny") {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
