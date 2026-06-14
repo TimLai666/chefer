@@ -51,27 +51,25 @@ Then just ask your agent to "write an appcipe for these images" — it will foll
 
 > **Running** a Chefer-packaged app needs nothing — the single file is self-contained. You only need to install Chefer if you want to **package** apps yourself.
 
-### Option 1 — Prebuilt binary (recommended)
-
-Download the package for your platform from the [latest release](https://github.com/TimLai666/chefer/releases/latest) — `chefer_<version>_<target>.zip` (Windows) or `chefer_<version>_<target>.tar.gz` (Linux/macOS). Inside, the `chefer` executable sits next to a `kit/` folder (the runtimes, guest-agents and macOS appliance it needs to build apps); keep them together so the kit is auto-discovered.
-
-```powershell
-# Windows (PowerShell) — extract and put chefer on PATH (keep kit\ beside chefer.exe)
-Expand-Archive chefer_<version>_x86_64-pc-windows-msvc.zip -DestinationPath $env:LOCALAPPDATA\Programs\chefer
-$env:Path += ";$env:LOCALAPPDATA\Programs\chefer\chefer_<version>_x86_64-pc-windows-msvc"
-chefer version
-```
+### Option 1 — One-line installer (recommended)
 
 ```bash
-# Linux / macOS — extract and put chefer on PATH (keep kit/ beside the binary)
-tar -xzf chefer_<version>_x86_64-unknown-linux-musl.tar.gz -C ~/.local/share/chefer
-ln -sf ~/.local/share/chefer/chefer_<version>_x86_64-unknown-linux-musl/chefer ~/.local/bin/chefer
-chefer version
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/TimLai666/chefer/main/scripts/install.sh | sh
 ```
 
-One package can cross-package for **every** target (its `kit/` ships all platforms' runtimes + both guest-agent arches + the macOS appliance). Update later with `chefer upgrade`. On macOS, allow the unsigned binary in System Settings → Privacy & Security on first run.
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/TimLai666/chefer/main/scripts/install.ps1 | iex
+```
 
-### Option 2 — From source
+The script detects your OS/arch, downloads the matching package from the [latest release](https://github.com/TimLai666/chefer/releases/latest), verifies its sha256, installs to `~/.chefer` (or `%LOCALAPPDATA%\chefer`), and adds it to your `PATH`. Open a new terminal, then `chefer version`. Pin a version with `CHEFER_VERSION=<tag>` (`$env:CHEFER_VERSION` on Windows) and change the location with `CHEFER_INSTALL_DIR`. Update later with `chefer upgrade`. On macOS, allow the unsigned binary in System Settings → Privacy & Security on first run.
+
+### Option 2 — Manual download
+
+Grab `chefer_<version>_<target>.zip` (Windows) / `.tar.gz` (Linux/macOS) from the [latest release](https://github.com/TimLai666/chefer/releases/latest), extract it, and put the `chefer` executable on your `PATH` — keep the `kit/` folder beside it (the runtimes, guest-agents and macOS appliance it needs to build apps; it's auto-discovered at `<exe dir>/kit`). One package can cross-package for **every** target.
+
+### Option 3 — From source
 
 ```bash
 git clone https://github.com/TimLai666/chefer && cd chefer
