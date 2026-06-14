@@ -264,15 +264,21 @@ fn holder_main(rootless: bool, wr: OwnedFd) -> ! {
     if rootless {
         flags |= CloneFlags::CLONE_NEWUSER;
     }
-    if unshare(flags).is_err() {
+    if let Err(e) = unshare(flags) {
+        eprintln!(
+            "[guest-agent] netns holder unshare({}) 失敗：{e}",
+            if rootless { "user+net" } else { "net" }
+        );
         report(false);
         unsafe { libc::_exit(1) }
     }
-    if rootless && write_self_id_maps().is_err() {
+    if rootless && let Err(e) = write_self_id_maps() {
+        eprintln!("[guest-agent] netns holder 寫入 uid/gid map 失敗：{e:#}");
         report(false);
         unsafe { libc::_exit(1) }
     }
-    if bring_lo_up().is_err() {
+    if let Err(e) = bring_lo_up() {
+        eprintln!("[guest-agent] netns holder 拉起 lo 失敗：{e:#}");
         report(false);
         unsafe { libc::_exit(1) }
     }
@@ -317,8 +323,9 @@ fn bring_lo_up() -> Result<()> {
             return Err(io::Error::last_os_error()).context("SIOCGIFFLAGS(lo) 失敗");
         }
         // SAFETY: 讀取 ifreq 的 flags union 欄位（寫入 union 欄位本身不需 unsafe）。
+        // 只設 IFF_UP（IFF_RUNNING 由核心管理，手動設可能被拒）。
         let cur = unsafe { ifr.ifr_ifru.ifru_flags };
-        ifr.ifr_ifru.ifru_flags = cur | (libc::IFF_UP as i16) | (libc::IFF_RUNNING as i16);
+        ifr.ifr_ifru.ifru_flags = cur | (libc::IFF_UP as i16);
         if unsafe { libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &ifr) } < 0 {
             return Err(io::Error::last_os_error()).context("SIOCSIFFLAGS(lo, UP) 失敗");
         }
