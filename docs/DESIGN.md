@@ -265,7 +265,10 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
   - 依 `topo_sort` 順序啟動（v1：先後順序即依賴語意，無健康檢查；文件註明）。
   - 每個服務：依執行身分決定 namespace——**以真實 root 執行（WSL2 distro、macOS VM、或原生 Linux 以 root 執行）時 `unshare(mount+pid)`、不開 user namespace**，服務直接以 root 跑，容器 entrypoint 的 `chown`/`gosu`/`setuid` 到服務專用 uid（官方 redis/postgres 的 999…）可直接成功；**非 root（原生 Linux rootless）才 `unshare(user+mount+pid)` 並寫單一 uid 映射**（`0 <uid> 1`，因核心規定 unshare 後自寫 uid_map 只能映射單一 id；範圍映射需由仍持 CAP_SETUID 的 parent 代寫，故 rootless 下 chown 到其他 uid 的映像受限，屬 rootless 固有限制）→ 掛 `/proc` → bind `/dev/{null,zero,random,urandom,tty}`、`/dev/pts`、`/dev/shm`(tmpfs) → bind persist（`<data_dir>/data/<svc>` ↔ persist_path，host 端先 `create_dir_all`）→ bind mounts（host 路徑不存在→啟動前報錯）→ interface_mode 含 gui 時 bind `/tmp/.X11-unix` 與 `$XDG_RUNTIME_DIR/wayland-*` socket（存在且為 socket 才掛；WSLg 內若未提供 `XDG_RUNTIME_DIR` 但 `/mnt/wslg/runtime-dir` 存在，則以該目錄作為 Wayland fallback）並傳遞 `DISPLAY`/`XDG_RUNTIME_DIR`/`WAYLAND_DISPLAY`（`WAYLAND_DISPLAY` 僅沿用實際已掛 socket，否則取排序後第一個）→ `pivot_root` → `chdir(workdir)` → env 合併（§3）→ exec 有效命令。
   - 網路：**不** unshare netns（共享網路 → ports 直接生效，WSL2 下 TCP 由 localhost forwarding 對外、UDP 由 `--udp-bridge` 起的 VM 內橋接 + host 端 relay 對外）。
-  - 監控：任一子行程結束且 exit ≠ 0 → 終止其餘全部（SIGTERM → 等 5s → SIGKILL）→ 回傳該 exit code（fail_fast）。全部正常結束 → 0。
+  - 監控（fail_fast + 介面服務生命週期）：
+    - 任一服務 exit ≠ 0 → 終止其餘全部（SIGTERM → 等 5s → SIGKILL，對中繼 pgid 與 pid-ns init 雙送）→ 回傳該 exit code。
+    - **介面服務（interface_mode 含 gui/terminal/both）即使 exit 0 也視為「整個 app 結束」**（使用者關掉視窗/終端 = app 該收掉）→ 終止其餘、回 0。否則 GUI app 關窗後背景服務（如 db）會殘留、佔住埠、無法重啟。
+    - 非介面（none）服務 exit 0 → 屬背景/一次性任務，其餘繼續跑；全部結束 → 0。
   - `interface_mode=terminal/both`：該服務 stdio 直通（v1：所有服務 stdout/stderr 都加 `[svc]` 前綴轉發；terminal 服務 stdin 直通——僅允許一個服務宣告 terminal/both，多個→驗證期報錯）。
 - musl 靜態建置：`cargo build -p guest-agent --target x86_64-unknown-linux-musl --release` 必須可行（避免依賴需要 cc 的 crate；zstd 解壓用純 Rust 的 ruzstd）。musl 目標的 linker 統一為 rust-lld（`.cargo/config.toml` 已設定，跨 host 一致）。
 

@@ -18,6 +18,8 @@ then packages them into a **single standalone executable** that runs **without D
 With a simple **AppCipe recipe** (`appcipe.yml`),
 you can "cook" your containerized application into a portable single-file app, making container technology truly zero-barrier for end users.
 
+**In one line:** write an `appcipe.yml`, point it at your images, and `chefer build` produces a single executable your users just double-click — no Docker, no Chefer, nothing to install. The packaged app's services share an internal network, persist data, and you declare which ports are proxied to the host. It runs on **Linux** and **Windows (WSL2)** today; **macOS** packaging works with execution validation in progress — so it's *moving toward* "write once, run anywhere", not there on every OS yet. (Two honesty notes for v1: the internal network is **not yet host-isolated** — undeclared ports can still be reached from the host, see [Roadmap](#roadmap); and on Windows the runtime needs WSL2.)
+
 ## Platform Support
 
 `chefer build` runs on all three host OSes and can cross-package for any of the six output targets given a kit. What follows is **how a packaged app behaves at run time**, per host OS, feature by feature. Status reflects the current state of the project — see [Known Limitations](#known-limitations) for the caveat behind every ⚠️.
@@ -237,7 +239,7 @@ Planned, not yet implemented:
 - **Pull images straight from a registry** (like Docker Compose) — write `image: redis:7.2-alpine` and have `chefer build` fetch it, instead of `docker save`-ing to a tar first. **`latest` (and untagged) will be rejected — a specific version tag or digest is required**, so a build is always reproducible.
 - **Build from a Dockerfile** (`source: dockerfile`) and other `source:` kinds, beyond today's `source: tar`.
 - **Windows without WSL2** — boot the bundled Linux micro-VM appliance (the same kernel + initramfs + guest-agent the macOS `vz` backend uses) via the **Windows Hypervisor Platform (WHP)**, as an alternative to the `wsl2` backend. This removes the WSL2 requirement for users who have (or can enable) hardware virtualization + the WHP feature. A software-emulation fallback (bundled QEMU/TCG) could run on machines with no virtualization at all, at a significant speed cost.
-- **Per-app network isolation** (a dedicated netns per app) so a service with no `ports:` is *truly* unreachable from the host — closing the v1 "db not exposed" gap.
+- **Host-isolated internal network + opt-in port exposure** — give each app its own network namespace so services talk to each other internally but the app is **walled off from the host**, and **only the ports you declare in `ports:` are bridged out** (everything else is genuinely unreachable from outside). Today there is no per-app netns: services share one namespace and, on Windows, WSL2's `wslrelay` mirrors any listening port to the host — so an undeclared port (e.g. a `db` with no `ports:`) is still reachable from the host. This item closes that gap and makes "internal network" / "not exposed" actually true.
 - **`depends_on` health checks** (wait-until-ready), not just start order.
 - **Rootless Linux support for chown/gosu images** via `newuidmap` + `/etc/subuid` delegation (works today on the root backends: WSL2 / macOS VM / native-root).
 - **macOS VZ boot validated on real Apple Silicon** — the guest path is already QEMU-verified; the host Virtualization.framework shim needs bare-metal hardware to certify.

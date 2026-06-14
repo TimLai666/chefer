@@ -60,7 +60,7 @@ Rule of thumb: the **release version** moves every release; the **spec/manifest/
 See [examples/appcipe.yml](examples/appcipe.yml) for the fully-commented reference. Key semantics:
 - `image:` accepts a short form (a bare tar path string) or a full form (`source`/`file`/`format`/`platform`) — both map to `appcipe_spec::ImageSourceOrPath`. Only `source: tar` is supported (dockerfile/image are rejected at validation).
 - Persistence is opt-in per service via `persist_path`; data lands in `{data_dir or system default}/data/{service}/`. `old_names` drives automatic data-dir migration.
-- `crash: fail_fast` (the only policy; legacy field name `crash_policy` accepted via serde alias): any service exiting non-zero terminates the whole app with that exit code.
+- `crash: fail_fast` (the only policy; legacy field name `crash_policy` accepted via serde alias): any service exiting non-zero terminates the whole app with that exit code. Additionally, an **interface service** (`interface_mode` gui/terminal/both) exiting *even with code 0* tears the whole app down (closing the window/terminal = app done) — otherwise background services like a `db` would linger after the GUI closes; a `none` service exiting 0 is treated as a finished background/one-shot task and the rest keep running.
 - `interface_mode`: terminal | gui | both | none — at most one terminal/both service per app; host ports must be unique app-wide.
 
 Validation rules live in `crates/appcipe-spec/src/validate.rs`; it collects **all** errors in one report (deterministic order).

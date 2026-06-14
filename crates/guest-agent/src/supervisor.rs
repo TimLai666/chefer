@@ -27,6 +27,10 @@ struct Running {
     /// 不受服務 setsid/setpgid 脫離中繼 process group 的影響。
     init: Option<Pid>,
     name: String,
+    /// 是否為「介面服務」（interface_mode 含 gui / terminal / both）。
+    /// 介面服務一旦結束（即使 exit 0，例如使用者關掉視窗）→ 視為整個 app 該結束，
+    /// 終止其餘服務。非介面（none）服務 exit 0 則屬背景/一次性，其餘繼續跑。
+    is_interface: bool,
 }
 
 /// SIGTERM / SIGINT 旗標（由訊號處理常式設定，主迴圈輪詢）。
@@ -97,6 +101,7 @@ pub fn run_services(
             mid: spawned.pid,
             init: spawned.init_pid,
             name: svc.name.clone(),
+            is_interface: svc.interface_mode.wants_gui() || svc.interface_mode.wants_terminal(),
         });
         eprintln!(
             "[guest-agent] 服務 `{}` 已啟動（pid {}）",
@@ -133,7 +138,8 @@ fn monitor(running: &mut Vec<Running>) -> Result<i32> {
         let Some(idx) = running.iter().position(|r| r.mid == pid) else {
             continue; // 非我們追蹤的子行程
         };
-        let name = running.remove(idx).name;
+        let done = running.remove(idx);
+        let name = done.name;
         if code != 0 {
             eprintln!(
                 "[guest-agent] 服務 `{name}` 以非零代碼 {code} 結束（fail_fast）；正在終止其餘服務…"
@@ -141,6 +147,13 @@ fn monitor(running: &mut Vec<Running>) -> Result<i32> {
             terminate_all(running);
             return Ok(code);
         }
+        // 介面服務（gui/terminal/both）正常結束 = 使用者關掉視窗/終端 → 收掉整個 app。
+        if done.is_interface {
+            eprintln!("[guest-agent] 介面服務 `{name}` 結束（視窗/終端關閉）；正在終止其餘服務…");
+            terminate_all(running);
+            return Ok(0);
+        }
+        // 非介面服務正常結束（背景/一次性任務）→ 其餘繼續跑。
         eprintln!("[guest-agent] 服務 `{name}` 正常結束");
     }
 }
