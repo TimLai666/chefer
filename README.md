@@ -230,6 +230,7 @@ Planned, not yet implemented:
 
 - **Pull images straight from a registry** (like Docker Compose) — write `image: redis:7.2-alpine` and have `chefer build` fetch it, instead of `docker save`-ing to a tar first. **`latest` (and untagged) will be rejected — a specific version tag or digest is required**, so a build is always reproducible.
 - **Build from a Dockerfile** (`source: dockerfile`) and other `source:` kinds, beyond today's `source: tar`.
+- **Windows without WSL2** — boot the bundled Linux micro-VM appliance (the same kernel + initramfs + guest-agent the macOS `vz` backend uses) via the **Windows Hypervisor Platform (WHP)**, as an alternative to the `wsl2` backend. This removes the WSL2 requirement for users who have (or can enable) hardware virtualization + the WHP feature. A software-emulation fallback (bundled QEMU/TCG) could run on machines with no virtualization at all, at a significant speed cost.
 - **Per-app network isolation** (a dedicated netns per app) so a service with no `ports:` is *truly* unreachable from the host — closing the v1 "db not exposed" gap.
 - **`depends_on` health checks** (wait-until-ready), not just start order.
 - **Rootless Linux support for chown/gosu images** via `newuidmap` + `/etc/subuid` delegation (works today on the root backends: WSL2 / macOS VM / native-root).
