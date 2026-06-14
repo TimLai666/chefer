@@ -260,20 +260,25 @@ fn holder_main(rootless: bool, wr: OwnedFd) -> ! {
         let _ = nix::unistd::write(&wr, &b);
     };
 
-    let mut flags = CloneFlags::CLONE_NEWNET;
+    // rootless：**先單獨** unshare user ns 再寫單行 uid/gid map。
+    // 不可把 NEWUSER 與 NEWNET 併在同一個 unshare()——某些核心在「同一呼叫同時建
+    // user ns 與其他 ns」時，會拒絕之後的非特權單行 uid_map 寫入（EPERM）。
+    // 分兩步（同 `unshare -U` → 寫 map → 再建 netns 的慣用法）即可正常。
     if rootless {
-        flags |= CloneFlags::CLONE_NEWUSER;
+        if let Err(e) = unshare(CloneFlags::CLONE_NEWUSER) {
+            eprintln!("[guest-agent] netns holder unshare(user) 失敗：{e}");
+            report(false);
+            unsafe { libc::_exit(1) }
+        }
+        if let Err(e) = write_self_id_maps() {
+            eprintln!("[guest-agent] netns holder 寫入 uid/gid map 失敗：{e:#}");
+            report(false);
+            unsafe { libc::_exit(1) }
+        }
     }
-    if let Err(e) = unshare(flags) {
-        eprintln!(
-            "[guest-agent] netns holder unshare({}) 失敗：{e}",
-            if rootless { "user+net" } else { "net" }
-        );
-        report(false);
-        unsafe { libc::_exit(1) }
-    }
-    if rootless && let Err(e) = write_self_id_maps() {
-        eprintln!("[guest-agent] netns holder 寫入 uid/gid map 失敗：{e:#}");
+    // 此時（rootless 下已是 user ns 內 root，持 CAP_NET_ADMIN）再建 net ns。
+    if let Err(e) = unshare(CloneFlags::CLONE_NEWNET) {
+        eprintln!("[guest-agent] netns holder unshare(net) 失敗：{e}");
         report(false);
         unsafe { libc::_exit(1) }
     }
