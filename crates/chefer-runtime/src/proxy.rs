@@ -226,7 +226,7 @@ pub(crate) fn spawn_udp_proxy(host_sock: UdpSocket, guest: u16) -> Result<()> {
                 }
                 Err(err) => {
                     tracing::debug!("UDP 代理（guest 端）接收失敗：{err}");
-                    thread::sleep(Duration::from_millis(50));
+                    thread::sleep(std::time::Duration::from_millis(50));
                 }
             }
         }
