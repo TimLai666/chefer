@@ -16,6 +16,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # 讓所有 JS actions 在 Node 24 上跑（checkout/cache 的 Node 20 已棄用）。
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   # 可重現 micro-VM appliance 使用的 Linux stable git tag。
   # 可由 repository variable / workflow env 覆寫；script 會把實際 commit 寫入 BUILDINFO。
   CHEFER_LINUX_REF: ${{ vars.CHEFER_LINUX_REF || 'v6.6.32' }}
@@ -34,7 +36,7 @@ jobs:
           - name: linux-arm64
             runner: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # 用 runner 的 host 原生 gnu target 建置（免 musl C 交叉工具鏈）。
       - name: Install Rust
@@ -80,7 +82,7 @@ jobs:
             runner: ubuntu-24.04-arm
             guest_target: aarch64-unknown-linux-musl
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

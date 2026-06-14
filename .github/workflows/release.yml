@@ -24,6 +24,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # 讓所有 JS actions 在 Node 24 上跑（checkout/cache/artifact 的 Node 20 已棄用）。
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   CHEFER_LINUX_REF: ${{ inputs.linux_ref || vars.CHEFER_LINUX_REF || 'v6.6.32' }}
 
 jobs:
@@ -35,7 +37,7 @@ jobs:
       release_tag: ${{ steps.tag.outputs.release_tag }}
       linux_ref: ${{ steps.tag.outputs.linux_ref }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -84,7 +86,7 @@ jobs:
           - { runner: macos-latest,   target: aarch64-apple-darwin,        cross: false, agent: false }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.preflight.outputs.checkout_ref }}
 
@@ -145,7 +147,7 @@ jobs:
       matrix:
         arch: [x86_64, aarch64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.preflight.outputs.checkout_ref }}
 
@@ -179,7 +181,7 @@ jobs:
           - aarch64-apple-darwin
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.preflight.outputs.checkout_ref }}
 

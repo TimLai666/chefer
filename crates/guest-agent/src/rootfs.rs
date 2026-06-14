@@ -148,6 +148,7 @@ mod linux {
     ///    彼此不阻塞——這是重點：絕不能在「重用快取」的常見路徑上互相等待）。
     /// 2. 未完成 → 釋放 SH、取 `LOCK_EX` 重建，重建後**再次檢查**（避免與其他
     ///    process 重複建置），最後降回 `LOCK_SH` 持有至 run 結束。
+    ///
     /// 持有的 SH 鎖會擋下其他 instance 的 cleanup（需 EX），確保使用中的 rootfs
     /// 不被刪除。
     pub fn assemble_service_rootfs(

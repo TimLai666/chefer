@@ -1,0 +1,45 @@
+name: Security audit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - ".github/workflows/security.yml"
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 6 * * 1" # 每週一 06:00 UTC：抓進新公布的 advisory
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  audit:
+    name: cargo audit (RustSec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # 以預編二進位安裝 cargo-audit（免現場編譯，數秒完成）
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      # 比對 Cargo.lock 與 RustSec advisory DB；有未修補漏洞即失敗。
+      - name: Audit dependencies
+        run: cargo audit

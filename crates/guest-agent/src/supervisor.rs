@@ -1,7 +1,8 @@
 //! 服務生命週期監控（fail_fast）：
 //! 依拓撲順序啟動全部服務 → 任一服務以非零結束 → SIGTERM 其餘 → 5 秒後 SIGKILL
 //! → 回傳該 exit code；全部正常結束 → 0；收到 SIGTERM/SIGINT → 同終止程序 → 130。
-#![cfg(target_os = "linux")]
+//!
+//! 本模組於 `lib.rs` 以 `#[cfg(target_os = "linux")]` 限定，故此處不再重複內層 cfg。
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};

@@ -12,8 +12,32 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # 讓所有 JS actions 在 Node 24 上跑（actions/checkout、cache 等的 Node 20 已棄用）。
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  lint:
+    name: lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      # Linux target：涵蓋 guest-agent 的 exec/supervisor 等 cfg(linux) 模組
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
   test:
     name: build & test (${{ matrix.os }})
     strategy:
@@ -22,10 +46,12 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -36,16 +62,15 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
-      # clippy 先以資訊性質執行，待告警清零後改為 -D warnings 阻斷
-      - name: Clippy (informational)
-        run: cargo clippy --workspace --all-targets
-        continue-on-error: true
+      # 每個 OS 各跑一次 clippy，涵蓋平台限定模組（Windows 的 wsl2、macOS 的 vz）。
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
   musl-guest-agent:
     name: guest-agent (x86_64 musl static)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust (musl target)
         uses: dtolnay/rust-toolchain@stable

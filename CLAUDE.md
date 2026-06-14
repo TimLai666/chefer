@@ -41,6 +41,18 @@ Cargo workspace under `crates/`. The data flow is:
 
 **chefer-cli** is the user-facing CLI (`init`, `check`, `build`, `run`, `inspect`, `version`, `upgrade`, `selfrm`), one file per command under `src/commands/`. `upgrade` replaces both the binary and the whole `kit/` together (no drift); `build` records its own `CARGO_PKG_VERSION` into `manifest.app.builder_version` (shown by `inspect` as "Packed by chefer" and in the runtime startup log); `selfrm` self-deletes the binary + kit and cleans the installer's PATH entry. Its `build.rs` injects `BUILD_TIME` and `BUILD_TARGET`; the supported spec version is the `APPCIPE_SPEC_VERSION` constant in `src/main.rs`.
 
+## Versioning (read before bumping any version)
+
+There are **several independent version numbers**; don't conflate them, and **never hardcode/assume the release number** — it comes from `Cargo.toml` (bumped at release) and the git tag, so docs say "latest release", not a number.
+
+- **Chefer release version** — the `version` in the user-facing crates' `Cargo.toml` (`chefer-cli`, `chefer-runtime`, `chefer-pack`, `chefer-assembler`, `chefer-bundle`, `vmm-backend`, `guest-agent`). This is `CARGO_PKG_VERSION`; it drives `chefer version`, `chefer upgrade` (compared against the GitHub Release tag), and is written into `manifest.app.builder_version` (shown by `inspect` as "Packed by chefer" + in the runtime startup log). Bump it to match the release git tag (e.g. tag `v0.2.0` ⇒ these crates `0.2.0`).
+- **`appcipe-spec` / `appcipe-normalize` crate versions track the *appcipe.yml spec version*, NOT the release** (see the comments in their `Cargo.toml`): the first two digits follow `APPCIPE_SPEC_VERSION`. They only move when the appcipe.yml format changes — so they can legitimately differ from the release version.
+- **`APPCIPE_SPEC_VERSION`** (`crates/chefer-cli/src/main.rs`, currently `"0.1"`) — the appcipe.yml schema version the CLI accepts/validates. Independent of the release.
+- **`MANIFEST_FORMAT_VERSION`** (`crates/chefer-bundle/src/manifest.rs`, currently `1`) — bundle `manifest.json` format; the runtime rejects a mismatch. Independent format version.
+- **`FOOTER_VERSION`** + `MAGIC` (`crates/chefer-bundle/src/footer.rs`, currently `1` / `b"CHEFER\0\0"`) — single-file footer format; the runtime rejects a mismatch. Independent format version.
+
+Rule of thumb: the **release version** moves every release; the **spec/manifest/footer** versions are *format/protocol* versions that move **only on an actual incompatible format change** — and when one does, update its reader/validator (which already checks it) **and** `docs/DESIGN.md`.
+
 ## AppCipe Format Notes
 
 **Authoring an `appcipe.yml`?** Read [skills/write-appcipe/SKILL.md](skills/write-appcipe/SKILL.md) — the full field reference, validation rules, and real-world gotchas (image `format` is hyphenated, official chown/gosu images (redis/postgres) run as-is on the root backends — WSL2 / macOS VM / native-Linux-as-root run services as real root with no user namespace — but are single-uid-limited on the native-Linux rootless path, the v1 "db not truly isolated" networking caveat, `app_version` is display-only and not readable by the container). A runnable app+db example lives in [examples/demo/](examples/demo/).

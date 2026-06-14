@@ -1,5 +1,11 @@
 # Chefer — Cook Your Containers into Delicious Apps
 
+[![CI](https://github.com/TimLai666/chefer/actions/workflows/ci.yml/badge.svg)](https://github.com/TimLai666/chefer/actions/workflows/ci.yml)
+[![Native Linux E2E](https://github.com/TimLai666/chefer/actions/workflows/e2e-linux.yml/badge.svg)](https://github.com/TimLai666/chefer/actions/workflows/e2e-linux.yml)
+[![Security audit](https://github.com/TimLai666/chefer/actions/workflows/security.yml/badge.svg)](https://github.com/TimLai666/chefer/actions/workflows/security.yml)
+[![Release](https://img.shields.io/github/v/release/TimLai666/chefer?sort=semver)](https://github.com/TimLai666/chefer/releases/latest)
+[![License](https://img.shields.io/github/license/TimLai666/chefer)](LICENSE)
+
 For developers, **Docker** is a friendly and convenient way to package applications.
 However, for end users, asking them to install Docker, pull images, configure networks, and mount volumes just to run an app is simply unrealistic.
 

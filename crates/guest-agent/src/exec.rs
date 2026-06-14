@@ -11,7 +11,8 @@
 //! 以真實 root 執行時不開 user namespace、服務以 root 跑——官方會 `chown`/`gosu` 到
 //! 服務專用 uid（redis/postgres 999…）的映像因此可用；非 root 才開 user ns + 單一
 //! uid map（uid ↔ 0）。image_config.user 在 v1 忽略。
-#![cfg(target_os = "linux")]
+//!
+//! 本模組於 `lib.rs` 以 `#[cfg(target_os = "linux")]` 限定，故此處不再重複內層 cfg。
 
 use std::convert::Infallible;
 use std::ffi::CString;

@@ -1,0 +1,18 @@
+version: 2
+updates:
+  # Rust 相依套件（workspace 根的 Cargo.toml/Cargo.lock）
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      cargo-minor-patch:
+        update-types: ["minor", "patch"]
+
+  # GitHub Actions（讓 checkout/cache/artifact 等保持最新、跟上 Node 版本）
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
