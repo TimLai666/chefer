@@ -153,6 +153,10 @@ name: ${name}
 app_version: "qemu-e2e"
 data_dir: "${data_dir}"
 crash: fail_fast
+# 此 appliance/QEMU E2E 驗的是 macOS-VM guest 路徑（開機 + virtiofs + 跑 app），
+# 與網路模式無關；釘 shared 以免套用新預設 bridge（VM 內的 netns/pasta 路徑尚未驗證，
+# 見 Roadmap 的 macOS-VM isolation）。
+network: shared
 services:
   web:
     image:
@@ -181,6 +185,7 @@ name: QemuE2EFail
 app_version: "qemu-e2e"
 data_dir: "${data_dir}"
 crash: fail_fast
+network: shared
 services:
   fail:
     image:
