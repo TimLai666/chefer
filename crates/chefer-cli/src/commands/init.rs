@@ -54,23 +54,24 @@ pub fn cmd_init(dir: Option<&Path>) -> Result<()> {
     let path = dir.join("appcipe.yml");
     if path.exists() {
         bail!(
-            "檔案已存在：{}；`chefer init` 不會覆蓋既有檔案。\
-             若要重新產生範本，請先移除或改名該檔案",
+            "file already exists: {}; `chefer init` will not overwrite an existing file. \
+             To regenerate the template, remove or rename that file first",
             path.display()
         );
     }
-    std::fs::create_dir_all(dir).with_context(|| format!("建立目錄失敗：{}", dir.display()))?;
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create directory: {}", dir.display()))?;
     std::fs::write(&path, APPCIPE_TEMPLATE)
-        .with_context(|| format!("寫入範本失敗：{}", path.display()))?;
+        .with_context(|| format!("failed to write template: {}", path.display()))?;
 
     println!(
         "{}  {}",
-        "✔ 已產生範本".green().bold(),
+        "✔ Template created".green().bold(),
         path.display().to_string().blue()
     );
     println!(
         "{}",
-        "下一步：編輯 appcipe.yml（更新 name 與 image 路徑）→ `chefer check` → `chefer build`"
+        "Next: edit appcipe.yml (update name and image paths) → `chefer check` → `chefer build`"
             .dimmed()
     );
     Ok(())
@@ -109,7 +110,7 @@ mod tests {
         std::fs::write(&path, "original").unwrap();
 
         let err = cmd_init(Some(dir.path())).unwrap_err().to_string();
-        assert!(err.contains("已存在"), "{err}");
+        assert!(err.contains("already exists"), "{err}");
         // 原內容不可被動到
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
     }

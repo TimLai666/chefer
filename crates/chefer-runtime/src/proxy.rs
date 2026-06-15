@@ -42,13 +42,13 @@ pub fn start_port_proxies(manifest: &Manifest) -> Result<()> {
                         vec![(Ipv6Addr::LOCALHOST, spec.guest).into()],
                     ) {
                         Ok(()) => tracing::debug!(
-                            "IPv4 補橋已啟動：127.0.0.1:{} → [::1]:{}（service `{}`）",
+                            "IPv4 bridge started: 127.0.0.1:{} -> [::1]:{} (service `{}`)",
                             spec.host,
                             spec.guest,
                             svc.name
                         ),
                         Err(err) => tracing::debug!(
-                            "IPv4 補橋未啟動（不影響 localhost/[::1] 存取）：{err:#}"
+                            "IPv4 bridge not started (does not affect localhost/[::1] access): {err:#}"
                         ),
                     }
                 }
@@ -62,17 +62,19 @@ pub fn start_port_proxies(manifest: &Manifest) -> Result<()> {
                 PortProto::Udp => {
                     // Windows：UDP 由 wsl2 後端取得 VM IP 後自行 relay（wslrelay 不轉 UDP），
                     // 此處不綁，避免與後端搶占 127.0.0.1:host；continue 以免誤印「已啟動」。
-                    tracing::debug!("UDP 埠 {spec} 交由 wsl2 後端轉發（wslrelay 不轉 UDP）");
+                    tracing::debug!(
+                        "UDP port {spec} handled by the wsl2 backend (wslrelay does not forward UDP)"
+                    );
                     continue;
                 }
             };
             match result {
                 Ok(()) => {
-                    tracing::info!("埠代理已啟動：{}（service `{}`）", spec, svc.name);
+                    tracing::info!("Port proxy started: {} (service `{}`)", spec, svc.name);
                 }
                 Err(err) => {
                     failures.push(format!(
-                        "  - {}/{}（service `{}`）：{err:#}",
+                        "  - {}/{} (service `{}`): {err:#}",
                         spec.host, spec.proto, svc.name
                     ));
                 }
@@ -81,8 +83,8 @@ pub fn start_port_proxies(manifest: &Manifest) -> Result<()> {
     }
     if !failures.is_empty() {
         bail!(
-            "以下 host 埠無法啟動代理（埠可能已被其他程式占用；\
-             請關閉占用的程式，或調整 appcipe.yml 的 ports 後重新打包）：\n{}",
+            "Could not start proxies for the following host ports (the ports may already be in use by another program; \
+             close the program using them, or adjust the ports in appcipe.yml and repack):\n{}",
             failures.join("\n")
         );
     }
@@ -106,7 +108,7 @@ fn guest_backends(guest: u16) -> Vec<SocketAddr> {
 
 fn start_tcp_proxy_to(host: u16, backends: Vec<SocketAddr>) -> Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", host))
-        .with_context(|| format!("bind 127.0.0.1:{host}/tcp 失敗"))?;
+        .with_context(|| format!("failed to bind 127.0.0.1:{host}/tcp"))?;
     spawn_tcp_proxy(listener, backends);
     Ok(())
 }
@@ -118,14 +120,14 @@ pub(crate) fn spawn_tcp_proxy(listener: TcpListener, backends: Vec<SocketAddr>) 
             let client = match conn {
                 Ok(c) => c,
                 Err(err) => {
-                    tracing::debug!("TCP 代理 accept 失敗：{err}");
+                    tracing::debug!("TCP proxy accept failed: {err}");
                     continue;
                 }
             };
             let backends = backends.clone();
             thread::spawn(move || {
                 if let Err(err) = relay_tcp(client, &backends) {
-                    tracing::debug!("TCP 代理連線結束（後端 {backends:?}）：{err:#}");
+                    tracing::debug!("TCP proxy connection ended (backends {backends:?}): {err:#}");
                 }
             });
         }
@@ -147,13 +149,17 @@ fn relay_tcp(client: TcpStream, backends: &[SocketAddr]) -> Result<()> {
     }
     let upstream = connected.ok_or_else(|| {
         anyhow::anyhow!(
-            "連線後端 {backends:?} 全部失敗（guest 服務尚未就緒？）：{}",
+            "failed to connect to all backends {backends:?} (guest service not ready yet?): {}",
             last_err.map(|e| e.to_string()).unwrap_or_default()
         )
     })?;
 
-    let mut client_read = client.try_clone().context("複製 client socket 失敗")?;
-    let mut upstream_write = upstream.try_clone().context("複製 upstream socket 失敗")?;
+    let mut client_read = client
+        .try_clone()
+        .context("failed to clone client socket")?;
+    let mut upstream_write = upstream
+        .try_clone()
+        .context("failed to clone upstream socket")?;
     let mut upstream_read = upstream;
     let mut client_write = client;
 
@@ -173,7 +179,7 @@ fn relay_tcp(client: TcpStream, backends: &[SocketAddr]) -> Result<()> {
 #[cfg(not(windows))]
 fn start_udp_proxy(host: u16, guest: u16) -> Result<()> {
     let host_sock = UdpSocket::bind(("127.0.0.1", host))
-        .with_context(|| format!("bind 127.0.0.1:{host}/udp 失敗"))?;
+        .with_context(|| format!("failed to bind 127.0.0.1:{host}/udp"))?;
     spawn_udp_proxy(host_sock, guest)
 }
 
@@ -181,19 +187,22 @@ fn start_udp_proxy(host: u16, guest: u16) -> Result<()> {
 /// guest 回應送回「最後一個」client 來源（簡化版，足敷單一 client 情境）。
 #[cfg(not(windows))]
 pub(crate) fn spawn_udp_proxy(host_sock: UdpSocket, guest: u16) -> Result<()> {
-    let guest_sock = UdpSocket::bind(("127.0.0.1", 0)).context("建立 UDP relay socket 失敗")?;
+    let guest_sock =
+        UdpSocket::bind(("127.0.0.1", 0)).context("failed to create UDP relay socket")?;
     guest_sock
         .connect(("127.0.0.1", guest))
-        .with_context(|| format!("UDP relay 連線 127.0.0.1:{guest} 失敗"))?;
+        .with_context(|| format!("UDP relay failed to connect to 127.0.0.1:{guest}"))?;
 
     let last_client: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
 
     // client → guest
     {
-        let host_sock = host_sock.try_clone().context("複製 host UDP socket 失敗")?;
+        let host_sock = host_sock
+            .try_clone()
+            .context("failed to clone host UDP socket")?;
         let guest_sock = guest_sock
             .try_clone()
-            .context("複製 guest UDP socket 失敗")?;
+            .context("failed to clone guest UDP socket")?;
         let last_client = Arc::clone(&last_client);
         thread::spawn(move || {
             let mut buf = [0u8; 65535];
@@ -204,7 +213,7 @@ pub(crate) fn spawn_udp_proxy(host_sock: UdpSocket, guest: u16) -> Result<()> {
                         let _ = guest_sock.send(&buf[..n]);
                     }
                     Err(err) => {
-                        tracing::debug!("UDP 代理（host 端）接收失敗：{err}");
+                        tracing::debug!("UDP proxy (host side) receive failed: {err}");
                         // 避免錯誤時熱迴圈空轉
                         thread::sleep(std::time::Duration::from_millis(50));
                     }
@@ -225,7 +234,7 @@ pub(crate) fn spawn_udp_proxy(host_sock: UdpSocket, guest: u16) -> Result<()> {
                     }
                 }
                 Err(err) => {
-                    tracing::debug!("UDP 代理（guest 端）接收失敗：{err}");
+                    tracing::debug!("UDP proxy (guest side) receive failed: {err}");
                     thread::sleep(std::time::Duration::from_millis(50));
                 }
             }

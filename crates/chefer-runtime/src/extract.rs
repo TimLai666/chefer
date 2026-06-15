@@ -48,26 +48,36 @@ pub fn extract_bundle(exe: &Path, ft: &Footer, opts: &ExtractOptions<'_>) -> Res
     let tempdir = match opts.extract_parent {
         Some(parent) => {
             fs_err::create_dir_all(parent).with_context(|| {
-                format!("建立 --extract-dir 指定的目錄失敗：{}", parent.display())
+                format!(
+                    "failed to create the directory specified by --extract-dir: {}",
+                    parent.display()
+                )
             })?;
-            TempDir::with_prefix_in("chefer-", parent)
-                .with_context(|| format!("在 {} 下建立暫存目錄失敗", parent.display()))?
+            TempDir::with_prefix_in("chefer-", parent).with_context(|| {
+                format!(
+                    "failed to create a temp directory under {}",
+                    parent.display()
+                )
+            })?
         }
-        None => TempDir::with_prefix("chefer-").context("建立系統暫存目錄失敗")?,
+        None => {
+            TempDir::with_prefix("chefer-").context("failed to create the system temp directory")?
+        }
     };
 
     // ── 2. 開自身檔案，限制在 payload 區段，邊讀邊算 sha256 ─────
     let mut f = fs_err::File::open(exe)
-        .with_context(|| format!("開啟自身執行檔失敗：{}", exe.display()))?;
+        .with_context(|| format!("failed to open own executable: {}", exe.display()))?;
     f.seek(SeekFrom::Start(ft.offset))
-        .with_context(|| format!("seek 到 payload 起點（offset={}）失敗", ft.offset))?;
+        .with_context(|| format!("failed to seek to payload start (offset={})", ft.offset))?;
     let mut tee = TeeReader::new(f.take(ft.length));
 
     // ── 3. 解壓（zstd → tar；非 zstd flag 時直接視為 tar）────────
     let dest = tempdir.path();
     if ft.is_zstd() {
-        let decoder = zstd::stream::read::Decoder::new(&mut tee)
-            .context("建立 zstd 解碼器失敗（payload 開頭可能已損毀）")?;
+        let decoder = zstd::stream::read::Decoder::new(&mut tee).context(
+            "failed to create the zstd decoder (the start of the payload may be corrupted)",
+        )?;
         // 解壓「輸出」總量限制器：以壓縮輸入長度的合理倍數為上限，擋下
         // 長檔名/pax 標頭撐爆 read_to_end 的解壓炸彈（此讀取發生在 sha 驗證之前）。
         // 非 zstd 路徑的輸出 = 輸入，已被 take(length) 自然限制，無需再包。
@@ -81,13 +91,13 @@ pub fn extract_bundle(exe: &Path, ft: &Footer, opts: &ExtractOptions<'_>) -> Res
     // ── 4. 排空剩餘 payload，讓 sha256 覆蓋完整的 footer.length ──
     // tar 在結尾零區塊後即停止讀取，zstd 解碼器也可能殘留未消化的
     // bytes；這裡把剩餘區段讀完（只進 hasher，不佔記憶體）。
-    io::copy(&mut tee, &mut io::sink()).context("讀取 payload 尾端失敗")?;
+    io::copy(&mut tee, &mut io::sink()).context("failed to read the end of the payload")?;
     let got = tee.finalize();
     if got != ft.sha256 {
         // 直接返回錯誤：tempdir 在此 drop，解壓內容隨之刪除。
         bail!(
-            "payload 的 SHA-256 驗證失敗（預期 {}，實際 {}）；\
-             檔案可能已損毀或遭竄改，解壓內容已刪除。請重新下載或重新打包此單檔",
+            "payload SHA-256 verification failed (expected {}, got {}); \
+             the file may be corrupted or tampered with, and the extracted content has been deleted. Please re-download or repack this single file",
             hex::encode(ft.sha256),
             hex::encode(got)
         );
@@ -98,8 +108,8 @@ pub fn extract_bundle(exe: &Path, ft: &Footer, opts: &ExtractOptions<'_>) -> Res
     let manifest_path = chefer_bundle::layout::manifest_path(&bundle_dir);
     if !manifest_path.is_file() {
         bail!(
-            "解壓後找不到 {}；payload 內容不符合 bundle 佈局（tar 應以 bundle/ 為根）。\
-             請以相同版本的 chefer 重新打包",
+            "{} not found after extraction; the payload does not match the bundle layout (the tar should be rooted at bundle/). \
+             Please repack with the same version of chefer",
             manifest_path.display()
         );
     }
@@ -107,7 +117,7 @@ pub fn extract_bundle(exe: &Path, ft: &Footer, opts: &ExtractOptions<'_>) -> Res
     // ── 6. --keep-tmp：真正保留目錄並印出路徑 ────────────────────
     if opts.keep_tmp {
         let root = tempdir.keep();
-        tracing::info!("已保留暫存目錄（--keep-tmp）：{}", root.display());
+        tracing::info!("Temp directory kept (--keep-tmp): {}", root.display());
         Ok(Extracted {
             _tempdir: None,
             bundle_dir: root.join("bundle"),
@@ -125,31 +135,35 @@ fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<()> {
     let mut archive = tar::Archive::new(reader);
     for entry in archive
         .entries()
-        .context("讀取 tar 內容失敗（payload 可能損毀）")?
+        .context("failed to read tar contents (the payload may be corrupted)")?
     {
-        let mut entry = entry.context("讀取 tar 項目失敗（payload 可能損毀）")?;
-        let raw = entry.path().context("tar 項目路徑無法解析")?.into_owned();
+        let mut entry = entry.context("failed to read tar entry (the payload may be corrupted)")?;
+        let raw = entry
+            .path()
+            .context("could not parse tar entry path")?
+            .into_owned();
         let rel = sanitize_rel_path(&raw)?;
         match entry.header().entry_type() {
             tar::EntryType::Directory => {
                 fs_err::create_dir_all(dest.join(&rel))
-                    .with_context(|| format!("建立目錄失敗：{}", rel.display()))?;
+                    .with_context(|| format!("failed to create directory: {}", rel.display()))?;
             }
             tar::EntryType::Regular | tar::EntryType::Continuous | tar::EntryType::GNUSparse => {
                 let out = dest.join(&rel);
                 if let Some(parent) = out.parent() {
-                    fs_err::create_dir_all(parent)
-                        .with_context(|| format!("建立目錄失敗：{}", parent.display()))?;
+                    fs_err::create_dir_all(parent).with_context(|| {
+                        format!("failed to create directory: {}", parent.display())
+                    })?;
                 }
                 let mut file = fs_err::File::create(&out)
-                    .with_context(|| format!("建立檔案失敗：{}", out.display()))?;
+                    .with_context(|| format!("failed to create file: {}", out.display()))?;
                 io::copy(&mut entry, &mut file)
-                    .with_context(|| format!("寫入檔案失敗：{}", out.display()))?;
+                    .with_context(|| format!("failed to write file: {}", out.display()))?;
             }
             other => {
                 bail!(
-                    "bundle tar 內含不支援的項目類型 {:?}：{}；\
-                     bundle 只應包含一般檔案與目錄，請重新打包",
+                    "bundle tar contains an unsupported entry type {:?}: {}; \
+                     a bundle should only contain regular files and directories, please repack",
                     other,
                     raw.display()
                 );
@@ -167,18 +181,23 @@ fn sanitize_rel_path(p: &Path) -> Result<PathBuf> {
         match comp {
             Component::Prefix(_) | Component::RootDir => {
                 bail!(
-                    "bundle tar 內含絕對路徑或 Windows 磁碟前綴，拒絕解壓：{}",
+                    "bundle tar contains an absolute path or Windows drive prefix; refusing to extract: {}",
                     p.display()
                 );
             }
             Component::CurDir => {}
             Component::ParentDir => {
-                bail!("bundle tar 內含 `..` 路徑，拒絕解壓：{}", p.display());
+                bail!(
+                    "bundle tar contains a `..` path; refusing to extract: {}",
+                    p.display()
+                );
             }
             Component::Normal(seg) => {
                 let s = seg.to_string_lossy();
                 if s.contains(':') || s.contains('\\') {
-                    bail!("bundle tar 路徑片段含非法字元（`:` 或 `\\`）：{s}");
+                    bail!(
+                        "bundle tar path segment contains an illegal character (`:` or `\\`): {s}"
+                    );
                 }
                 buf.push(seg);
             }

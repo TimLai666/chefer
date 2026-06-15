@@ -15,21 +15,21 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 #[derive(clap::Parser, Debug)]
-#[command(name = "chefer-runtime", version, about = "Chefer 單檔執行期")]
+#[command(name = "chefer-runtime", version, about = "Chefer single-file runtime")]
 struct Args {
-    /// 指定解壓暫存目錄的父目錄（預設使用系統 temp）
+    /// Parent directory for the extraction temp directory (defaults to the system temp)
     #[arg(long)]
     extract_dir: Option<PathBuf>,
 
-    /// 保留解壓出的暫存目錄（預設退出即刪）
+    /// Keep the extracted temp directory (deleted on exit by default)
     #[arg(long)]
     keep_tmp: bool,
 
-    /// 僅顯示 footer 資訊後退出（除錯用）
+    /// Print footer info and exit (for debugging)
     #[arg(long)]
     dump_footer: bool,
 
-    /// 顯示更詳細的執行紀錄（debug 等級）
+    /// Show more detailed logs (debug level)
     #[arg(long, short)]
     verbose: bool,
 }
@@ -52,18 +52,19 @@ fn main() {
     match real_main(&args) {
         Ok(code) => std::process::exit(code),
         Err(err) => {
-            tracing::error!("執行失敗：{err:#}");
+            tracing::error!("execution failed: {err:#}");
             std::process::exit(1);
         }
     }
 }
 
 fn real_main(args: &Args) -> Result<i32> {
-    let exe = std::env::current_exe().context("取得自身執行檔路徑失敗")?;
+    let exe =
+        std::env::current_exe().context("failed to get the path of the running executable")?;
 
     let ft = chefer_bundle::Footer::read_from_file(&exe).with_context(|| {
         format!(
-            "讀取單檔 footer 失敗：{}；此檔案可能不是由 `chefer build` 組裝的單一執行檔",
+            "failed to read the single-file footer: {}; this file may not be a single-file executable assembled by `chefer build`",
             exe.display()
         )
     })?;
@@ -86,7 +87,7 @@ fn real_main(args: &Args) -> Result<i32> {
         keep_tmp: args.keep_tmp,
     };
     let extracted = extract::extract_bundle(&exe, &ft, &opts)?;
-    tracing::info!("bundle 已解壓至 {}", extracted.bundle_dir.display());
+    tracing::info!("bundle extracted to {}", extracted.bundle_dir.display());
 
     let code = run::run(&extracted.bundle_dir, args.keep_tmp)?;
     // extracted 在此 scope 結束時 drop：未指定 --keep-tmp 時自動刪除暫存目錄。

@@ -42,7 +42,9 @@ fn should_show_console(manifest: &Manifest) -> bool {
 pub fn apply(manifest: &Manifest) {
     if is_headless(manifest) {
         // 全 none：共用主控台是唯一停止介面 → 一定保留，並提示如何停止。
-        eprintln!("此 app 沒有圖形或終端介面；在此視窗按 Ctrl+C 可停止。");
+        eprintln!(
+            "This app has no GUI or terminal interface; press Ctrl+C in this window to stop it."
+        );
         return;
     }
     if !should_show_console(manifest) {

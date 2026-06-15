@@ -15,7 +15,7 @@ pub fn cmd_run(opts: &BuildOpts) -> Result<i32> {
     let artifacts = build::cmd_build(opts, &[], false)?;
     let artifact = artifacts
         .first()
-        .ok_or_else(|| anyhow!("內部錯誤：build 未產生任何產物"))?;
+        .ok_or_else(|| anyhow!("internal error: build produced no artifacts"))?;
 
     println!(
         "{}  {}",
@@ -25,7 +25,7 @@ pub fn cmd_run(opts: &BuildOpts) -> Result<i32> {
 
     let status = std::process::Command::new(&artifact.path)
         .status()
-        .with_context(|| format!("執行產物失敗：{}", artifact.path.display()))?;
+        .with_context(|| format!("failed to run artifact: {}", artifact.path.display()))?;
 
     // exit code 透傳；被信號終止（Unix 上 code() 為 None）時以 130 表示中斷。
     Ok(status.code().unwrap_or(130))
