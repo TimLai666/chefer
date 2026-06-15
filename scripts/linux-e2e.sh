@@ -731,7 +731,10 @@ services:
       source: tar
       file: "$image_tar"
       platform: ${image_platform}
-    cmd: ["python", "-c", "import socket,time\ntime.sleep(3)\ns=socket.socket()\ns.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\ns.bind(('127.0.0.1',7799))\ns.listen(1)\ns.settimeout(20)\ntry:\n    c,_=s.accept()\n    c.recv(16)\nexcept Exception:\n    pass\nprint('CHEFER_DB_DONE')"]
+    # 先延遲 3s 才 listen（讓 healthcheck 一開始失敗，真正測到 gating）；之後只 listen 不 accept
+    #（kernel 會替 backlog 內的連線完成握手，故 app 的 connect 會成功），並停留 8s 讓 app 來得及連，
+    # 再退出。注意：不可 accept 後就退出——否則會把 healthcheck 探針的連線當成唯一連線吃掉而提早結束。
+    cmd: ["python", "-c", "import socket,time\ntime.sleep(3)\ns=socket.socket()\ns.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\ns.bind(('127.0.0.1',7799))\ns.listen(8)\ntime.sleep(8)\nprint('CHEFER_DB_DONE')"]
     interface_mode: none
     healthcheck:
       test: ["CMD", "python", "-c", "import socket,sys; sys.exit(0 if socket.socket().connect_ex(('127.0.0.1',7799))==0 else 1)"]
