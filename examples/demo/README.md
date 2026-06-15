@@ -1,26 +1,24 @@
 # Chefer Demo：應用 + 資料庫
 
 一個最小但完整的範例：Python HTTP 服務（app）+ redis（db）兩個服務。
+**db 直接由 chefer 從 registry 拉取**（`image: redis:7.2-alpine`，免 `docker save`）。
 
-實測（Windows + WSL2，2026-06）結果：
+重點：
 
+- ✅ **registry 拉取**：`chefer build` 直接拉官方 `redis:7.2-alpine` 打進單檔，不需先 `docker save`。
 - ✅ **應用 + 資料庫**：兩個服務一起在單檔內啟動。
-- ✅ **內部網路**：app 以 `127.0.0.1:6379` 連 db（同一 app 的服務共享網路 namespace），
-  造訪計數每次 +1，證明 app↔db 連線正常。
-- ✅ **資料持久化**：redis 以 AOF 持久化到 `/data`（`persist_path`，綁回 host）；
-  關閉單檔再重新執行，計數從上次延續（實測 …→5 →重啟→ 6）。
-- ⚠️ **db 不對外暴露 — v1 尚未真正達成**：chefer **不會**為沒有 `ports:` 的 db
-  建立 host→guest 代理；但 chefer v1 的服務都共享同一個網路 namespace（無逐 app 網路隔離），
-  且 **WSL2 的 `wslrelay` 會把 VM 內任何 loopback 監聽埠自動鏡射到 Windows localhost**，
-  因此實測 db 的 6379 仍可從 Windows 連到。要真正做到「內部專用、不可從外部連入」，
-  需要替每個 app 建立獨立 network namespace（只把宣告的 `ports:` 橋接出去）——這是 v1 的已知缺口。
-  在原生 Linux 上 db 也僅綁 loopback（不對 LAN 暴露），但仍可從同機 host 連到；同樣需要
-  netns 隔離才能完全內部化。
+- ✅ **內部網路**：app 以 `127.0.0.1:6379` 連 db（同一 app 的服務共享 netns），造訪計數每次 +1。
+- ✅ **資料持久化**：redis 以 AOF 持久化到 `/data`（`persist_path`，綁回 host）；關閉再執行，計數延續。
+- ✅ **db 真正不對外（預設 `bridge`）**：本 app 有專屬 network namespace，db 沒有 `ports:`
+  → 不會被橋接出去，從 host **連不到**（含 Windows：wslrelay 只鏡射有 relay 的宣告埠）。
+  〔已在原生 Linux + WSL2 驗證；舊版「服務共享 netns、6379 仍可從 host 連到」的缺口已由 bridge 預設關閉。〕
 
-> 這個 demo 的價值之一就是把上述 networking 缺口實測出來：app+db+內部通訊+持久化在 Windows 上
-> 確實可運作，但「完全不對外」需要 chefer 加上逐 app 網路隔離後才成立。
+> ⚠️ **平台注意**：官方 redis 的 entrypoint 會 `chown`/`gosu` 到 redis uid 999。
+> 在 **WSL2 / macOS VM / 原生 Linux 以 root 執行** 時可行；**原生 Linux rootless**（以非 root 使用者跑單檔）
+> 下單一 uid 映射會讓 chown 失敗（見專案 Roadmap 的 newuidmap 委派）。需要在 rootless 也能跑的，
+> 可改回自建免-chown 的 redis（`source: tar`）。
 
-## 一、產生 image tar（需要 Docker）
+## 一、產生 app image tar（需要 Docker）
 
 ```bash
 # Linux / macOS
@@ -29,8 +27,8 @@ bash examples/demo/scripts/build-images.sh
 examples\demo\scripts\build-images.ps1
 ```
 
-產生 `examples/demo/images/app.tar`（自建）與 `examples/demo/images/db.tar`（redis 官方映像）。
-打包 arm64 目標時設 `CHEFER_DEMO_PLATFORM=linux/arm64`。
+只產生 `examples/demo/images/app.tar`（自建）；**db 不必先建**，`chefer build` 會自動從 registry 拉 redis。
+打包 arm64 目標時設 `CHEFER_DEMO_PLATFORM=linux/arm64`（chefer 會拉對應架構的 redis）。
 
 ## 二、打包成單檔
 
