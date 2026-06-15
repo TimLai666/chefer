@@ -25,11 +25,59 @@ const EXIT_NSENTER_FAIL: i32 = 125; // setns/fork/chroot 失敗
 const EXIT_TIMEOUT: i32 = 124; // test 超過 timeout
 const EXIT_EXEC_FAIL: i32 = 127; // execve 失敗（命令不存在等）
 
+/// 一次健康探測的結果。
+pub enum Probe {
+    /// test exit 0。
+    Healthy,
+    /// 跑完但失敗，帶可區分的原因（供記錄成可行動訊息）。
+    Failed(ProbeFail),
+}
+
+/// 探測失敗的原因（對應 runner 的退出碼，沿用 shell 慣例：124 逾時、127 找不到命令）。
+#[derive(Debug, Clone, Copy)]
+pub enum ProbeFail {
+    /// test 命令本身以非零碼結束。
+    NonZero(i32),
+    /// test 超過 timeout。
+    Timeout,
+    /// test 命令在 image 內找不到 / 無法 exec。
+    ExecNotFound,
+    /// 進不了服務的 namespace（多半是服務已退出）。
+    NsenterFailed,
+}
+
+impl ProbeFail {
+    /// 給使用者看的英文說明。
+    pub fn describe(self) -> String {
+        match self {
+            ProbeFail::NonZero(c) => format!("test command exited with status {c}"),
+            ProbeFail::Timeout => "test command timed out".to_string(),
+            ProbeFail::ExecNotFound => {
+                "test command not found in the image (check healthcheck.test)".to_string()
+            }
+            ProbeFail::NsenterFailed => {
+                "could not run the probe inside the service (it may have already exited)"
+                    .to_string()
+            }
+        }
+    }
+}
+
+fn classify(exit_code: i32) -> Probe {
+    match exit_code {
+        0 => Probe::Healthy,
+        EXIT_TIMEOUT => Probe::Failed(ProbeFail::Timeout),
+        EXIT_NSENTER_FAIL => Probe::Failed(ProbeFail::NsenterFailed),
+        EXIT_EXEC_FAIL => Probe::Failed(ProbeFail::ExecNotFound),
+        c => Probe::Failed(ProbeFail::NonZero(c)),
+    }
+}
+
 /// 進行一次健康探測：在服務（`init`）的 namespaces 內 exec test。
 ///
-/// 回傳 `Ok(true)` = test exit 0（healthy）；`Ok(false)` = 跑完但非 0 / 逾時 / 進 ns 失敗；
-/// `Err` = 連探測行程都 fork 不出來（呼叫端視為一次失敗）。
-pub fn probe(init: Pid, hc: &HealthCheck) -> Result<bool> {
+/// 回傳 `Ok(Probe::Healthy)` = test exit 0；`Ok(Probe::Failed(reason))` = 跑完但失敗
+/// （帶原因）；`Err` = 連探測行程都 fork 不出來（呼叫端視為一次失敗）。
+pub fn probe(init: Pid, hc: &HealthCheck) -> Result<Probe> {
     // fork 前先備妥 exec 計畫與所有 fd（child 內不再配置記憶體 / 開檔）。
     let prep = ExecPrep::prepare(init, hc)?;
     let base = format!("/proc/{}", init.as_raw());
@@ -46,8 +94,9 @@ pub fn probe(init: Pid, hc: &HealthCheck) -> Result<bool> {
     // SAFETY: fork 後 child 僅呼叫 async-signal-safe 的系統呼叫，且失敗一律 `_exit`。
     match unsafe { fork() }.context("fork health-check runner failed")? {
         ForkResult::Parent { child } => match nix::sys::wait::waitpid(child, None) {
-            Ok(nix::sys::wait::WaitStatus::Exited(_, 0)) => Ok(true),
-            Ok(_) => Ok(false),
+            Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => Ok(classify(code)),
+            // runner 被訊號終止：當作進 ns 階段的失敗。
+            Ok(_) => Ok(Probe::Failed(ProbeFail::NsenterFailed)),
             Err(e) => bail!("waiting for health-check runner failed: {e}"),
         },
         ForkResult::Child => {

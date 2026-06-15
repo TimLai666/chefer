@@ -134,9 +134,12 @@ pub fn run_services(
                     terminate_all(&mut running);
                     return Ok(code);
                 }
-                Gate::Unhealthy => {
+                Gate::Unhealthy(reason) => {
+                    let detail = reason
+                        .map(|r| r.describe())
+                        .unwrap_or_else(|| "no probe completed".to_string());
                     eprintln!(
-                        "[guest-agent] 服務 `{}` 的 healthcheck 在 {} 次重試後仍未通過；視為啟動失敗（fail_fast）",
+                        "[guest-agent] 服務 `{}` 的 healthcheck 在 {} 次重試後仍未通過（{detail}）；視為啟動失敗（fail_fast）",
                         svc.name, hc.retries
                     );
                     terminate_all(&mut running);
@@ -159,8 +162,8 @@ pub fn run_services(
 enum Gate {
     /// healthcheck 通過（或無 init pid 可探測 → 視為就緒）。
     Healthy,
-    /// retries 用盡仍未通過。
-    Unhealthy,
+    /// retries 用盡仍未通過；帶最後一次的失敗原因（供記錄可行動訊息）。
+    Unhealthy(Option<crate::health::ProbeFail>),
     /// 等待期間收到 SHUTDOWN。
     ShuttingDown,
     /// 等待期間有已啟動服務以非零碼崩潰（透傳該碼）。
@@ -182,6 +185,7 @@ fn await_healthy(
     let start_period = Duration::from_millis(hc.start_period_ms);
     let started = Instant::now();
     let mut failures: u32 = 0;
+    let mut last_fail: Option<crate::health::ProbeFail> = None;
     eprintln!("[guest-agent] 等待服務 `{name}` 通過 healthcheck…");
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
@@ -192,18 +196,18 @@ fn await_healthy(
             return Gate::ServiceCrashed(code);
         }
         match crate::health::probe(init, hc) {
-            Ok(true) => {
+            Ok(crate::health::Probe::Healthy) => {
                 eprintln!("[guest-agent] 服務 `{name}` 已就緒（healthy）");
                 return Gate::Healthy;
             }
-            Ok(false) => {}
+            Ok(crate::health::Probe::Failed(reason)) => last_fail = Some(reason),
             Err(e) => eprintln!("[guest-agent] 服務 `{name}` 的 healthcheck 無法執行：{e:#}"),
         }
         // start_period 寬限期內的失敗不計入 retries。
         if started.elapsed() >= start_period {
             failures += 1;
             if failures >= hc.retries.max(1) {
-                return Gate::Unhealthy;
+                return Gate::Unhealthy(last_fail);
             }
         }
         sleep_interruptible(interval);

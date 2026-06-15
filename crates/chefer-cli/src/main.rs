@@ -120,7 +120,7 @@ pub(crate) struct BuildOpts {
     pub kit_dirs: Vec<PathBuf>,
 
     /// zstd compression level (1..=22; defaults to 3)
-    #[arg(long, default_value_t = 3, value_name = "N")]
+    #[arg(long, default_value_t = 3, value_name = "N", value_parser = clap::value_parser!(i32).range(1..=22))]
     pub zstd_level: i32,
 
     /// Don't embed the original appcipe.yml back into the bundle

@@ -128,6 +128,11 @@ struct OciManifest {
 
 /// 由 digest（`sha256:<64hex>`）取得 blob 檔案路徑；嚴格驗證避免路徑注入。
 fn blob_path(root: &Path, digest: &str) -> Result<PathBuf> {
+    if digest.is_empty() {
+        bail!(
+            "image archive 的 index/manifest descriptor 缺少 digest 欄位；archive 可能損毀或非標準，請重新匯出"
+        );
+    }
     let Some(hex) = digest.strip_prefix("sha256:") else {
         bail!("不支援的 digest 演算法（僅支援 sha256）：{digest}");
     };

@@ -7,9 +7,11 @@
 //! 由 appcipe-spec 的驗證把關。
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use oci_client::client::{ClientConfig, ImageData};
+use oci_client::errors::OciDistributionError;
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Client, Reference};
 
@@ -27,7 +29,7 @@ const ACCEPTED_LAYER_MEDIA_TYPES: &[&str] = &[
 /// 拉取 `reference` 在 `platform` 上的 image，layer blob 寫進 `tmp`（呼叫端負責保留其生命週期）。
 pub(crate) fn pull_image(reference: &str, platform: &str, tmp: &Path) -> Result<ResolvedImage> {
     let (want_os, want_arch) = split_platform(platform)?;
-    let reference: Reference = reference
+    let parsed: Reference = reference
         .parse()
         .with_context(|| format!("無法解析 image reference：{reference}"))?;
 
@@ -36,11 +38,25 @@ pub(crate) fn pull_image(reference: &str, platform: &str, tmp: &Path) -> Result<
         .build()
         .context("建立 tokio runtime 失敗")?;
 
+    // 多架構索引時，resolver 順便記錄「實際可用的平台清單」，供找不到對應平台時給出可行動訊息。
+    let available: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
     let image: ImageData = rt.block_on(async {
         // 多架構（manifest index）時依 os/arch 挑選；單架構則此 resolver 不被使用。
         let resolver = {
             let (os, arch) = (want_os.clone(), want_arch.clone());
+            let available = Arc::clone(&available);
             move |entries: &[oci_client::manifest::ImageIndexEntry]| -> Option<String> {
+                if let Ok(mut a) = available.lock() {
+                    *a = entries
+                        .iter()
+                        .filter_map(|e| {
+                            e.platform
+                                .as_ref()
+                                .map(|p| format!("{}/{}", p.os, p.architecture))
+                        })
+                        .collect();
+                }
                 entries
                     .iter()
                     .find(|e| {
@@ -58,12 +74,12 @@ pub(crate) fn pull_image(reference: &str, platform: &str, tmp: &Path) -> Result<
         let client = Client::new(config);
         client
             .pull(
-                &reference,
+                &parsed,
                 &RegistryAuth::Anonymous,
                 ACCEPTED_LAYER_MEDIA_TYPES.to_vec(),
             )
             .await
-            .context("從 registry 拉取失敗（公開 image 採匿名拉取；私有 registry 尚未支援）")
+            .map_err(|e| pull_error(reference, platform, &available, e))
     })?;
 
     if image.layers.is_empty() {
@@ -129,6 +145,75 @@ fn order_layers_by_diff_ids(
         ordered.push(pairs.remove(pos).1);
     }
     Ok(ordered)
+}
+
+/// 把 oci-client 的拉取錯誤轉成可行動的訊息。常見原因（打錯名稱 404、私有 401/403、
+/// Docker Hub 流量限制 429、斷網/TLS、多架構無此平台）各給不同提示。
+/// 變體名稱在不同 oci-client 版本可能變動，故以 Display 字串做穩健分類。
+fn pull_error(
+    reference: &str,
+    platform: &str,
+    available: &Mutex<Vec<String>>,
+    e: OciDistributionError,
+) -> anyhow::Error {
+    // 多架構索引有列出平台、但都不含要求的平台 → 明確的「無此平台」訊息（比照本機 tar 路徑）。
+    if let Ok(a) = available.lock()
+        && !a.is_empty()
+        && !a.iter().any(|p| p == platform)
+    {
+        return anyhow::anyhow!(
+            "image `{reference}` has no `{platform}` variant. Available platforms: {}. \
+             Set image.platform in appcipe.yml to one of these.",
+            a.join(", ")
+        );
+    }
+
+    let s = e.to_string();
+    let low = s.to_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|n| low.contains(n));
+
+    if has(&[
+        "not found",
+        "manifest_unknown",
+        "name_unknown",
+        "notfound",
+        "404",
+    ]) {
+        anyhow::anyhow!(
+            "image not found in registry: `{reference}`. Check the name and that the tag/digest \
+             exists (repository names and tags are case-sensitive)."
+        )
+    } else if has(&["unauthorized", "denied", "authentication", "401", "403"]) {
+        anyhow::anyhow!(
+            "registry requires authentication for `{reference}`. Chefer pulls public images \
+             anonymously; private registries are not supported yet."
+        )
+    } else if has(&["toomanyrequests", "too many requests", "rate limit", "429"]) {
+        anyhow::anyhow!(
+            "hit the registry rate limit while pulling `{reference}`. Wait a few minutes and try \
+             again (Docker Hub limits anonymous pulls)."
+        )
+    } else if has(&[
+        "dns",
+        "connect",
+        "timed out",
+        "timeout",
+        "tls",
+        "certificate",
+        "network",
+        "transport",
+        "tcp",
+    ]) {
+        anyhow::anyhow!(
+            "could not reach the registry to pull `{reference}`: {s}. Check your internet \
+             connection or proxy settings."
+        )
+    } else {
+        anyhow::anyhow!(
+            "failed to pull `{reference}` from the registry: {s}. (Public images are pulled \
+             anonymously; private registries are not supported yet.)"
+        )
+    }
 }
 
 fn split_platform(p: &str) -> Result<(String, String)> {

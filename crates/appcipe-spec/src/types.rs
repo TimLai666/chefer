@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 /// 注意：本型別只負責「解析 + 驗證」；host 路徑絕對化等正規化邏輯
 /// 位於 `appcipe-normalize` crate（正式載入入口為 `appcipe_normalize::load`）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)] // 擋打錯的頂層欄位名（否則 serde 靜默忽略 → app 行為悄悄消失）
 pub struct AppCipe {
     pub version: String,
     pub name: String,
@@ -70,6 +71,7 @@ pub enum NetworkMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)] // 擋打錯的欄位名，例如 port→ports、command→cmd、volumes→mounts
 pub struct Service {
     pub image: ImageSourceOrPath,
 
@@ -105,6 +107,7 @@ pub struct Service {
 /// 服務健康檢查（見 docs/DESIGN.md「健康檢查」節）。duration 欄位接受 `<n>(ms|s|m)`
 /// 或裸整數（= 秒）；省略時套用 [`HealthCheck`] 的 `DEFAULT_*`。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HealthCheck {
     /// 檢查命令；字串 = `sh -c`，陣列比照 Docker（`CMD`/`CMD-SHELL`/`NONE` 前綴）。
     pub test: HealthTest,
