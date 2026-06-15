@@ -35,7 +35,7 @@ use nix::unistd::{ForkResult, Pid, fork, setpgid};
 /// 啟動一個服務所需的輸入。
 pub struct SpawnSpec<'a> {
     pub service: &'a chefer_bundle::ServiceEntry,
-    /// 已組裝完成的 rootfs 目錄。
+    /// 最終 root 路徑：非 overlay = 合併好的 rootfs 目錄；overlay = 已建好的空 merged 掛載點。
     pub rootfs: &'a Path,
     /// app 資料目錄（persist 實體存放在 `<data_dir>/data/<svc>`）。
     pub data_dir: &'a Path,
@@ -44,6 +44,24 @@ pub struct SpawnSpec<'a> {
     /// internal/bridge 模式：要 setns 進入的 app netns（含 rootless 時的 user ns fd）。
     /// shared 模式為 None（不隔離網路，沿用共享 netns）。
     pub netns: Option<crate::netns::NetnsJoin>,
+    /// Some = overlayfs 模式（root 後端）：在 `rootfs`（merged 掛載點）上掛 overlay。
+    /// None = 直接 bind 合併好的 rootfs（rootless / 不支援 overlay）。
+    pub overlay: Option<&'a OverlayDirs>,
+}
+
+/// overlay 掛載所需的目錄：唯讀 lowerdir（base→top）+ 每次執行的可寫 upper/work。
+#[derive(Clone, Debug)]
+pub struct OverlayDirs {
+    /// 各層 lowerdir，base→top 順序（掛載時會反轉成 overlay 要求的 top-first）。
+    pub lowers: Vec<PathBuf>,
+    pub upper: PathBuf,
+    pub work: PathBuf,
+}
+
+/// 一個服務的 rootfs 來源：最終 root 路徑 + （選用）overlay 目錄組。
+pub struct ServiceRootfs {
+    pub root: PathBuf,
+    pub overlay: Option<OverlayDirs>,
 }
 
 /// 已啟動的服務（pid 為中繼行程；其 pgid 與 pid 相同，供整組送訊號）。
@@ -88,6 +106,8 @@ struct ChildPlan {
     terminal: bool,
     /// internal/bridge：要 setns 進入的 app netns；None = shared（共享 netns）。
     netns: Option<crate::netns::NetnsJoin>,
+    /// Some = overlay 模式：在 rootfs（merged 掛載點）上掛 overlayfs。
+    overlay: Option<OverlayDirs>,
 }
 
 /// 把容器內絕對路徑接到 rootfs 下（含安全檢查，拒絕 `..` 等）。
@@ -295,6 +315,7 @@ fn build_plan(spec: &SpawnSpec) -> Result<ChildPlan> {
         gid: nix::unistd::getgid().as_raw(),
         terminal: spec.terminal,
         netns: spec.netns,
+        overlay: spec.overlay.cloned(),
     })
 }
 
@@ -506,15 +527,40 @@ fn setup_and_exec(plan: &ChildPlan) -> Result<Infallible> {
     )
     .context("failed to set mount propagation to private")?;
 
-    // 2) rootfs bind 到自身，成為掛載點（pivot_root 的前提）
-    mnt(
-        Some(root),
-        root,
-        None,
-        MsFlags::MS_BIND | MsFlags::MS_REC,
-        None,
-    )
-    .with_context(|| format!("failed to bind rootfs: {}", root.display()))?;
+    // 2) 準備 root 掛載點：overlay 模式掛 overlayfs（lower=各層、upper/work=本次執行可寫層）；
+    //    否則把合併好的 rootfs bind 到自身成為掛載點（pivot_root 的前提）。
+    if let Some(ov) = &plan.overlay {
+        // overlay 的 lowerdir 需「上層在前」：lowers 為 base→top，故反轉。
+        let lowerdir = ov
+            .lowers
+            .iter()
+            .rev()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(":");
+        let opts = format!(
+            "lowerdir={lowerdir},upperdir={},workdir={}",
+            ov.upper.display(),
+            ov.work.display()
+        );
+        mnt(
+            Some(Path::new("overlay")),
+            root,
+            Some("overlay"),
+            MsFlags::empty(),
+            Some(&opts),
+        )
+        .with_context(|| format!("failed to mount overlay rootfs at {}", root.display()))?;
+    } else {
+        mnt(
+            Some(root),
+            root,
+            None,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None,
+        )
+        .with_context(|| format!("failed to bind rootfs: {}", root.display()))?;
+    }
 
     // 3) /proc（proc 型別；此時已在新 pid ns）
     let proc_dir = root.join("proc");

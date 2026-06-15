@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::fd::OwnedFd;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -19,7 +19,7 @@ use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, kill, kil
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::Pid;
 
-use crate::exec::{SpawnSpec, spawn_service};
+use crate::exec::{ServiceRootfs, SpawnSpec, spawn_service};
 use crate::netns::AppNet;
 
 /// 一個執行中服務：中繼行程 pid（= pgid）、服務本體（pid-ns init）host pid、名稱。
@@ -69,7 +69,7 @@ const UNHEALTHY_EXIT: i32 = 1;
 /// 被依賴者必在依賴者之前 ready，故 `depends_on` 等同 wait-until-ready。
 pub fn run_services(
     order: &[&chefer_bundle::ServiceEntry],
-    rootfs_map: &BTreeMap<String, PathBuf>,
+    rootfs_map: &BTreeMap<String, ServiceRootfs>,
     data_dir: &Path,
     app_net: Option<&AppNet>,
     manifest: &chefer_bundle::Manifest,
@@ -84,7 +84,7 @@ pub fn run_services(
             terminate_all(&mut running);
             return Ok(130);
         }
-        let rootfs = rootfs_map.get(&svc.name).ok_or_else(|| {
+        let sr = rootfs_map.get(&svc.name).ok_or_else(|| {
             anyhow::anyhow!(
                 "internal error: service `{}` has no rootfs mapping",
                 svc.name
@@ -93,10 +93,11 @@ pub fn run_services(
         let terminal = svc.interface_mode.wants_terminal();
         let spawned = spawn_service(&SpawnSpec {
             service: svc,
-            rootfs,
+            rootfs: &sr.root,
             data_dir,
             terminal,
             netns: netns_join,
+            overlay: sr.overlay.as_ref(),
         })
         .with_context(|| format!("failed to start service `{}`", svc.name));
         let spawned = match spawned {

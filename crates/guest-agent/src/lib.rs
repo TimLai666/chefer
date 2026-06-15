@@ -81,8 +81,10 @@ mod linux_impl {
     use std::collections::BTreeMap;
     use std::path::Path;
 
-    use anyhow::{Result, bail};
+    use anyhow::{Context, Result, bail};
     use chefer_bundle::NetworkMode;
+
+    use crate::exec::{OverlayDirs, ServiceRootfs};
 
     use crate::{RunConfig, load_manifest, netns, rootfs, supervisor};
 
@@ -125,13 +127,55 @@ mod linux_impl {
             .cache_dir
             .clone()
             .unwrap_or_else(|| rootfs::default_cache_root(&cfg.data_dir));
-        let mut rootfs_map: BTreeMap<String, std::path::PathBuf> = BTreeMap::new();
-        // 持有各服務 rootfs 的共享租約直到 run 結束，阻止並行 instance 在使用中刪除。
+        // root 後端可用 overlayfs：各層解到獨立唯讀 lowerdir（共用、去重）、每服務一個可寫
+        // upper/work 疊上去——免合併複製、掛載瞬間完成。rootless / 不支援 overlay → 維持合併。
+        let use_overlay = rootfs::overlay_supported();
+        if use_overlay {
+            eprintln!("[guest-agent] rootfs via overlayfs (root backend; lazy, shared layers)");
+        }
+        // overlay 的每次執行可寫層根（以 pid 區隔；結束後清除）。
+        let overlay_run_root = cfg
+            .data_dir
+            .join(".overlay")
+            .join(std::process::id().to_string());
+
+        let mut rootfs_map: BTreeMap<String, ServiceRootfs> = BTreeMap::new();
+        // 非 overlay：持有各服務 rootfs 的共享租約直到 run 結束，阻止並行 instance 在使用中刪除。
         let mut leases: Vec<(String, rootfs::RootfsLease)> = Vec::new();
         for svc in &order {
-            let lease = rootfs::assemble_service_rootfs(&cfg.bundle_dir, svc, &cache_root)?;
-            rootfs_map.insert(svc.name.clone(), lease.path().to_path_buf());
-            leases.push((svc.name.clone(), lease));
+            if use_overlay {
+                let lowers = rootfs::assemble_overlay_layers(&cfg.bundle_dir, svc, &cache_root)?;
+                let svc_root = overlay_run_root.join(&svc.name);
+                let upper = svc_root.join("upper");
+                let work = svc_root.join("work");
+                let merged = svc_root.join("merged");
+                for d in [&upper, &work, &merged] {
+                    std::fs::create_dir_all(d).with_context(|| {
+                        format!("failed to create overlay dir: {}", d.display())
+                    })?;
+                }
+                rootfs_map.insert(
+                    svc.name.clone(),
+                    ServiceRootfs {
+                        root: merged,
+                        overlay: Some(OverlayDirs {
+                            lowers,
+                            upper,
+                            work,
+                        }),
+                    },
+                );
+            } else {
+                let lease = rootfs::assemble_service_rootfs(&cfg.bundle_dir, svc, &cache_root)?;
+                rootfs_map.insert(
+                    svc.name.clone(),
+                    ServiceRootfs {
+                        root: lease.path().to_path_buf(),
+                        overlay: None,
+                    },
+                );
+                leases.push((svc.name.clone(), lease));
+            }
         }
 
         // 依拓撲順序啟動並監控（internal/bridge 模式下各服務 setns 進 app netns，
@@ -150,7 +194,13 @@ mod linux_impl {
         }
         let code = run_result?;
 
-        // 未要求保留時，嘗試清掉 rootfs 快取——只有在無其他 instance 使用時
+        // overlay 模式：清掉本次執行的可寫層（upper/work/merged 為 ephemeral；lowerdir 各層
+        // 內容定址、持久共用，不在此刪）。即使 keep_rootfs 也清——這些只是本次執行的暫存寫入層。
+        if use_overlay {
+            let _ = std::fs::remove_dir_all(&overlay_run_root);
+        }
+
+        // 非 overlay：未要求保留時，嘗試清掉合併 rootfs 快取——只有在無其他 instance 使用時
         // （能升級為獨佔鎖）才真正刪除，否則安全跳過。
         if !cfg.keep_rootfs {
             for (name, lease) in leases {

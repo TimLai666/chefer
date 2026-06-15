@@ -74,7 +74,10 @@ pub fn sanitize_rel_path(entry_path: &str) -> Result<Option<PathBuf>> {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{RootfsLease, assemble_rootfs_at, assemble_service_rootfs};
+pub use linux::{
+    RootfsLease, assemble_overlay_layers, assemble_rootfs_at, assemble_service_rootfs,
+    overlay_supported,
+};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -508,6 +511,277 @@ mod linux {
             }
             result
         })
+    }
+
+    // ─────────────────────── overlayfs / lazy rootfs（僅 root 後端）───────────────────────
+    //
+    // root 後端（WSL2 / macOS VM / native-root）可改用 overlayfs：各層解到「以 diff_id 為名」
+    // 的獨立唯讀 lowerdir（跨服務/跨 image 共用、去重、持久），exec 時掛 overlay（lower=各層、
+    // upper/work=每次執行的暫存可寫層）再 pivot_root——免合併複製、掛載瞬間完成。
+    // rootless 無法 mknod whiteout 裝置、unprivileged overlay 受限 → 維持現有合併路徑。
+    //
+    // OCI whiteout → overlay whiteout 轉換（解層時）：
+    // - `.wh.<name>`        → 在該層 dir 建字元裝置 0:0（overlay 的 whiteout 表示法）。
+    // - `.wh..wh..opq`      → 對該目錄設 `trusted.overlay.opaque=y`。
+    // 兩者皆需真 root（mknod 裝置 / trusted.* xattr），故此路徑僅在 root 後端啟用。
+
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    /// 是否可用 overlay：必須是真 root（rootless 不能 mknod whiteout / 掛 unpriv overlay 受限），
+    /// kernel 支援 overlay，且實測掛載成功。
+    pub fn overlay_supported() -> bool {
+        if !nix::unistd::geteuid().is_root() {
+            return false;
+        }
+        match fs::read_to_string("/proc/filesystems") {
+            Ok(s)
+                if s.lines()
+                    .any(|l| l.split('\t').next_back() == Some("overlay")) => {}
+            _ => return false,
+        }
+        overlay_mount_selftest()
+    }
+
+    /// 在新 mount ns 內試掛一個最小 overlay（兩個空 lowerdir + upper + work），驗證真的能掛。
+    /// 以子行程隔離（unshare(NEWNS) + mount 不污染本行程）；成功 → 退 0。
+    fn overlay_mount_selftest() -> bool {
+        let base = std::env::temp_dir().join(format!("chefer-ovl-selftest-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        for d in ["l1", "l2", "u", "w", "m"] {
+            if fs::create_dir_all(base.join(d)).is_err() {
+                return false;
+            }
+        }
+        // SAFETY: fork 後子行程僅呼叫 async-signal 安全的系統呼叫並 _exit。
+        let ok = match unsafe { nix::unistd::fork() } {
+            Ok(nix::unistd::ForkResult::Parent { child }) => {
+                matches!(
+                    nix::sys::wait::waitpid(child, None),
+                    Ok(nix::sys::wait::WaitStatus::Exited(_, 0))
+                )
+            }
+            Ok(nix::unistd::ForkResult::Child) => {
+                use nix::mount::{MsFlags, mount};
+                use nix::sched::{CloneFlags, unshare};
+                let code = (|| -> i32 {
+                    if unshare(CloneFlags::CLONE_NEWNS).is_err() {
+                        return 1;
+                    }
+                    let opts = format!(
+                        "lowerdir={}:{},upperdir={},workdir={}",
+                        base.join("l1").display(),
+                        base.join("l2").display(),
+                        base.join("u").display(),
+                        base.join("w").display(),
+                    );
+                    let r = mount(
+                        Some("overlay"),
+                        &base.join("m"),
+                        Some("overlay"),
+                        MsFlags::empty(),
+                        Some(opts.as_str()),
+                    );
+                    if r.is_err() { 1 } else { 0 }
+                })();
+                unsafe { libc::_exit(code) };
+            }
+            Err(_) => false,
+        };
+        let _ = fs::remove_dir_all(&base);
+        ok
+    }
+
+    /// 確保各層已解到獨立 lowerdir（以 diff_id 為名、內容定址、可共用），回傳 base→top 順序的目錄清單。
+    pub fn assemble_overlay_layers(
+        bundle_dir: &Path,
+        svc: &chefer_bundle::ServiceEntry,
+        cache_root: &Path,
+    ) -> Result<Vec<PathBuf>> {
+        let layers_root = cache_root.join("layers");
+        fs::create_dir_all(&layers_root).with_context(|| {
+            format!(
+                "failed to create overlay layers dir: {}",
+                layers_root.display()
+            )
+        })?;
+        let mut dirs = Vec::with_capacity(svc.layers.len());
+        for layer in &svc.layers {
+            dirs.push(ensure_overlay_layer(bundle_dir, layer, &layers_root)?);
+        }
+        Ok(dirs)
+    }
+
+    /// 確保單層已解到 `<layers_root>/<diff_id>`（含 `.complete`）；內容定址 → 同層只解一次、跨 image 共用。
+    fn ensure_overlay_layer(
+        bundle_dir: &Path,
+        layer: &chefer_bundle::LayerRef,
+        layers_root: &Path,
+    ) -> Result<PathBuf> {
+        // diff_id 形如 "sha256:<hex>"；取 hex 當目錄名（檔名安全）。
+        let key = layer.diff_id.rsplit(':').next().unwrap_or(&layer.diff_id);
+        let dir = layers_root.join(key);
+
+        // 以鎖檔序列化建置（共用快路徑：已 .complete 直接重用）。
+        let lock_path = layers_root.join(format!(".{key}.lock"));
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("failed to open layer lock: {}", lock_path.display()))?;
+        flock(&lock, libc::LOCK_SH).context("failed to acquire layer shared lock")?;
+        if is_rootfs_complete(&dir) {
+            return Ok(dir);
+        }
+        flock(&lock, libc::LOCK_UN).ok();
+        flock(&lock, libc::LOCK_EX).context("failed to acquire layer exclusive lock")?;
+
+        if !is_rootfs_complete(&dir) {
+            if dir.exists() {
+                fs::remove_dir_all(&dir).with_context(|| {
+                    format!("failed to remove incomplete layer dir: {}", dir.display())
+                })?;
+            }
+            fs::create_dir_all(&dir)
+                .with_context(|| format!("failed to create layer dir: {}", dir.display()))?;
+            let layer_path = bundle_dir.join(&layer.rel_path);
+            let f = fs::File::open(&layer_path).with_context(|| {
+                format!(
+                    "failed to open layer: {}; the bundle may be incomplete, please re-extract or repack",
+                    layer_path.display()
+                )
+            })?;
+            let dec = ruzstd::decoding::StreamingDecoder::new(std::io::BufReader::new(f))
+                .with_context(|| format!("zstd decompress failed: {}", layer_path.display()))?;
+            if let Err(e) = extract_layer_overlay(&dir, dec) {
+                let _ = fs::remove_dir_all(&dir);
+                return Err(e).with_context(|| {
+                    format!("failed to extract overlay layer: {}", layer_path.display())
+                });
+            }
+            fs::write(dir.join(COMPLETE_MARKER), b"")
+                .with_context(|| format!("failed to write layer .complete: {}", dir.display()))?;
+        }
+        flock(&lock, libc::LOCK_SH).ok();
+        Ok(dir)
+    }
+
+    /// 解單層到 overlay lowerdir：OCI whiteout 轉成 overlay whiteout，其餘 entry 正常落地（不刪除）。
+    fn extract_layer_overlay<R: Read>(layer_dir: &Path, reader: R) -> Result<()> {
+        let mut dir_modes: BTreeMap<PathBuf, u32> = BTreeMap::new();
+        let mut archive = tar::Archive::new(reader);
+        for entry in archive.entries().context("failed to read tar entry")? {
+            let mut entry = entry.context("failed to read tar entry")?;
+            let path_str = entry
+                .path()
+                .context("could not parse tar entry path")?
+                .to_string_lossy()
+                .into_owned();
+
+            if let Some(action) = parse_whiteout(&path_str) {
+                apply_overlay_whiteout(layer_dir, &action)?;
+                continue;
+            }
+            let Some(rel) = sanitize_rel_path(&path_str)? else {
+                continue;
+            };
+            let parent_abs = match rel.parent() {
+                Some(p) if !p.as_os_str().is_empty() => secure_resolve(layer_dir, p)?,
+                _ => layer_dir.to_path_buf(),
+            };
+            fs::create_dir_all(&parent_abs)
+                .with_context(|| format!("failed to create directory: {}", parent_abs.display()))?;
+            let file_name = rel
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("tar entry is missing a file name: {path_str}"))?;
+            let dest = parent_abs.join(file_name);
+            extract_entry(layer_dir, &mut entry, &dest, &path_str, &mut dir_modes)?;
+        }
+        for (dir, mode) in &dir_modes {
+            match fs::set_permissions(dir, fs::Permissions::from_mode(*mode & 0o7777)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("failed to set directory permissions: {}", dir.display())
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 在 overlay lowerdir 內表示 whiteout：刪除 → 字元裝置 0:0；opaque → trusted.overlay.opaque。
+    fn apply_overlay_whiteout(layer_dir: &Path, action: &WhiteoutAction) -> Result<()> {
+        match action {
+            WhiteoutAction::Remove { path } => {
+                let Some(rel) = sanitize_rel_path(path)? else {
+                    return Ok(());
+                };
+                let parent_abs = match rel.parent() {
+                    Some(p) if !p.as_os_str().is_empty() => secure_resolve(layer_dir, p)?,
+                    _ => layer_dir.to_path_buf(),
+                };
+                fs::create_dir_all(&parent_abs)?;
+                let target = parent_abs.join(rel.file_name().unwrap_or_default());
+                let _ = remove_existing(&target);
+                mknod_whiteout(&target)?;
+            }
+            WhiteoutAction::Opaque { dir } => {
+                let target = match sanitize_rel_path(dir)? {
+                    Some(rel) => secure_resolve(layer_dir, &rel)?,
+                    None => layer_dir.to_path_buf(),
+                };
+                fs::create_dir_all(&target)?;
+                set_overlay_opaque(&target)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 建立 overlay whiteout 字元裝置（dev 0:0）。需真 root。
+    fn mknod_whiteout(path: &Path) -> Result<()> {
+        let c = CString::new(path.as_os_str().as_bytes())
+            .with_context(|| format!("path contains NUL: {}", path.display()))?;
+        // SAFETY: 有效路徑 + S_IFCHR + dev 0:0。
+        let r = unsafe { libc::mknod(c.as_ptr(), libc::S_IFCHR, libc::makedev(0, 0)) };
+        if r != 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "failed to create overlay whiteout device (needs real root): {}",
+                    path.display()
+                )
+            });
+        }
+        Ok(())
+    }
+
+    /// 對目錄設 overlay 不透明標記（trusted.overlay.opaque=y）。需真 root。
+    fn set_overlay_opaque(dir: &Path) -> Result<()> {
+        let cp = CString::new(dir.as_os_str().as_bytes())
+            .with_context(|| format!("path contains NUL: {}", dir.display()))?;
+        let name = c"trusted.overlay.opaque";
+        // SAFETY: 有效路徑/名稱/值。
+        let r = unsafe {
+            libc::setxattr(
+                cp.as_ptr(),
+                name.as_ptr(),
+                b"y".as_ptr() as *const libc::c_void,
+                1,
+                0,
+            )
+        };
+        if r != 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "failed to set trusted.overlay.opaque (needs real root): {}",
+                    dir.display()
+                )
+            });
+        }
+        Ok(())
     }
 
     /// 解開單一層：whiteout 先處理，其他 entry 正常落地。
