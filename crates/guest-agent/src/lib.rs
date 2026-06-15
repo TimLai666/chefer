@@ -134,9 +134,12 @@ mod linux_impl {
             eprintln!("[guest-agent] rootfs via overlayfs (root backend; lazy, shared layers)");
         }
         // overlay 的每次執行可寫層根（以 pid 區隔；結束後清除）。
-        let overlay_run_root = cfg
-            .data_dir
-            .join(".overlay")
+        // **放系統 temp（通常 /tmp）而非 data_dir**：overlay 的 upperdir 對檔案系統有要求
+        // （d_type、xattr 等），而 data_dir 在 VM 後端常是 virtiofs（缺這些 → mount EINVAL
+        // 「upper fs missing required features」）。temp 與 overlay_supported() 的實測掛載同一處，
+        // 故那個 selftest 正好驗證了這裡能不能當 upper。
+        let overlay_run_root = std::env::temp_dir()
+            .join("chefer-overlay")
             .join(std::process::id().to_string());
 
         let mut rootfs_map: BTreeMap<String, ServiceRootfs> = BTreeMap::new();
