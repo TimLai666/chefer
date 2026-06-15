@@ -8,8 +8,23 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
 
-/// rootfs 快取完成標記檔名（位於 rootfs 目錄內）。
+/// rootfs 快取完成標記檔名後綴。**置於 rootfs 目錄外（同層 sibling）**：標記檔
+/// 必須 NOT 落在會成為容器 `/` 的目錄裡，否則合併/overlay 兩條路都會讓容器根目錄
+/// 多出一個 `/.complete`（overlay 的 lowerdir 內容會原樣透出、合併 rootfs 被 bind
+/// 成 `/`）。故標記寫成 `<dir>.complete`。
 pub const COMPLETE_MARKER: &str = ".complete";
+
+/// rootfs/層目錄的完成標記路徑：同層 sibling `<dir>.complete`（不在 `dir` 內）。
+pub fn complete_marker_path(dir: &Path) -> PathBuf {
+    let mut s = dir.as_os_str().to_os_string();
+    s.push(COMPLETE_MARKER);
+    PathBuf::from(s)
+}
+
+/// 寫入完成標記（sibling 空檔）。
+pub fn mark_rootfs_complete(dir: &Path) -> std::io::Result<()> {
+    std::fs::write(complete_marker_path(dir), b"")
+}
 
 /// 預設 rootfs 快取根目錄：`<data_dir>/.rootfs-cache`。
 pub fn default_cache_root(data_dir: &Path) -> PathBuf {
@@ -38,9 +53,9 @@ pub fn service_rootfs_dir(cache_root: &Path, svc: &chefer_bundle::ServiceEntry) 
     cache_root.join(rootfs_dir_name(&svc.name, &diff_ids))
 }
 
-/// 快取是否已完成（目錄存在且含 `.complete` 標記）。
+/// 快取是否已完成（目錄存在且 sibling `<dir>.complete` 標記存在）。
 pub fn is_rootfs_complete(dir: &Path) -> bool {
-    dir.is_dir() && dir.join(COMPLETE_MARKER).is_file()
+    dir.is_dir() && complete_marker_path(dir).is_file()
 }
 
 /// tar entry 路徑（rootfs 內容）的安全檢查與正規化。
@@ -92,7 +107,10 @@ mod linux {
 
     use anyhow::{Context, Result, bail};
 
-    use super::{COMPLETE_MARKER, is_rootfs_complete, sanitize_rel_path, service_rootfs_dir};
+    use super::{
+        complete_marker_path, is_rootfs_complete, mark_rootfs_complete, sanitize_rel_path,
+        service_rootfs_dir,
+    };
     use crate::whiteout::{WhiteoutAction, parse_whiteout};
 
     /// 已組裝完成的 rootfs 租約：在 run 期間持有共享 flock，
@@ -125,6 +143,8 @@ mod linux {
             // 亦即沒有別的 instance 持有 SH → 可安全刪除。
             if flock(&self.lock, libc::LOCK_EX | libc::LOCK_NB).is_ok() {
                 let _ = fs::remove_dir_all(&self.dir);
+                // 連同 sibling 完成標記一起清，避免遺留空檔。
+                let _ = fs::remove_file(complete_marker_path(&self.dir));
                 true
             } else {
                 false
@@ -228,9 +248,9 @@ mod linux {
                 return Err(e);
             }
 
-            fs::write(target.join(COMPLETE_MARKER), b"").with_context(|| {
+            mark_rootfs_complete(&target).with_context(|| {
                 format!(
-                    "failed to write {COMPLETE_MARKER} marker: {}",
+                    "failed to write completion marker for: {}",
                     target.display()
                 )
             })?;
@@ -661,8 +681,9 @@ mod linux {
                     format!("failed to extract overlay layer: {}", layer_path.display())
                 });
             }
-            fs::write(dir.join(COMPLETE_MARKER), b"")
-                .with_context(|| format!("failed to write layer .complete: {}", dir.display()))?;
+            mark_rootfs_complete(&dir).with_context(|| {
+                format!("failed to write layer completion marker: {}", dir.display())
+            })?;
         }
         flock(&lock, libc::LOCK_SH).ok();
         Ok(dir)
@@ -1032,14 +1053,23 @@ mod tests {
 
         // 不存在 → 未完成
         assert!(!is_rootfs_complete(&dir));
-        // 存在但無 .complete → 未完成
+        // 存在但無標記 → 未完成
         std::fs::create_dir_all(&dir).unwrap();
         assert!(!is_rootfs_complete(&dir));
-        // 寫入 .complete → 完成
-        std::fs::write(dir.join(COMPLETE_MARKER), b"").unwrap();
+        // 寫入 sibling 標記 → 完成；且標記不得落在 dir 內（否則會洩漏成容器的 /.complete）
+        mark_rootfs_complete(&dir).unwrap();
         assert!(is_rootfs_complete(&dir));
+        assert!(
+            complete_marker_path(&dir).is_file(),
+            "標記應為 sibling <dir>.complete"
+        );
+        assert!(
+            !dir.join(COMPLETE_MARKER).exists(),
+            "標記不可落在 rootfs 目錄內（會洩漏成容器根目錄的 /.complete）"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_file(complete_marker_path(&dir));
     }
 
     #[test]
@@ -1383,5 +1413,219 @@ mod linux_tests {
         assert!(out.join("evil.txt").exists());
         assert!(!tmp.path().join("evil.txt").exists());
         assert!(!tmp.path().parent().unwrap().join("evil.txt").exists());
+    }
+
+    // ── overlay 正確性：合成視圖必須等於合併樹 ──────────────────────────────
+    // overlay 只改變 rootfs「怎麼組」（lazy、共享層、掛載瞬成），組出來的 rootfs
+    // 語意應與既有合併路徑「逐檔一致」——掛載後的 bind/persist 兩條路完全相同，故
+    // 「掛載出的 merged 視圖 == assemble_rootfs_at 合併樹」就是最強的正確性證明。
+    //
+    // 需要 real root（mknod whiteout char dev + mount overlay）：非 root 直接跳過，
+    // 由 root CI job（e2e-linux.yml 的 overlay-rootfs-root-test）以 sudo 實跑。
+
+    /// 對單一目錄樹做快照：相對路徑 → 型別/權限/內容雜湊（symlink 比目標、檔案比
+    /// mode+sha256、目錄比 mode）。overlay 與合併兩樹比這份快照即可判等。
+    fn snapshot(root: &Path) -> BTreeMap<String, String> {
+        fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            entries.sort();
+            for p in entries {
+                let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+                let md = std::fs::symlink_metadata(&p).unwrap();
+                let ft = md.file_type();
+                if ft.is_symlink() {
+                    let tgt = std::fs::read_link(&p).unwrap();
+                    out.insert(rel, format!("symlink -> {}", tgt.display()));
+                } else if ft.is_dir() {
+                    out.insert(rel, format!("dir {:04o}", md.permissions().mode() & 0o7777));
+                    walk(root, &p, out);
+                } else if ft.is_file() {
+                    let content = std::fs::read(&p).unwrap();
+                    let h = hex::encode(Sha256::digest(&content));
+                    out.insert(
+                        rel,
+                        format!("file {:04o} {h}", md.permissions().mode() & 0o7777),
+                    );
+                } else {
+                    // 乾淨的 rootfs 視圖不該出現 char/block/fifo/socket（whiteout 應被
+                    // overlay 消化、不外露）；若出現即為 bug，記下供比對報錯。
+                    out.insert(rel, format!("special {ft:?}"));
+                }
+            }
+        }
+        let mut out = BTreeMap::new();
+        walk(root, root, &mut out);
+        out
+    }
+
+    /// 組一個組合：合併路徑 vs overlay 掛載視圖，斷言兩樹逐檔一致。
+    /// 須在已 unshare(NEWNS) 且傳播設私有的執行緒上呼叫（見 overlay_view_matches_merge）。
+    fn assert_overlay_matches_merge(name: &str, layers: Vec<(Vec<u8>, String)>) {
+        use nix::mount::{MsFlags, mount, umount};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("bundle");
+        let cache = tmp.path().join("cache");
+        let svc = make_bundle(&bundle, "app", layers);
+
+        // 合併樹（既有正確路徑，當作 ground truth）
+        let merge = tmp.path().join("merge");
+        assemble_rootfs_at(&bundle, &svc, &merge)
+            .unwrap_or_else(|e| panic!("[{name}] merge 組裝失敗：{e:#}"));
+
+        // overlay：各層 lowerdir（內容定址、共享）+ 本次可寫 upper/work + 掛載點 merged
+        let lowers = assemble_overlay_layers(&bundle, &svc, &cache)
+            .unwrap_or_else(|e| panic!("[{name}] overlay 層組裝失敗：{e:#}"));
+        let upper = tmp.path().join("upper");
+        let work = tmp.path().join("work");
+        let merged = tmp.path().join("merged");
+        for d in [&upper, &work, &merged] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        // lowerdir 需上層在前（lowers 為 base→top，故反轉）——與 exec.rs 一致。
+        let lowerdir = lowers
+            .iter()
+            .rev()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(":");
+        let opts = format!(
+            "lowerdir={lowerdir},upperdir={},workdir={}",
+            upper.display(),
+            work.display()
+        );
+        mount(
+            Some("overlay"),
+            &merged,
+            Some("overlay"),
+            MsFlags::empty(),
+            Some(opts.as_str()),
+        )
+        .unwrap_or_else(|e| panic!("[{name}] overlay 掛載失敗：{e}（opts={opts}）"));
+
+        let truth = snapshot(&merge);
+        let view = snapshot(&merged);
+        let _ = umount(&merged);
+
+        if truth != view {
+            let mut diff = String::new();
+            let keys: std::collections::BTreeSet<&String> =
+                truth.keys().chain(view.keys()).collect();
+            for k in keys {
+                let a = truth.get(k);
+                let b = view.get(k);
+                if a != b {
+                    diff.push_str(&format!("\n  {k}: merge={a:?} overlay={b:?}"));
+                }
+            }
+            panic!("[{name}] overlay 合成視圖與合併樹不一致：{diff}");
+        }
+    }
+
+    #[test]
+    fn overlay_view_matches_merge() {
+        if !overlay_supported() {
+            eprintln!(
+                "skip overlay_view_matches_merge: overlay unsupported \
+                 (needs real root + overlay fs; run via the root CI job)"
+            );
+            return;
+        }
+
+        // 全程在獨立 mount ns 內操作，並把傳播設私有 → overlay 掛載不外洩到 host。
+        use nix::mount::{MsFlags, mount};
+        use nix::sched::{CloneFlags, unshare};
+        unshare(CloneFlags::CLONE_NEWNS).expect("unshare(NEWNS) failed");
+        mount(
+            None::<&str>,
+            "/",
+            None::<&str>,
+            MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+            None::<&str>,
+        )
+        .expect("set / propagation private failed");
+
+        // 1) 單層、無 whiteout（最基本：檔案/目錄/symlink/權限）
+        let basic = vec![
+            LayerBuilder::new()
+                .dir("etc", 0o755)
+                .file("etc/conf", b"hello", 0o644)
+                .dir("bin", 0o755)
+                .file("bin/run", b"#!/bin/sh\n", 0o755)
+                .symlink("etc/link", "conf")
+                .finish(),
+        ];
+        assert_overlay_matches_merge("basic-single-layer", basic);
+
+        // 2) whiteout 檔 + opaque 目錄 + 覆寫 + symlink + hardlink（沿用既有覆蓋面）
+        let l0 = LayerBuilder::new()
+            .dir("etc", 0o755)
+            .file("etc/a.txt", b"v1", 0o644)
+            .dir("data", 0o755)
+            .file("data/x", b"x", 0o644)
+            .file("data/y", b"y", 0o644)
+            .dir("bin", 0o755)
+            .file("bin/prog", b"#!/bin/sh\n", 0o755)
+            .symlink("etc/link", "a.txt")
+            .hardlink("etc/hard", "etc/a.txt")
+            .finish();
+        let l1 = LayerBuilder::new()
+            .file("etc/.wh.a.txt", b"", 0o644)
+            .file("data/.wh..wh..opq", b"", 0o644)
+            .file("data/z", b"z", 0o600)
+            .file("bin/prog", b"#!/bin/sh\necho v2\n", 0o700)
+            .finish();
+        assert_overlay_matches_merge("whiteout-opaque-overwrite", vec![l0, l1]);
+
+        // 3) 刪除後再重建（whiteout 之上又出現同名檔 → 上層實檔應勝過下層 whiteout）
+        let d0 = LayerBuilder::new()
+            .dir("foo", 0o755)
+            .file("foo/bar.txt", b"v1", 0o644)
+            .finish();
+        let d1 = LayerBuilder::new()
+            .file("foo/.wh.bar.txt", b"", 0o644)
+            .finish();
+        let d2 = LayerBuilder::new()
+            .file("foo/bar.txt", b"v3", 0o600)
+            .finish();
+        assert_overlay_matches_merge("delete-then-recreate", vec![d0, d1, d2]);
+
+        // 4) 巢狀目錄 + 深層 opaque（opaque 應只清該目錄下層內容，保留同層新增）
+        let n0 = LayerBuilder::new()
+            .dir("a", 0o755)
+            .dir("a/b", 0o755)
+            .file("a/b/old1", b"1", 0o644)
+            .file("a/b/old2", b"2", 0o644)
+            .dir("a/b/c", 0o755)
+            .file("a/b/c/deep", b"d", 0o644)
+            .finish();
+        let n1 = LayerBuilder::new()
+            .file("a/b/.wh..wh..opq", b"", 0o644)
+            .file("a/b/fresh", b"f", 0o644)
+            .finish();
+        assert_overlay_matches_merge("nested-deep-opaque", vec![n0, n1]);
+
+        // 5) 多層連續覆寫同檔（內容與權限都應取最上層）
+        let m0 = LayerBuilder::new().file("v", b"one", 0o644).finish();
+        let m1 = LayerBuilder::new().file("v", b"two", 0o600).finish();
+        let m2 = LayerBuilder::new().file("v", b"three", 0o755).finish();
+        assert_overlay_matches_merge("multi-layer-overwrite", vec![m0, m1, m2]);
+
+        // 6) 權限多樣性（各種 mode 的檔與目錄都應被 overlay 如實呈現）
+        let p0 = LayerBuilder::new()
+            .dir("d700", 0o700)
+            .file("d700/secret", b"s", 0o600)
+            .file("readonly", b"r", 0o444)
+            .file("exec", b"e", 0o755)
+            .dir("d555", 0o555)
+            .finish();
+        assert_overlay_matches_merge("permission-variety", vec![p0]);
+
+        // 成功標記：root CI job 會斷言這行出現（且未出現 "skip ..."），避免
+        // overlay 不支援時測試靜默跳過卻讓 job 變綠（假陽性）。
+        eprintln!("overlay_view_matches_merge: OK (6 combos verified overlay == merge)");
     }
 }
