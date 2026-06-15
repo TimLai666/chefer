@@ -669,9 +669,12 @@ run_registry_pull_e2e() {
   local image_platform="$3"
   local cli="$4"
   local kit="$5"
-  local ref="${CHEFER_E2E_REGISTRY_REF:-alpine:3.20}"
+  # 用「多層」官方 image（redis）而非單層 alpine：才能涵蓋 layer 順序重排
+  #（oci-client 平行下載、回傳順序非 manifest 序）這條路徑——單層 image 抓不到該 bug。
+  # 覆寫 cmd 讓它印標記後退出（redis-server 本身不會結束）。
+  local ref="${CHEFER_E2E_REGISTRY_REF:-redis:7.2-alpine}"
 
-  note "Registry pull E2E: image ${ref} pulled straight from registry (no docker save)"
+  note "Registry pull E2E: multi-layer image ${ref} pulled straight from registry (no docker save)"
   mkdir -p "$work/reg"
   cat >"$work/reg/appcipe.yml" <<YAML
 version: "0.1"

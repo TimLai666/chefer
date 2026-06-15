@@ -6,7 +6,7 @@
 //! `block_on` async 拉取。v1 僅匿名拉取（公開 image）；reference 的合法性與「禁 latest／須釘版」
 //! 由 appcipe-spec 的驗證把關。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use oci_client::client::{ClientConfig, ImageData};
@@ -89,7 +89,46 @@ pub(crate) fn pull_image(reference: &str, platform: &str, tmp: &Path) -> Result<
             .with_context(|| format!("寫入第 {idx} 層 blob 失敗：{}", p.display()))?;
         layers.push(p);
     }
+    // oci-client 以 buffer_unordered 平行下載 → 回傳的 layers **順序非 manifest 序**；
+    // 依 config 的 rootfs.diff_ids 重排，確保與後續 repack 的逐層 diff_id 檢查對齊。
+    let layers = order_layers_by_diff_ids(layers, &config)?;
     Ok(ResolvedImage { config, layers })
+}
+
+/// 把（順序不定的）已下載 layer 依 `config.rootfs.diff_ids` 的順序重排。
+fn order_layers_by_diff_ids(
+    layers: Vec<PathBuf>,
+    config: &ImageConfigJson,
+) -> Result<Vec<PathBuf>> {
+    let want = config
+        .rootfs
+        .as_ref()
+        .map(|r| r.diff_ids.as_slice())
+        .unwrap_or(&[]);
+    if want.is_empty() {
+        return Ok(layers); // 無 diff_ids 資訊：維持原序（後續仍會做逐層比對）。
+    }
+    if want.len() != layers.len() {
+        bail!(
+            "registry image 層數（{}）與 config diff_ids（{}）不一致；image 可能不完整",
+            layers.len(),
+            want.len()
+        );
+    }
+    // 先算每個下載 layer 的 diff_id（解壓後 sha256），再依 want 順序挑出（remove 處理重複層）。
+    let mut pairs: Vec<(String, PathBuf)> = Vec::with_capacity(layers.len());
+    for p in layers {
+        let d = crate::layers::compute_diff_id(&p)?;
+        pairs.push((d, p));
+    }
+    let mut ordered = Vec::with_capacity(want.len());
+    for w in want {
+        let Some(pos) = pairs.iter().position(|(d, _)| d == w) else {
+            bail!("拉到的層找不到對應 diff_id：{w}（registry 回應可能不完整）");
+        };
+        ordered.push(pairs.remove(pos).1);
+    }
+    Ok(ordered)
 }
 
 fn split_platform(p: &str) -> Result<(String, String)> {
