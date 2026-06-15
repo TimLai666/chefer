@@ -34,6 +34,15 @@ impl AppCipe {
             errs.push(e);
         }
 
+        // --- data_dir：若指定則不可為空白（否則正規化後等同沿用 base 目錄，行為令人意外）---
+        if let Some(d) = &self.data_dir
+            && d.trim().is_empty()
+        {
+            errs.push(
+                "data_dir 不可為空字串；請移除該欄位以用平台預設，或填一個有效路徑".to_string(),
+            );
+        }
+
         // --- old_names：每一項都必須是「單一目錄名」(同 app name 規則) ---
         // 安全關鍵：執行期 runtime 會在 host 端（沙箱外）把 parent.join(old)
         // rename 成 data_dir。若放任 old 含路徑分隔/`..`/絕對路徑，惡意 appcipe
@@ -124,6 +133,15 @@ impl AppCipe {
             {
                 errs.push(format!(
                     "service `{name}` 的 persist_path `{pp}` 無效：必須以 '/' 開頭（容器內絕對路徑）"
+                ));
+            }
+
+            // --- workdir：若指定須為容器內絕對路徑（相對路徑多半是誤填）---
+            if let Some(wd) = &svc.workdir
+                && !wd.starts_with('/')
+            {
+                errs.push(format!(
+                    "service `{name}` 的 workdir `{wd}` 無效：必須以 '/' 開頭（容器內絕對路徑）"
                 ));
             }
 
@@ -872,6 +890,47 @@ services:
             "version: \"0.1\"\nname: App\nnetwork: wormhole\nservices:\n  db: { image: ./db.tar }\n",
         );
         assert!(bad.is_err(), "未知 network 模式應解析失敗");
+    }
+
+    // ---------- data_dir / workdir ----------
+
+    #[test]
+    fn rejects_empty_data_dir() {
+        let e = validate_err(
+            "version: \"0.1\"\nname: App\ndata_dir: \"\"\nservices:\n  db: { image: ./db.tar }\n",
+        );
+        assert!(e.contains("data_dir"), "{e}");
+    }
+
+    #[test]
+    fn rejects_relative_workdir() {
+        let e = validate_err(
+            "version: \"0.1\"\nname: App\nservices:\n  db: { image: ./db.tar, workdir: rel/dir }\n",
+        );
+        assert!(e.contains("workdir"), "{e}");
+    }
+
+    // ---------- 未知欄位（打錯名稱）----------
+
+    #[test]
+    fn rejects_misspelled_service_field() {
+        // `port`（少了 s）是常見打錯；deny_unknown_fields 應在解析期擋下，而非靜默忽略。
+        let e = serde_yaml::from_str::<crate::AppCipe>(
+            "version: \"0.1\"\nname: App\nservices:\n  db: { image: ./db.tar, port: [\"5432:5432\"] }\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("port") || e.contains("unknown field"), "{e}");
+    }
+
+    #[test]
+    fn rejects_misspelled_top_level_field() {
+        let e = serde_yaml::from_str::<crate::AppCipe>(
+            "version: \"0.1\"\nname: App\nservcies:\n  db: { image: ./db.tar }\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("servcies") || e.contains("unknown field"), "{e}");
     }
 
     // ---------- healthcheck ----------
