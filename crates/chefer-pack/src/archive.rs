@@ -2,28 +2,40 @@
 //!
 //! 安全規則（docs/DESIGN.md §0）：
 //! - 拒絕絕對路徑、`..`、Windows 磁碟前綴。
-//! - **拒絕 symlink entry**。
-//! - **hardlink entry**：只允許目標經同樣越界檢查後落在解壓根內，並以「複製目標檔內容」
-//!   實作（不在磁碟上留下連結）。
+//! - **symlink / hardlink entry 一律不在磁碟上建立連結**：把目標詞法解析、確認落在解壓根
+//!   內後，**改成複製目標檔內容**。
 //!
-//! 為何 symlink 一律拒絕：純詞法的目標深度檢查可被 `d -> .` 這類「深度放大器」繞過
-//! ——先建一個指向自身目錄的 symlink，再讓後續 entry 的路徑成分穿過它，落地時
-//! `create_dir_all`/`File::create` 會跟隨磁碟上已建立的 symlink 而寫到解壓根之外
-//! （build 機任意檔案寫入）。要正確防護需逐成分以 O_NOFOLLOW 重新解析。
+//! 為何「複製而非建連結」：純詞法的目標深度檢查可被 `d -> .` 這類「深度放大器」繞過
+//! ——若把 symlink 真的建在磁碟上，後續 entry 的路徑成分可能穿過它，落地時
+//! `create_dir_all`/`File::create` 會跟隨磁碟上的 symlink 寫到解壓根之外（build 機任意
+//! 檔案寫入）。**只要不在磁碟留下任何連結**，這種「延後重導」攻擊就結構性不可能；同時
+//! 我們仍把目標詞法解析並限制在解壓根內。
 //!
-//! 為何 hardlink 可放行：tar 的 hardlink 指向同一 archive 內「先前的」一般檔案 entry，
-//! **不會在磁碟留下會重導後續路徑解析的連結**；我們把 linkname 當相對路徑做同樣的越界
-//! 檢查、確認目標在根內，再把目標檔內容複製過來（內容等同）。**podman / buildah 的
-//! docker-archive 會用 hardlink 去重相同的 `layer.tar`**，故不能像 symlink 一樣一律拒絕，
-//! 否則 `source: dockerfile` 用 podman 建置時會解不開。docker 的 `save` 不用 hardlink，
-//! 因此只有非-docker builder 會走到這條。
+//! 為何需要支援連結：**podman / buildah 的 docker-archive 會用 symlink/hardlink 去重相同的
+//! `layer.tar`**，一律拒絕的話 `source: dockerfile` 用 podman 建置就解不開。docker 的
+//! `save` 不用連結，故只有非-docker builder 會走到這條。
+//!
+//! 目標解析語意（依 tar 慣例）：**hardlink** 的 linkname 相對 archive 根；**symlink** 的
+//! linkname 相對「連結自身所在目錄」（如同檔案系統 symlink，可含 `..`）。兩者解析後都必須
+//! 落在解壓根內、且指向一般檔案，否則報錯。連結在主迴圈先收集、待一般檔案全數解出後再處理
+//! （目標不分前後皆可）。
 
+use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use fs_err as fs;
 use tar::{Archive, EntryType};
+
+/// 待處理的連結 entry（symlink/hardlink）：連結自身相對路徑、目標、是否為 symlink。
+struct PendingLink {
+    /// 連結自身相對解壓根的（已 sanitize）路徑。
+    rel: PathBuf,
+    /// linkname（symlink：相對連結所在目錄；hardlink：相對 archive 根）。
+    target: PathBuf,
+    is_symlink: bool,
+}
 
 /// 將 `tar_path` 的內容安全解壓到 `dest_root`。
 pub(crate) fn extract_tar_to_dir(tar_path: &Path, dest_root: &Path) -> Result<()> {
@@ -35,6 +47,8 @@ pub(crate) fn extract_tar_to_dir(tar_path: &Path, dest_root: &Path) -> Result<()
 /// 從任意 reader 逐 entry 解壓，並做路徑安全檢查。
 pub(crate) fn extract_tar_reader<R: Read>(reader: R, dest_root: &Path) -> Result<()> {
     let mut ar = Archive::new(reader);
+    // 連結 entry 先收集、待一般檔案全部解出後再處理（目標可能在連結之後才出現）。
+    let mut links: Vec<PendingLink> = Vec::new();
     for entry in ar
         .entries()
         .context("讀取 tar 內容失敗（檔案可能不是 tar 格式）")?
@@ -55,42 +69,18 @@ pub(crate) fn extract_tar_reader<R: Read>(reader: R, dest_root: &Path) -> Result
             EntryType::Directory => {
                 fs::create_dir_all(&dest)?;
             }
-            // symlink：會在磁碟留下重導，後續 entry 的路徑成分可能穿過它寫到根外，故一律拒絕。
-            EntryType::Symlink => {
-                bail!(
-                    "image archive 不允許 symlink（可能是惡意 image 的路徑逃逸嘗試）：{}",
-                    rel.display()
-                );
-            }
-            // hardlink：目標須經越界檢查且落在解壓根內；以複製目標檔內容實作（podman/buildah
-            // 的 docker-archive 會以 hardlink 去重相同 layer.tar）。
-            EntryType::Link => {
+            // symlink / hardlink：不在磁碟建連結；記下來，第二階段詞法解析目標後複製內容。
+            ty @ (EntryType::Symlink | EntryType::Link) => {
                 let target = entry
                     .link_name()
-                    .context("讀取 hardlink 目標失敗")?
-                    .ok_or_else(|| anyhow::anyhow!("hardlink entry 缺少目標：{}", rel.display()))?
+                    .context("讀取連結目標失敗")?
+                    .ok_or_else(|| anyhow::anyhow!("連結 entry 缺少目標：{}", rel.display()))?
                     .into_owned();
-                let safe_target = sanitize_rel_path(&target)
-                    .with_context(|| format!("hardlink 目標不安全：{}", target.display()))?;
-                let src = dest_root.join(&safe_target);
-                // tar 的 hardlink 必指向先前已出現的 entry；不存在 → archive 損毀。
-                if !src.is_file() {
-                    bail!(
-                        "hardlink 目標不存在或非一般檔案（image archive 可能損毀）：{} -> {}",
-                        rel.display(),
-                        safe_target.display()
-                    );
-                }
-                if let Some(parent) = dest.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::copy(&src, &dest).with_context(|| {
-                    format!(
-                        "複製 hardlink 目標失敗：{} -> {}",
-                        src.display(),
-                        dest.display()
-                    )
-                })?;
+                links.push(PendingLink {
+                    rel,
+                    target,
+                    is_symlink: ty == EntryType::Symlink,
+                });
             }
             EntryType::Regular | EntryType::Continuous | EntryType::GNUSparse => {
                 if let Some(parent) = dest.parent() {
@@ -105,7 +95,76 @@ pub(crate) fn extract_tar_reader<R: Read>(reader: R, dest_root: &Path) -> Result
             _ => continue,
         }
     }
+
+    // 第二階段：把每個連結解析成「解壓根內的一般檔案」並複製內容（不建任何磁碟連結）。
+    for link in &links {
+        let resolved =
+            resolve_link_target(&link.rel, &link.target, link.is_symlink).with_context(|| {
+                format!(
+                    "連結目標不安全：{} -> {}",
+                    link.rel.display(),
+                    link.target.display()
+                )
+            })?;
+        let src = dest_root.join(&resolved);
+        if !src.is_file() {
+            bail!(
+                "連結目標不存在或非一般檔案（image archive 可能損毀）：{} -> {}",
+                link.rel.display(),
+                resolved.display()
+            );
+        }
+        let dest = dest_root.join(&link.rel);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&src, &dest).with_context(|| {
+            format!("複製連結目標失敗：{} -> {}", src.display(), dest.display())
+        })?;
+    }
     Ok(())
+}
+
+/// 把連結目標詞法解析成「相對解壓根、不越界」的路徑。
+///
+/// - symlink：目標相對「連結所在目錄」（可含 `..`）。
+/// - hardlink：目標相對 archive 根。
+///
+/// 任何越界（`..` 超出根）、絕對路徑、或含 `\` 的片段都報錯。
+fn resolve_link_target(link_rel: &Path, target: &Path, is_symlink: bool) -> Result<PathBuf> {
+    // 組出待正規化的「相對根」路徑。
+    let combined = if is_symlink {
+        match link_rel.parent() {
+            Some(p) => p.join(target),
+            None => target.to_path_buf(),
+        }
+    } else {
+        target.to_path_buf()
+    };
+    let mut stack: Vec<OsString> = Vec::new();
+    for comp in combined.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir => {
+                bail!("連結目標為絕對路徑：{}", target.display());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if stack.pop().is_none() {
+                    bail!("連結目標越界（`..` 超出解壓根）：{}", target.display());
+                }
+            }
+            Component::Normal(seg) => {
+                if seg.to_string_lossy().contains('\\') {
+                    bail!("連結目標片段含非法字元（`\\`）：{}", target.display());
+                }
+                stack.push(seg.to_os_string());
+            }
+        }
+    }
+    if stack.is_empty() {
+        bail!("連結目標為空或指向解壓根本身：{}", target.display());
+    }
+    Ok(stack.iter().collect())
 }
 
 /// 把 tar entry 路徑轉成「相對、無越界」的安全路徑。
@@ -176,27 +235,67 @@ mod tests {
     }
 
     #[test]
-    fn extract_rejects_symlink_entries() {
-        // `d -> .` 深度放大器的第一步——直接被拒，逃逸不可能成立。
+    fn extract_never_creates_symlink_on_disk() {
+        // `d -> .` 深度放大器：永遠不在磁碟建 symlink；目標 `.` 不是一般檔案 → 報錯。
+        // 關鍵是磁碟上不會留下 `d` 這個 symlink（否則後續 entry 可穿過它逃逸）。
         let bytes = tar_with_entry(b"d", EntryType::Symlink, Some(b"."));
         let tmp = tempfile::tempdir().unwrap();
         let err = extract_tar_reader(bytes.as_slice(), tmp.path()).unwrap_err();
-        assert!(format!("{err:#}").contains("不允許 symlink"), "{err:#}");
-        assert!(!tmp.path().join("d").exists());
+        assert!(format!("{err:#}").contains("連結目標"), "{err:#}");
+        assert!(tmp.path().join("d").symlink_metadata().is_err());
+    }
+
+    #[test]
+    fn extract_rejects_escaping_symlink() {
+        // 指向解壓根外的 symlink（`../../etc/passwd`，相對連結所在目錄）→ 越界被拒。
+        let bytes = tar_with_entry(b"sub/h", EntryType::Symlink, Some(b"../../../etc/passwd"));
+        let tmp = tempfile::tempdir().unwrap();
+        let err = extract_tar_reader(bytes.as_slice(), tmp.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("越界"), "{err:#}");
     }
 
     #[test]
     fn extract_rejects_escaping_hardlink() {
-        // 越界的 hardlink 目標（`..`）→ 仍被拒（目標越界檢查失敗）。
+        // 越界的 hardlink 目標（root-relative，`..` 超出根）→ 被拒。
         let bytes = tar_with_entry(b"h", EntryType::Link, Some(b"../../etc/passwd"));
         let tmp = tempfile::tempdir().unwrap();
         let err = extract_tar_reader(bytes.as_slice(), tmp.path()).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("hardlink 目標不安全") || msg.contains("`..`"),
-            "{msg}"
-        );
+        assert!(format!("{err:#}").contains("越界"), "{err:#}");
         assert!(!tmp.path().join("h").exists());
+    }
+
+    #[test]
+    fn extract_allows_in_root_symlink_as_copy() {
+        // podman 風格：layer.tar 以 symlink（相對連結目錄）去重 → 應以複製內容解出，且磁碟上不留 symlink。
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h1 = tar::Header::new_gnu();
+        h1.set_size(3);
+        h1.set_mode(0o644);
+        h1.set_entry_type(EntryType::Regular);
+        h1.set_cksum();
+        b.append_data(&mut h1, "a/layer.tar", &b"abc"[..]).unwrap();
+        let mut h2 = tar::Header::new_gnu();
+        h2.set_size(0);
+        h2.set_mode(0o777);
+        h2.set_entry_type(EntryType::Symlink);
+        h2.set_cksum();
+        // b/layer.tar -> ../a/layer.tar（相對 b/）
+        b.append_link(&mut h2, "b/layer.tar", "../a/layer.tar")
+            .unwrap();
+        let bytes = b.into_inner().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        extract_tar_reader(bytes.as_slice(), tmp.path()).unwrap();
+        assert_eq!(fs::read(tmp.path().join("b/layer.tar")).unwrap(), b"abc");
+        // 磁碟上不可有 symlink。
+        assert!(
+            !tmp.path()
+                .join("b/layer.tar")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 
     #[test]
