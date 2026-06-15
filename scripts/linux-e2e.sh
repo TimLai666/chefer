@@ -708,6 +708,111 @@ YAML
   note "Registry pull E2E passed: ${ref} pulled, packed, ran"
 }
 
+# depends_on healthcheck（command healthcheck）：
+#  正向 — db 有 healthcheck（延遲 3s 才 listen），app depends_on db；若 gating 生效，
+#         app 啟動時 db 必已就緒、能連上 → 印 CHEFER_DEPENDS_OK、整體 exit 0。
+#  反向 — healthcheck 永遠失敗（test=false）→ retries 用盡 → fail_fast，整體非零退出，
+#         且不會卡在 db 的 sleep 3600（gating 主動拆除）。
+run_healthcheck_e2e() {
+  local work="$1" output_target="$2" image_platform="$3" cli="$4" kit="$5" image_tar="$6"
+
+  note "Healthcheck E2E (positive): depends_on waits until db healthcheck passes"
+  mkdir -p "$work/hc-ok"
+  cat >"$work/hc-ok/appcipe.yml" <<YAML
+version: "0.1"
+name: LinuxHealthDep
+app_version: "e2e"
+data_dir: "$work/hc-ok-data"
+crash: fail_fast
+network: internal
+services:
+  db:
+    image:
+      source: tar
+      file: "$image_tar"
+      platform: ${image_platform}
+    # 先延遲 3s 才 listen（讓 healthcheck 一開始失敗，真正測到 gating）；之後只 listen 不 accept
+    #（kernel 會替 backlog 內的連線完成握手，故 app 的 connect 會成功），並停留 8s 讓 app 來得及連，
+    # 再退出。注意：不可 accept 後就退出——否則會把 healthcheck 探針的連線當成唯一連線吃掉而提早結束。
+    cmd: ["python", "-c", "import socket,time\ntime.sleep(3)\ns=socket.socket()\ns.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\ns.bind(('127.0.0.1',7799))\ns.listen(8)\ntime.sleep(8)\nprint('CHEFER_DB_DONE')"]
+    interface_mode: none
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket,sys; sys.exit(0 if socket.socket().connect_ex(('127.0.0.1',7799))==0 else 1)"]
+      interval: 1s
+      timeout: 3s
+      retries: 20
+  app:
+    image:
+      source: tar
+      file: "$image_tar"
+      platform: ${image_platform}
+    cmd: ["python", "-c", "import socket,sys\ns=socket.socket()\nr=s.connect_ex(('127.0.0.1',7799))\nif r==0:\n    s.send(b'x')\n    print('CHEFER_DEPENDS_OK')\n    sys.exit(0)\nprint('CHEFER_DEPENDS_FAIL')\nsys.exit(1)"]
+    interface_mode: none
+    depends_on: [db]
+YAML
+  "$cli" build "$work/hc-ok/appcipe.yml" --out "$work/out-hc-ok" --kit-dir "$kit" --target "$output_target"
+  local ok_app="$work/out-hc-ok/LinuxHealthDep/LinuxHealthDep_${output_target}"
+  [[ -f "$ok_app" ]] || die "missing built healthcheck app: $ok_app"
+  chmod +x "$ok_app"
+  local ok_log="$work/hc-ok.log"
+  set +e
+  timeout 60 "$ok_app" >"$ok_log" 2>&1
+  local ok_code=$?
+  set -e
+  if [[ "$ok_code" -ne 0 ]] || ! grep -q "CHEFER_DEPENDS_OK" "$ok_log"; then
+    cat "$ok_log" >&2 || true
+    die "Healthcheck positive E2E failed: exit=${ok_code}, expected exit 0 + CHEFER_DEPENDS_OK"
+  fi
+  if grep -q "CHEFER_DEPENDS_FAIL" "$ok_log"; then
+    cat "$ok_log" >&2 || true
+    die "Healthcheck positive E2E: app ran before db was ready (gating broken)"
+  fi
+  note "Healthcheck positive E2E passed: app started only after db became healthy"
+
+  note "Healthcheck E2E (negative): a never-passing healthcheck triggers fail_fast"
+  mkdir -p "$work/hc-bad"
+  cat >"$work/hc-bad/appcipe.yml" <<YAML
+version: "0.1"
+name: LinuxHealthFail
+app_version: "e2e"
+data_dir: "$work/hc-bad-data"
+crash: fail_fast
+network: internal
+services:
+  db:
+    image:
+      source: tar
+      file: "$image_tar"
+      platform: ${image_platform}
+    cmd: ["sh", "-c", "sleep 3600"]
+    interface_mode: none
+    healthcheck:
+      test: ["CMD", "false"]
+      interval: 1s
+      timeout: 2s
+      retries: 3
+YAML
+  "$cli" build "$work/hc-bad/appcipe.yml" --out "$work/out-hc-bad" --kit-dir "$kit" --target "$output_target"
+  local bad_app="$work/out-hc-bad/LinuxHealthFail/LinuxHealthFail_${output_target}"
+  [[ -f "$bad_app" ]] || die "missing built healthcheck-fail app: $bad_app"
+  chmod +x "$bad_app"
+  local bad_log="$work/hc-bad.log" bad_code=0
+  local started ended elapsed
+  started="$(date +%s)"
+  set +e
+  timeout 60 "$bad_app" >"$bad_log" 2>&1
+  bad_code=$?
+  set -e
+  ended="$(date +%s)"
+  elapsed=$(( ended - started ))
+  if [[ "$bad_code" -eq 0 || "$bad_code" -eq 124 ]]; then
+    cat "$bad_log" >&2 || true
+    die "Healthcheck negative E2E failed: expected non-zero fail_fast (got exit=${bad_code}; 124=timed out, meaning it hung on sleep 3600 instead of tearing down)"
+  fi
+  [[ "$elapsed" -lt 30 ]] || die "Healthcheck negative E2E: fail_fast took too long (${elapsed}s); gating did not tear down promptly"
+  note "Healthcheck negative E2E passed: unhealthy service tore the app down (exit=${bad_code}, ${elapsed}s)"
+}
+
 main() {
   [[ "$(uname -s)" == "Linux" ]] || die "Linux E2E must run on Linux"
   ! is_wsl || die "Linux E2E requires a native Linux host, not WSL"
@@ -873,6 +978,9 @@ main() {
 
   note "Checking registry image pull (source: image)"
   run_registry_pull_e2e "$work" "$output_target" "$image_platform" "$cli" "$kit"
+
+  note "Checking depends_on healthcheck (wait-until-ready + fail_fast)"
+  run_healthcheck_e2e "$work" "$output_target" "$image_platform" "$cli" "$kit" "$image_tar"
 
   if [[ "${CHEFER_E2E_GUI:-0}" == "1" ]]; then
     run_gui_e2e "$work" "$output_target" "$image_platform" "$cli" "$kit"

@@ -96,6 +96,122 @@ pub struct Service {
 
     #[serde(default)]
     pub depends_on: Vec<String>,
+
+    /// 選填的健康檢查（對齊 Docker HEALTHCHECK）；驅動 depends_on 的 wait-until-ready。
+    #[serde(default)]
+    pub healthcheck: Option<HealthCheck>,
+}
+
+/// 服務健康檢查（見 docs/DESIGN.md「健康檢查」節）。duration 欄位接受 `<n>(ms|s|m)`
+/// 或裸整數（= 秒）；省略時套用 [`HealthCheck`] 的 `DEFAULT_*`。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HealthCheck {
+    /// 檢查命令；字串 = `sh -c`，陣列比照 Docker（`CMD`/`CMD-SHELL`/`NONE` 前綴）。
+    pub test: HealthTest,
+    #[serde(default)]
+    pub interval: Option<String>,
+    #[serde(default)]
+    pub timeout: Option<String>,
+    #[serde(default)]
+    pub retries: Option<u32>,
+    #[serde(default)]
+    pub start_period: Option<String>,
+}
+
+/// `healthcheck.test`：字串（→ `sh -c`）或字串陣列（Docker 風格）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum HealthTest {
+    Shell(String),
+    Args(Vec<String>),
+}
+
+/// `test` 正規化後的可執行形式。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TestCmd {
+    /// 經 `/bin/sh -c <字串>` 執行。
+    Shell(String),
+    /// 直接作為 argv 執行。
+    Argv(Vec<String>),
+}
+
+impl HealthTest {
+    /// 正規化為可執行命令；`None` 代表「空 / NONE」（無效，驗證期會擋）。
+    pub fn to_cmd(&self) -> Option<TestCmd> {
+        match self {
+            HealthTest::Shell(s) if !s.trim().is_empty() => Some(TestCmd::Shell(s.clone())),
+            HealthTest::Shell(_) => None,
+            HealthTest::Args(v) => match v.split_first() {
+                None => None,
+                Some((head, rest)) => match head.as_str() {
+                    "NONE" => None,
+                    "CMD-SHELL" => {
+                        let s = rest.join(" ");
+                        (!s.trim().is_empty()).then_some(TestCmd::Shell(s))
+                    }
+                    "CMD" => (!rest.is_empty()).then(|| TestCmd::Argv(rest.to_vec())),
+                    // 無已知前綴 → 整段視為 argv。
+                    _ => Some(TestCmd::Argv(v.clone())),
+                },
+            },
+        }
+    }
+}
+
+impl HealthCheck {
+    pub const DEFAULT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+    pub const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    pub const DEFAULT_RETRIES: u32 = 10;
+    pub const DEFAULT_START_PERIOD: std::time::Duration = std::time::Duration::ZERO;
+
+    /// 解析後的 interval（省略 → 預設）。
+    pub fn interval(&self) -> Result<std::time::Duration, String> {
+        opt_duration(&self.interval, Self::DEFAULT_INTERVAL)
+    }
+    pub fn timeout(&self) -> Result<std::time::Duration, String> {
+        opt_duration(&self.timeout, Self::DEFAULT_TIMEOUT)
+    }
+    pub fn start_period(&self) -> Result<std::time::Duration, String> {
+        opt_duration(&self.start_period, Self::DEFAULT_START_PERIOD)
+    }
+    pub fn retries(&self) -> u32 {
+        self.retries.unwrap_or(Self::DEFAULT_RETRIES)
+    }
+}
+
+fn opt_duration(
+    raw: &Option<String>,
+    default: std::time::Duration,
+) -> Result<std::time::Duration, String> {
+    match raw {
+        None => Ok(default),
+        Some(s) => parse_duration(s),
+    }
+}
+
+/// 解析時間長度：`<n>ms` / `<n>s` / `<n>m`，或裸整數（= 秒）。
+pub fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Err("時間長度不可為空".to_string());
+    }
+    let (num, unit_ms): (&str, u64) = if let Some(n) = t.strip_suffix("ms") {
+        (n, 1)
+    } else if let Some(n) = t.strip_suffix('s') {
+        (n, 1000)
+    } else if let Some(n) = t.strip_suffix('m') {
+        (n, 60_000)
+    } else {
+        (t, 1000) // 裸數字 = 秒
+    };
+    let num = num.trim();
+    let value: u64 = num
+        .parse()
+        .map_err(|_| format!("無法解析時間長度 `{s}`（接受 <n>ms/<n>s/<n>m 或裸整數秒）"))?;
+    value
+        .checked_mul(unit_ms)
+        .map(std::time::Duration::from_millis)
+        .ok_or_else(|| format!("時間長度 `{s}` 溢位"))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

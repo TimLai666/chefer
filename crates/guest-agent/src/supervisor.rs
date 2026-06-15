@@ -59,10 +59,14 @@ pub fn install_signal_handlers() -> Result<()> {
     Ok(())
 }
 
+/// 健康檢查未通過時，app 整體回傳的 exit code。
+const UNHEALTHY_EXIT: i32 = 1;
+
 /// 依拓撲順序啟動所有服務並監控至結束，回傳 app 整體 exit code。
 ///
-/// v1 啟動順序即依賴語意（無健康檢查）：depends_on 只保證「先 spawn」，
-/// 不等待被依賴服務就緒。
+/// 啟動採拓撲序、序列化：spawn 一個服務後，若它有 `healthcheck` 就輪詢到 healthy 才
+/// spawn 下一個（無 healthcheck 者 spawn 即視為 ready）。因 depends_on 驅動拓撲序，
+/// 被依賴者必在依賴者之前 ready，故 `depends_on` 等同 wait-until-ready。
 pub fn run_services(
     order: &[&chefer_bundle::ServiceEntry],
     rootfs_map: &BTreeMap<String, PathBuf>,
@@ -116,6 +120,30 @@ pub fn run_services(
             "[guest-agent] 服務 `{}` 已啟動（pid {}）",
             svc.name, spawned.pid
         );
+
+        // depends_on wait-until-ready：有 healthcheck 的服務需輪詢至 healthy 才續啟下一個。
+        if let Some(hc) = &svc.healthcheck {
+            match await_healthy(&mut running, spawned.init_pid, hc, &svc.name) {
+                Gate::Healthy => {}
+                Gate::ShuttingDown => {
+                    terminate_all(&mut running);
+                    return Ok(130);
+                }
+                // 等待期間有服務崩潰 → 透傳其非零碼。
+                Gate::ServiceCrashed(code) => {
+                    terminate_all(&mut running);
+                    return Ok(code);
+                }
+                Gate::Unhealthy => {
+                    eprintln!(
+                        "[guest-agent] 服務 `{}` 的 healthcheck 在 {} 次重試後仍未通過；視為啟動失敗（fail_fast）",
+                        svc.name, hc.retries
+                    );
+                    terminate_all(&mut running);
+                    return Ok(UNHEALTHY_EXIT);
+                }
+            }
+        }
     }
 
     // internal/bridge：服務都在 app netns 內，為宣告的 port 起跨 netns inbound relay
@@ -125,6 +153,111 @@ pub fn run_services(
     }
 
     monitor(&mut running)
+}
+
+/// 健康檢查等待的結果。
+enum Gate {
+    /// healthcheck 通過（或無 init pid 可探測 → 視為就緒）。
+    Healthy,
+    /// retries 用盡仍未通過。
+    Unhealthy,
+    /// 等待期間收到 SHUTDOWN。
+    ShuttingDown,
+    /// 等待期間有已啟動服務以非零碼崩潰（透傳該碼）。
+    ServiceCrashed(i32),
+}
+
+/// 輪詢服務的 healthcheck 直到通過 / 用盡重試 / 服務崩潰 / 收到終止訊號。
+fn await_healthy(
+    running: &mut Vec<Running>,
+    init: Option<Pid>,
+    hc: &chefer_bundle::HealthCheck,
+    name: &str,
+) -> Gate {
+    let Some(init) = init else {
+        eprintln!("[guest-agent] 服務 `{name}` 取不到 init pid，略過 healthcheck（視為已就緒）");
+        return Gate::Healthy;
+    };
+    let interval = Duration::from_millis(hc.interval_ms.max(1));
+    let start_period = Duration::from_millis(hc.start_period_ms);
+    let started = Instant::now();
+    let mut failures: u32 = 0;
+    eprintln!("[guest-agent] 等待服務 `{name}` 通過 healthcheck…");
+    loop {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            return Gate::ShuttingDown;
+        }
+        // 已啟動服務（含本服務）若崩潰 → fail_fast，透傳其退出碼。
+        if let Some(code) = reap_crashed_nonblocking(running) {
+            return Gate::ServiceCrashed(code);
+        }
+        match crate::health::probe(init, hc) {
+            Ok(true) => {
+                eprintln!("[guest-agent] 服務 `{name}` 已就緒（healthy）");
+                return Gate::Healthy;
+            }
+            Ok(false) => {}
+            Err(e) => eprintln!("[guest-agent] 服務 `{name}` 的 healthcheck 無法執行：{e:#}"),
+        }
+        // start_period 寬限期內的失敗不計入 retries。
+        if started.elapsed() >= start_period {
+            failures += 1;
+            if failures >= hc.retries.max(1) {
+                return Gate::Unhealthy;
+            }
+        }
+        sleep_interruptible(interval);
+    }
+}
+
+/// 非阻塞回收已結束的「被追蹤服務」：任一非零退出 → 回傳其碼（fail_fast）；
+/// exit 0 者視為背景/一次性任務完成，移出 running 並繼續。
+fn reap_crashed_nonblocking(running: &mut Vec<Running>) -> Option<i32> {
+    loop {
+        match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::Exited(pid, code)) => {
+                if let Some(idx) = running.iter().position(|r| r.mid == pid) {
+                    let r = running.remove(idx);
+                    if code != 0 {
+                        eprintln!(
+                            "[guest-agent] 服務 `{}` 以非零代碼 {code} 結束（fail_fast）",
+                            r.name
+                        );
+                        return Some(code);
+                    }
+                    eprintln!("[guest-agent] 服務 `{}` 正常結束", r.name);
+                }
+            }
+            Ok(WaitStatus::Signaled(pid, sig, _)) => {
+                if let Some(idx) = running.iter().position(|r| r.mid == pid) {
+                    let r = running.remove(idx);
+                    eprintln!(
+                        "[guest-agent] 服務 `{}` 被訊號 {sig:?} 終止（fail_fast）",
+                        r.name
+                    );
+                    return Some(128 + sig as i32);
+                }
+            }
+            // 尚無已結束子行程，或無可回收 → 結束本輪非阻塞回收。
+            Ok(_) => return None,
+            Err(Errno::EINTR) => continue,
+            Err(_) => return None,
+        }
+    }
+}
+
+/// 分段睡眠 `total`，期間若收到 SHUTDOWN 則提早返回（讓 await_healthy 迴圈儘快響應）。
+fn sleep_interruptible(total: Duration) {
+    let step = Duration::from_millis(50);
+    let mut slept = Duration::ZERO;
+    while slept < total {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            return;
+        }
+        let d = step.min(total - slept);
+        std::thread::sleep(d);
+        slept += d;
+    }
 }
 
 /// 等待子行程結束；任一非零 → fail_fast 終止其餘並回傳該 code。

@@ -101,7 +101,14 @@ bundle/
       "ports": [ { "host": 5432, "guest": 5432, "proto": "tcp" } ],
       "mounts": [ { "host": "C:/data", "guest": "/mnt/data", "read_only": false } ],
       "interface_mode": "none",
-      "depends_on": []
+      "depends_on": [],
+      "healthcheck": {
+        "test": { "argv": ["redis-cli", "ping"] },
+        "interval_ms": 2000,
+        "timeout_ms": 5000,
+        "retries": 10,
+        "start_period_ms": 0
+      }
     }
   ]
 }
@@ -169,6 +176,7 @@ bundle/
   - mounts：可被 `MountSpec::parse` 接受。
   - `persist_path` 必須以 `/` 開頭。
   - `depends_on`：必須指向存在的 service；不得有循環；不得指向自己。
+  - `healthcheck`（選填，見「健康檢查」節）：有則 `test` 非空；`interval`/`timeout` 須能解析且 > 0；`retries` ≥ 1；`start_period` 能解析且 ≥ 0。`test` 接受字串或字串陣列（`CMD`/`CMD-SHELL` 前綴比照 Docker）。
   - env key：`[A-Za-z_][A-Za-z0-9_]*`。
   - `image.source` 支援 `tar`（本機 docker save / OCI archive）與 `image`（建置時從 registry 拉取）；`dockerfile` 仍回報「尚未支援」。`source: image` 的 `file` 是 registry reference，**必須釘版**：明確且非 `latest` 的 tag，或 `@<algo>:<hex>` digest（`check_image_reference`）；未標記/`latest` 一律拒絕（可重現性）。
 - **簡寫 `image: <字串>` 的判別（`appcipe-normalize::looks_like_image_ref`）**：非路徑徵兆（不以 `.`/`/`/`\`/`~` 開頭、非 Windows 磁碟代號、非 `.tar`/`.tgz`/`.tar.gz`、且檔案不存在）且帶 `@digest` 或「最後一段含 `:tag`」→ 轉成 `source: image`（compose 風格）；否則維持 tar 路徑。tag 合法性仍由 `validate()` 把關。
@@ -283,6 +291,7 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
   - 依 `topo_sort` 順序啟動（v1：先後順序即依賴語意，無健康檢查；文件註明）。
   - 每個服務：依執行身分決定 namespace——**以真實 root 執行（WSL2 distro、macOS VM、或原生 Linux 以 root 執行）時 `unshare(mount+pid)`、不開 user namespace**，服務直接以 root 跑，容器 entrypoint 的 `chown`/`gosu`/`setuid` 到服務專用 uid（官方 redis/postgres 的 999…）可直接成功；**非 root（原生 Linux rootless）才 `unshare(user+mount+pid)` 並寫單一 uid 映射**（`0 <uid> 1`，因核心規定 unshare 後自寫 uid_map 只能映射單一 id；範圍映射需由仍持 CAP_SETUID 的 parent 代寫，故 rootless 下 chown 到其他 uid 的映像受限，屬 rootless 固有限制）→ 掛 `/proc` → bind `/dev/{null,zero,random,urandom,tty}`、`/dev/pts`、`/dev/shm`(tmpfs) → bind persist（`<data_dir>/data/<svc>` ↔ persist_path，host 端先 `create_dir_all`）→ bind mounts（host 路徑不存在→啟動前報錯）→ interface_mode 含 gui 時 bind `/tmp/.X11-unix` 與 `$XDG_RUNTIME_DIR/wayland-*` socket（存在且為 socket 才掛；WSLg 內若未提供 `XDG_RUNTIME_DIR` 但 `/mnt/wslg/runtime-dir` 存在，則以該目錄作為 Wayland fallback）並傳遞 `DISPLAY`/`XDG_RUNTIME_DIR`/`WAYLAND_DISPLAY`（`WAYLAND_DISPLAY` 僅沿用實際已掛 socket，否則取排序後第一個）→ `pivot_root` → `chdir(workdir)` → env 合併（§3）→ exec 有效命令。
   - 網路（v1 預設 = `shared`）：**不** unshare netns（共享網路 → ports 直接生效，WSL2 下 TCP 由 localhost forwarding 對外、UDP 由 `--udp-bridge` 起的 VM 內橋接 + host 端 relay 對外）。**已知缺口**：未宣告的 port 仍可從 host 連到（共用 netns + WSL2 wslrelay 鏡射）。真正隔離見下方「網路隔離」設計。
+  - **depends_on 健康檢查（wait-until-ready）**：服務可選 `healthcheck`（見「健康檢查」節）。啟動採**拓撲序、序列化**：spawn 一個服務後，若它有 `healthcheck` 就**輪詢到 healthy 才 spawn 下一個**；無 healthcheck 的服務 spawn 即視為 ready（沿用 v1 行為）。因 `depends_on` 驅動拓撲序，被依賴者必在依賴者之前 ready，故 `depends_on: [db]` 等同「等 db ready」（db 有 healthcheck=等 healthy；否則=等 spawn）。輪詢期間同時偵測該服務崩潰與 SHUTDOWN。**fail_fast**：healthcheck 在 `retries` 次內（扣除 `start_period` 寬限）未成功 → 視為 unhealthy → terminate_all 並回非零碼。（MVP 序列化啟動：一個 healthcheck 會擋住其後所有服務，含不相依者；之後可改成只擋實際 dependents 的並行版。）
   - 監控（fail_fast + 介面服務生命週期）：
     - 任一服務 exit ≠ 0 → 終止其餘全部（SIGTERM → 等 5s → SIGKILL，對中繼 pgid 與 pid-ns init 雙送）→ 回傳該 exit code。
     - **介面服務（interface_mode 含 gui/terminal/both）即使 exit 0 也視為「整個 app 結束」**（使用者關掉視窗/終端 = app 該收掉）→ 終止其餘、回 0。否則 GUI app 關窗後背景服務（如 db）會殘留、佔住埠、無法重啟。
@@ -314,6 +323,36 @@ AppCipe 新增 app 級欄位 **`network`**（appcipe-spec enum，serde rename �
 > **inbound relay 的 fd 來源（重要實作細節）**:rootless 下 supervisor 在 init user ns、無 `CAP_SYS_ADMIN`，**不能** `setns(NEWNET)` 進 app netns（且執行緒不能 `setns(NEWUSER)`）。故由**已在 netns+userns 內為 root 的 holder 行程當 socket factory**:supervisor 經 SEQPACKET socketpair 送 `(proto,port)`，holder 在 netns 內建立連到 `127.0.0.1:guest` 的 socket，以 **SCM_RIGHTS** 傳回 fd，bidir 搬運留在 parent netns。holder 建 netns 時須**先單獨 `unshare(NEWUSER)`、在 unshare 前先取得真實 uid/gid 寫單行 map**（unshare 後 `getuid()` 會回 overflow id），再 `unshare(NEWNET)`。
 >
 > **bridge 出網（pasta）與 root 後端**:`pasta` 是 rootless-only——以 root 執行會自我停用、降權到 nobody 後又開不了 root 擁有的 ns。故 holder 與 pasta **一律以非特權 uid 執行**（rootless=呼叫者；WSL2 / VM / native-root 後端=**nobody**），netns 由該非特權 user ns 擁有，pasta 以 `--userns` 進入。root 後端 holder 降權時須在 `setuid` 後 `prctl(PR_SET_DUMPABLE,1)`，否則 `/proc/self/{setgroups,uid_map}` 變 root 擁有而寫不了。服務不受影響:root 後端服務仍以**真實 root** 只 `setns` 進 netns（不加入該 user ns）→ chown/gosu 照常。pasta 另須 `-t none -u none -T none -U none` 關閉預設的雙向 port 轉發（否則會在 netns 內搶占服務要綁的 port）。已於原生 Linux（CI）與實機 WSL2 驗證 `internal` 隔離與 `bridge` 出網。
+
+### 健康檢查（depends_on wait-until-ready）— 設計
+
+服務可選 app 內欄位 **`healthcheck`**（appcipe-spec；寫進 manifest 的 `ServiceEntry.healthcheck`），對齊 Docker `HEALTHCHECK` 語意：
+
+```yaml
+services:
+  db:
+    image: redis:7.2-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]   # 或 ["CMD-SHELL", "..."]，或字串（= sh -c）
+      interval: 2s        # 兩次檢查間隔（預設 2s）
+      timeout: 5s         # 單次檢查逾時（預設 5s）
+      retries: 10         # 連續失敗幾次才算 unhealthy（預設 10）
+      start_period: 0s    # 寬限期：期間的失敗不計入 retries（預設 0s）
+  app:
+    image: ./app.tar
+    depends_on: [db]      # db 有 healthcheck → 等 db healthy 才啟動 app
+```
+
+- **`test` 形式**（對齊 Docker）：字串 → `["/bin/sh","-c",s]`；`["CMD", argv…]` → 直接 argv；`["CMD-SHELL", s]` → `sh -c s`。正規化後存成 manifest 的 `CmdSpec`（`shell`/`argv`），duration 解析成毫秒（`interval_ms`/`timeout_ms`/`start_period_ms`）。
+- **time 解析**：接受 `<n>(ms|s|m)` 或裸整數（= 秒）。
+- **驗證**（appcipe-spec）：有 `healthcheck` 時 `test` 非空；`interval`/`timeout` > 0；`retries` ≥ 1；`start_period` ≥ 0。
+
+**在容器內執行 test（nsenter + chroot）**：supervisor 已追蹤每個服務的 pid-ns init host pid（`init_pid`）。健康檢查 fork 一個子行程，**進入該服務的 namespaces 後 exec test**：
+1. fork 前先開好 `/proc/<init>/ns/{user(僅 rootless),net,pid}` 與 `/proc/<init>/root` 的 fd。
+2. 子行程：`setns(user)`（rootless 先做以取得該 userns 內 root 與 caps）→ `setns(net)`（與服務同網路，能連 `127.0.0.1:<port>`）→ `setns(pid)`（CLONE_NEWPID 只影響其後 fork）→ **再 fork** 使孫行程成為該 pid-ns 成員 → `fchdir(root_fd); chroot("."); chdir("/")`（容器 rootfs 成為 `/`，故 test 命令在映像內解析）→ exec test argv。
+3. 父端對檢查行程套 `timeout` 上限（逾時 SIGKILL）；exit 0 = healthy，否則該次失敗。
+
+進不去 namespace、開不了 fd 等屬基礎建設錯誤 → 直接 fail（非「檢查失敗」）。root 後端服務無獨立 user ns（`setns(user)` 略過）；rootless 與 root 路徑共用同一 runner。
 
 ### 主控台顯示（app 級 `console`）— 設計
 

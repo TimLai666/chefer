@@ -55,6 +55,14 @@ services:
                                                    #   同一 app 內 host 埠不得重複
                                                    #   注意：Windows 上 UDP 映射目前不生效（WSL2 localhost 轉送限制）
 
+    # --- 健康檢查（選填；驅動 depends_on 的 wait-until-ready，語意對齊 Docker HEALTHCHECK） ---
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"] # 命令陣列（CMD=直接 argv；CMD-SHELL=sh -c）或字串（= sh -c）；exit 0 = 健康
+      interval: 2s                                  # 選填：兩次檢查間隔（預設 2s）。接受 <n>ms/<n>s/<n>m 或裸整數秒
+      timeout: 5s                                   # 選填：單次檢查逾時（預設 5s）
+      retries: 10                                   # 選填：連續失敗幾次才算 unhealthy → fail_fast（預設 10）
+      start_period: 0s                              # 選填：寬限期，期間失敗不計入 retries（預設 0s）
+
     # --- 終端/GUI ---
     interface_mode: none                           # 選填：gui | terminal | both | none（預設 none）
 
@@ -100,8 +108,9 @@ services:
       - ui
 
 # === 行為備註 ===
-# 1) 啟動單檔 → 依 depends_on 順序一次性拉起所有 services（僅決定先後順序，無健康檢查）；
-#    任一服務異常退出（exit code ≠ 0）→ 依 crash 策略（fail_fast：終止其餘服務並以該 code 整體退出）
+# 1) 啟動單檔 → 依 depends_on 拓撲順序拉起 services。若某服務有 healthcheck，會等它 healthy
+#    才啟動下一個（即 depends_on 的 wait-until-ready）；沒 healthcheck 的服務 spawn 即視為就緒。
+#    任一服務異常退出（exit code ≠ 0）或 healthcheck 重試用盡 → fail_fast（終止其餘服務並整體退出）
 # 2) 所有服務正常結束（exit code 0）→ 整體以 0 退出；Ctrl-C / 關閉終端 → 終止全部服務後退出
 # 3) 持久化資料夾實際位置：
 #    {data_dir 或系統預設（含 {name}）}/data/{service_name}/...

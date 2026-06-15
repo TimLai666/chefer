@@ -70,6 +70,21 @@ pub struct ServiceEntry {
     pub interface_mode: InterfaceMode,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// 選填健康檢查；驅動 depends_on 的 wait-until-ready（見 docs/DESIGN.md「健康檢查」）。
+    #[serde(default)]
+    pub healthcheck: Option<HealthCheck>,
+}
+
+/// 服務健康檢查（runtime 端解讀）。duration 一律已正規化為毫秒。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthCheck {
+    /// 檢查命令：`shell` → `/bin/sh -c <s>`；`argv` → 直接 exec。
+    pub test: CmdSpec,
+    pub interval_ms: u64,
+    pub timeout_ms: u64,
+    pub retries: u32,
+    #[serde(default)]
+    pub start_period_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,6 +273,7 @@ mod tests {
             mounts: vec![],
             interface_mode: InterfaceMode::None,
             depends_on: vec![],
+            healthcheck: None,
         }
     }
 

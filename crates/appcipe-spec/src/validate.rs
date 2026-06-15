@@ -150,6 +150,35 @@ impl AppCipe {
                 }
             }
 
+            // --- healthcheck ---
+            if let Some(hc) = &svc.healthcheck {
+                if hc.test.to_cmd().is_none() {
+                    errs.push(format!(
+                        "service `{name}` 的 healthcheck.test 不可為空（請給命令字串或 [\"CMD\", ...]/[\"CMD-SHELL\", \"...\"]）"
+                    ));
+                }
+                match hc.interval() {
+                    Ok(d) if d.is_zero() => {
+                        errs.push(format!("service `{name}` 的 healthcheck.interval 必須 > 0"));
+                    }
+                    Err(e) => errs.push(format!("service `{name}` 的 healthcheck.interval {e}")),
+                    _ => {}
+                }
+                match hc.timeout() {
+                    Ok(d) if d.is_zero() => {
+                        errs.push(format!("service `{name}` 的 healthcheck.timeout 必須 > 0"));
+                    }
+                    Err(e) => errs.push(format!("service `{name}` 的 healthcheck.timeout {e}")),
+                    _ => {}
+                }
+                if let Err(e) = hc.start_period() {
+                    errs.push(format!("service `{name}` 的 healthcheck.start_period {e}"));
+                }
+                if hc.retries == Some(0) {
+                    errs.push(format!("service `{name}` 的 healthcheck.retries 必須 >= 1"));
+                }
+            }
+
             // --- interface_mode 統計 ---
             if matches!(
                 svc.interface_mode,
@@ -843,6 +872,78 @@ services:
             "version: \"0.1\"\nname: App\nnetwork: wormhole\nservices:\n  db: { image: ./db.tar }\n",
         );
         assert!(bad.is_err(), "未知 network 模式應解析失敗");
+    }
+
+    // ---------- healthcheck ----------
+
+    #[test]
+    fn parse_duration_forms() {
+        use crate::parse_duration;
+        use std::time::Duration;
+        assert_eq!(parse_duration("2s").unwrap(), Duration::from_secs(2));
+        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_duration("1m").unwrap(), Duration::from_secs(60));
+        assert_eq!(parse_duration("3").unwrap(), Duration::from_secs(3));
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("abc").is_err());
+        assert!(parse_duration("2x").is_err());
+    }
+
+    #[test]
+    fn health_test_normalizes_docker_forms() {
+        use crate::{HealthTest, TestCmd};
+        assert_eq!(
+            HealthTest::Shell("redis-cli ping".into()).to_cmd(),
+            Some(TestCmd::Shell("redis-cli ping".into()))
+        );
+        assert_eq!(
+            HealthTest::Args(vec!["CMD".into(), "pg_isready".into()]).to_cmd(),
+            Some(TestCmd::Argv(vec!["pg_isready".into()]))
+        );
+        assert_eq!(
+            HealthTest::Args(vec!["CMD-SHELL".into(), "redis-cli ping".into()]).to_cmd(),
+            Some(TestCmd::Shell("redis-cli ping".into()))
+        );
+        // 無前綴 → 整段 argv
+        assert_eq!(
+            HealthTest::Args(vec!["true".into()]).to_cmd(),
+            Some(TestCmd::Argv(vec!["true".into()]))
+        );
+        // 空 / NONE → None
+        assert_eq!(HealthTest::Args(vec!["NONE".into()]).to_cmd(), None);
+        assert_eq!(HealthTest::Args(vec![]).to_cmd(), None);
+        assert_eq!(HealthTest::Shell("  ".into()).to_cmd(), None);
+    }
+
+    #[test]
+    fn healthcheck_valid_passes() {
+        let app = parse_raw(
+            "version: \"0.1\"\nname: App\nservices:\n  db:\n    image: ./db.tar\n    healthcheck:\n      test: [\"CMD\", \"redis-cli\", \"ping\"]\n      interval: 2s\n      timeout: 5s\n      retries: 5\n",
+        );
+        assert!(app.validate().is_ok(), "{:?}", app.validate());
+    }
+
+    #[test]
+    fn healthcheck_rejects_empty_test_and_bad_fields() {
+        let e = validate_err(
+            "version: \"0.1\"\nname: App\nservices:\n  db:\n    image: ./db.tar\n    healthcheck:\n      test: [\"NONE\"]\n",
+        );
+        assert!(e.contains("healthcheck.test"), "{e}");
+
+        let e = validate_err(
+            "version: \"0.1\"\nname: App\nservices:\n  db:\n    image: ./db.tar\n    healthcheck:\n      test: \"x\"\n      interval: 0s\n",
+        );
+        assert!(e.contains("healthcheck.interval"), "{e}");
+
+        let e = validate_err(
+            "version: \"0.1\"\nname: App\nservices:\n  db:\n    image: ./db.tar\n    healthcheck:\n      test: \"x\"\n      retries: 0\n",
+        );
+        assert!(e.contains("healthcheck.retries"), "{e}");
+
+        let e = validate_err(
+            "version: \"0.1\"\nname: App\nservices:\n  db:\n    image: ./db.tar\n    healthcheck:\n      test: \"x\"\n      timeout: bogus\n",
+        );
+        assert!(e.contains("healthcheck.timeout"), "{e}");
     }
 
     // ---------- console ----------

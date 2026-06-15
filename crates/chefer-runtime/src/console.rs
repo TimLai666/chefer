@@ -100,6 +100,7 @@ mod tests {
                 mounts: vec![],
                 interface_mode: *m,
                 depends_on: vec![],
+                healthcheck: None,
             })
             .collect();
         Manifest {
