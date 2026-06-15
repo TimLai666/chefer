@@ -549,18 +549,22 @@ main() {
     host_port="$(pick_free_port)"
   done
 
+  # 多重 bind mount 的執行時內容：vm-data 會以 virtiofs 掛到 guest 的 /mnt/data，
+  # 故這些子目錄在 VM 內即為 /mnt/data/extra1、/mnt/data/extra2（appcipe 的 mounts host 半邊）。
+  mkdir -p "$work/vm-data/extra1" "$work/vm-data/extra2"
+  printf 'bind-one' > "$work/vm-data/extra1/file.txt"
+  printf 'bind-two' > "$work/vm-data/extra2/file.txt"
+  # chefer-pack 於 **build 機**檢查 mount host 路徑存在；但 VM 後端的 host 是 guest 路徑
+  # （/mnt/data/extra*），runner 上預設沒有 → 先建同名空目錄滿足 build 檢查（執行時實際
+  # 內容由 VM 內 /mnt/data 的 virtiofs 提供，與此 runner 端 stub 無關）。
+  sudo mkdir -p /mnt/data/extra1 /mnt/data/extra2
+
   note "建置含內嵌 guest-agent 的 QemuE2E bundle"
   write_appcipe "$work/app/appcipe.yml" "QemuE2E" "$work/data" "$image_tar" "$host_port" "$guest_port" "$image_platform"
   "$cli" build "$work/app/appcipe.yml" --out "$work/out" --kit-dir "$kit" --target "$host_target"
   local bundle="$work/out/QemuE2E/bundle"
   [[ -d "$bundle" ]] || die "找不到已建置 bundle：$bundle"
   [[ -f "$bundle/agents/guest-agent-$arch" ]] || die "bundle 未內嵌 guest-agent-$arch"
-
-  # 多重 bind mount 的 host 來源：vm-data 會以 virtiofs 掛到 guest 的 /mnt/data，
-  # 故這些子目錄在 VM 內即為 /mnt/data/extra1、/mnt/data/extra2（appcipe 的 mounts host 半邊）。
-  mkdir -p "$work/vm-data/extra1" "$work/vm-data/extra2"
-  printf 'bind-one' > "$work/vm-data/extra1/file.txt"
-  printf 'bind-two' > "$work/vm-data/extra2/file.txt"
 
   local first_log="$work/qemu-first.console.log"
   start_qemu "$arch" "$kernel" "$initramfs" "$bundle" "$work/vm-data" "$host_port" "$guest_port" "$first_log" "$virtiofsd" "first"
