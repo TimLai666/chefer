@@ -77,6 +77,61 @@ jobs:
           CHEFER_E2E_GUI: "1"
         run: bash scripts/linux-e2e.sh
 
+  overlay-rootfs-root-test:
+    name: overlay rootfs == merge tree, as root (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            runner: ubuntu-latest
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: overlay-root-${{ matrix.name }}
+
+      # overlay_view_matches_merge 需要 real root（mknod whiteout char dev + mount overlay），
+      # 一般 `cargo test` 以非 root 跑會自動跳過。這裡先把 lib 測試二進位「只編不跑」，
+      # 再以 sudo 單獨實跑這個測試 —— 驗證 overlay 合成的 rootfs 與既有合併路徑逐檔一致。
+      - name: Build guest-agent lib test binary
+        shell: bash
+        run: |
+          cargo test -p guest-agent --lib --no-run --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .profile.test == true and (.target.kind | index("lib"))) | .executable' \
+            | grep . > test-binaries.txt
+          cat test-binaries.txt
+
+      - name: Run overlay-vs-merge test as root
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$(mktemp)"
+          while IFS= read -r bin; do
+            echo "== running overlay test in: $bin =="
+            # --exact + 完整測試路徑；--nocapture 讓跳過/差異/成功標記可見。
+            sudo "$bin" --exact --nocapture \
+              rootfs::linux_tests::overlay_view_matches_merge 2>&1 | tee -a "$out"
+          done < test-binaries.txt
+          # 防假陽性：root 下必須實跑（出現 OK 標記），且不得靜默跳過。
+          if grep -q "skip overlay_view_matches_merge" "$out"; then
+            echo "::error::overlay test skipped under root — overlay unsupported on this runner; cannot claim verification"
+            exit 1
+          fi
+          if ! grep -q "overlay_view_matches_merge: OK" "$out"; then
+            echo "::error::overlay test did not emit its success marker — it may not have run"
+            exit 1
+          fi
+
   qemu-appliance-e2e:
     name: appliance QEMU E2E (${{ matrix.name }})
     runs-on: ${{ matrix.runner }}

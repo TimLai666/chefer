@@ -126,6 +126,14 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self.send_text(404, "missing\n")
             return
+        if parsed.path == "/mount":
+            # 讀回多個 bind mount 的內容，驗證 overlay rootfs 之上的 bind 確實生效。
+            parts = []
+            for p in ("/extra1/file.txt", "/extra2/file.txt"):
+                fp = Path(p)
+                parts.append(fp.read_text(encoding="utf-8") if fp.exists() else "MISSING")
+            self.send_text(200, "|".join(parts) + "\n")
+            return
         if parsed.path == "/shutdown":
             self.send_text(200, "bye\n")
             threading.Thread(target=self.server.shutdown, daemon=True).start()
@@ -168,6 +176,12 @@ services:
     env:
       PORT: "${guest_port}"
     persist_path: /data
+    # 多重 bind mount（疊在 overlay rootfs 之上）。host 端用 /mnt/data/extra*：
+    # 那是 VM 內的 virtiofs data 掛載（runner 端 vm-data 下預先建好），故 guest-agent
+    # 啟動前的 host 路徑存在檢查能通過。驗 overlay root 上的多 mount 確實生效。
+    mounts:
+      - "/mnt/data/extra1:/extra1"
+      - "/mnt/data/extra2:/extra2"
     ports: ["${host_port}:${guest_port}"]
     interface_mode: none
 YAML
@@ -542,6 +556,12 @@ main() {
   [[ -d "$bundle" ]] || die "找不到已建置 bundle：$bundle"
   [[ -f "$bundle/agents/guest-agent-$arch" ]] || die "bundle 未內嵌 guest-agent-$arch"
 
+  # 多重 bind mount 的 host 來源：vm-data 會以 virtiofs 掛到 guest 的 /mnt/data，
+  # 故這些子目錄在 VM 內即為 /mnt/data/extra1、/mnt/data/extra2（appcipe 的 mounts host 半邊）。
+  mkdir -p "$work/vm-data/extra1" "$work/vm-data/extra2"
+  printf 'bind-one' > "$work/vm-data/extra1/file.txt"
+  printf 'bind-two' > "$work/vm-data/extra2/file.txt"
+
   local first_log="$work/qemu-first.console.log"
   start_qemu "$arch" "$kernel" "$initramfs" "$bundle" "$work/vm-data" "$host_port" "$guest_port" "$first_log" "$virtiofsd" "first"
   wait_for_http "http://127.0.0.1:${host_port}/health" "$QEMU_PID" "$first_log"
@@ -549,6 +569,12 @@ main() {
   ns_json="$(curl -fsS "http://127.0.0.1:${host_port}/ns")"
   echo "namespace 證據：${ns_json}" >&2
   assert_namespace_evidence "$ns_json"
+  # 多重 bind mount 疊在 overlay rootfs 之上應如實可讀。
+  local mounts_out
+  mounts_out="$(curl -fsS "http://127.0.0.1:${host_port}/mount")"
+  [[ "$mounts_out" == "bind-one|bind-two" ]] \
+    || die "multi bind-mount atop the overlay rootfs failed: expected 'bind-one|bind-two', got '${mounts_out}'"
+  note "multi bind-mount atop overlay verified: ${mounts_out}"
   curl -fsS "http://127.0.0.1:${host_port}/write?value=qemu-first-run" >/dev/null
   curl -fsS "http://127.0.0.1:${host_port}/shutdown" >/dev/null || true
   wait_qemu_exit_code 0 "$first_log" "first run"
@@ -577,7 +603,7 @@ main() {
 
   docker image rm "$image" >/dev/null 2>&1 || true
   CLEANUP_IMAGE=""
-  note "QEMU E2E 通過：appliance 開機、virtiofs bundle/data、guest-agent namespaces、persist、fail_fast、host!=guest TCP forwarding"
+  note "QEMU E2E 通過：appliance 開機、virtiofs bundle/data、guest-agent namespaces、overlay rootfs、persist（單 mount）、多重 bind mount（疊在 overlay 上）、fail_fast（無 mount）、host!=guest TCP forwarding"
 }
 
 main "$@"
