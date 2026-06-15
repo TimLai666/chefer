@@ -1,6 +1,6 @@
 //! appcipe 型別 → chefer_bundle manifest 型別的轉換。
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use appcipe_spec::{Cmd, ImagePlatform, ImageSourceOrPath, ImageSourceType, Service};
 use chefer_bundle::{CmdSpec, ImageConfig};
 
@@ -19,25 +19,38 @@ pub(crate) fn platform_of(svc: &Service) -> String {
     }
 }
 
-/// service 的 image 來源：本機 tar 檔，或 registry reference。
+/// service 的 image 來源：本機 tar、registry reference、或 Dockerfile（打包時建置）。
 pub(crate) enum ImageSrc<'a> {
     /// 本機 image tar 檔路徑（docker-archive / oci-archive）。
     Tar(&'a str),
     /// registry reference（如 `redis:7.2-alpine` / `ghcr.io/o/i@sha256:…`）。
     Registry(&'a str),
+    /// Dockerfile：打包機上以既有 builder 建置成 tar 後，併入 tar 路徑。
+    Dockerfile {
+        dockerfile: &'a str,
+        context: Option<&'a str>,
+        build_args: &'a std::collections::HashMap<String, String>,
+    },
 }
 
-/// 判別 service 的 image 來源（tar 路徑或 registry ref）。dockerfile 尚未支援。
-pub(crate) fn image_src<'a>(name: &str, svc: &'a Service) -> Result<ImageSrc<'a>> {
+/// 判別 service 的 image 來源。
+pub(crate) fn image_src<'a>(_name: &str, svc: &'a Service) -> Result<ImageSrc<'a>> {
     match &svc.image {
         ImageSourceOrPath::TarPath(p) => Ok(ImageSrc::Tar(p)),
-        ImageSourceOrPath::Full { source, file, .. } => match source {
+        ImageSourceOrPath::Full {
+            source,
+            file,
+            context,
+            build_args,
+            ..
+        } => match source {
             ImageSourceType::Tar => Ok(ImageSrc::Tar(file)),
             ImageSourceType::Image => Ok(ImageSrc::Registry(file)),
-            ImageSourceType::Dockerfile => bail!(
-                "service `{name}`：image.source=dockerfile 尚未支援；\
-                 請先以 `docker build` + `docker save -o <file>` 匯出 tar 後改用 source=tar"
-            ),
+            ImageSourceType::Dockerfile => Ok(ImageSrc::Dockerfile {
+                dockerfile: file,
+                context: context.as_deref(),
+                build_args,
+            }),
         },
     }
 }

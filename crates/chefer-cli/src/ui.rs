@@ -193,7 +193,7 @@ pub fn render_summary_table(app: &appcipe_spec::AppCipe) {
 
 /// Image 欄顯示：以檔案路徑為主體；
 /// 非預設 format 附註 `(docker-archive|oci-archive)`、非預設 platform 附註 `[linux/arm64]`，
-/// 非 tar 來源（dockerfile/image，目前驗證不允許，僅防禦性顯示）加上 `source:` 前綴。
+/// 非 tar 來源（dockerfile/image）加上 `source:` 前綴顯示。
 pub fn image_display(image: &appcipe_spec::ImageSourceOrPath) -> String {
     match image {
         appcipe_spec::ImageSourceOrPath::TarPath(p) => p.clone(),
@@ -202,6 +202,7 @@ pub fn image_display(image: &appcipe_spec::ImageSourceOrPath) -> String {
             file,
             format,
             platform,
+            ..
         } => {
             let mut s = match source {
                 appcipe_spec::ImageSourceType::Tar => file.clone(),
@@ -250,6 +251,8 @@ mod tests {
             file: "./db.tar".into(),
             format: ImageFormat::OciArchive,
             platform: ImagePlatform::LinuxArm64,
+            context: None,
+            build_args: Default::default(),
         };
         assert_eq!(image_display(&full), "./db.tar (oci-archive) [linux/arm64]");
 
@@ -258,6 +261,8 @@ mod tests {
             file: "./db.tar".into(),
             format: ImageFormat::Auto,
             platform: ImagePlatform::LinuxAmd64,
+            context: None,
+            build_args: Default::default(),
         };
         assert_eq!(image_display(&plain), "./db.tar");
     }

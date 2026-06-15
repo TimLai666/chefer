@@ -322,6 +322,8 @@ fn pack_oci_nested_index_and_platform_selection() {
         file: image_tar.to_string_lossy().to_string(),
         format: ImageFormat::Auto,
         platform: ImagePlatform::LinuxArm64,
+        context: None,
+        build_args: Default::default(),
     });
     let app = make_app("MultiArch", vec![("db", svc)]);
     let out = tmp.path().join("out");
@@ -484,6 +486,8 @@ fn pack_copies_macos_appliance_from_kit_when_targeting_darwin() {
         file: image_tar.to_string_lossy().to_string(),
         format: ImageFormat::DockerArchive,
         platform: ImagePlatform::LinuxArm64,
+        context: None,
+        build_args: Default::default(),
     });
     let app = make_app("MacApplianceApp", vec![("web", svc)]);
     let out = tmp.path().join("out");
@@ -518,6 +522,8 @@ fn pack_skips_missing_macos_appliance_without_failing() {
         file: image_tar.to_string_lossy().to_string(),
         format: ImageFormat::DockerArchive,
         platform: ImagePlatform::LinuxArm64,
+        context: None,
+        build_args: Default::default(),
     });
     let app = make_app("MissingMacApplianceApp", vec![("web", svc)]);
     let out = tmp.path().join("out");

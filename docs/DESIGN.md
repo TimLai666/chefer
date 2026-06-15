@@ -193,9 +193,10 @@ bundle/
 - `pub struct PackResult { pub bundle_dir: PathBuf, pub manifest: chefer_bundle::Manifest }`
 - `pub fn pack(app: &AppCipe, opts: &PackOptions) -> anyhow::Result<PackResult>`
 - 行為：
-  0. 取得每個 service 的 image，收斂成同一個 `ResolvedImage`（config + 各層 blob 檔），來源二擇一：
+  0. 取得每個 service 的 image，收斂成同一個 `ResolvedImage`（config + 各層 blob 檔），來源三擇一：
      - **`source: tar`**：image tar 先安全解壓到暫存目錄再解析（OCI blobs 需隨機存取）。
      - **`source: image`**：以 `oci-client`（rustls）依 `platform` 從 registry 拉 manifest+config+layers（`chefer-pack::registry`，pack 同步流程內 `block_on` 一個 tokio runtime；匿名，僅公開 image），layer blob 寫進暫存目錄。之後與 tar 共用同一條 repack。各層 blob 的解壓/雜湊/重壓全程串流。
+     - **`source: dockerfile`**：在**打包機**上以既有的 container builder 建置（見下方「Dockerfile build」），`save` 成 docker-archive tar 後，**完全併入 `source: tar` 的解析路徑**。
   1. `source: tar` 時**自動偵測格式**（看內容不看副檔名）：
      - docker-archive：根目錄有 `manifest.json`（JSON 陣列，元素含 `Config`/`Layers`）。
      - oci-archive：根目錄有 `index.json` + `blobs/`（layout 可含 `oci-layout`）。
@@ -323,6 +324,33 @@ AppCipe 新增 app 級欄位 **`network`**（appcipe-spec enum，serde rename �
 > **inbound relay 的 fd 來源（重要實作細節）**:rootless 下 supervisor 在 init user ns、無 `CAP_SYS_ADMIN`，**不能** `setns(NEWNET)` 進 app netns（且執行緒不能 `setns(NEWUSER)`）。故由**已在 netns+userns 內為 root 的 holder 行程當 socket factory**:supervisor 經 SEQPACKET socketpair 送 `(proto,port)`，holder 在 netns 內建立連到 `127.0.0.1:guest` 的 socket，以 **SCM_RIGHTS** 傳回 fd，bidir 搬運留在 parent netns。holder 建 netns 時須**先單獨 `unshare(NEWUSER)`、在 unshare 前先取得真實 uid/gid 寫單行 map**（unshare 後 `getuid()` 會回 overflow id），再 `unshare(NEWNET)`。
 >
 > **bridge 出網（pasta）與 root 後端**:`pasta` 是 rootless-only——以 root 執行會自我停用、降權到 nobody 後又開不了 root 擁有的 ns。故 holder 與 pasta **一律以非特權 uid 執行**（rootless=呼叫者；WSL2 / VM / native-root 後端=**nobody**），netns 由該非特權 user ns 擁有，pasta 以 `--userns` 進入。root 後端 holder 降權時須在 `setuid` 後 `prctl(PR_SET_DUMPABLE,1)`，否則 `/proc/self/{setgroups,uid_map}` 變 root 擁有而寫不了。服務不受影響:root 後端服務仍以**真實 root** 只 `setns` 進 netns（不加入該 user ns）→ chown/gosu 照常。pasta 另須 `-t none -u none -T none -U none` 關閉預設的雙向 port 轉發（否則會在 netns 內搶占服務要綁的 port）。已於原生 Linux（CI）與實機 WSL2 驗證 `internal` 隔離與 `bridge` 出網。
+
+### Dockerfile build（`source: dockerfile`）— 設計
+
+讓使用者直接給 Dockerfile，由 `chefer build` 代為建置成 image，省掉手動 `docker build` + `docker save`。
+
+```yaml
+services:
+  app:
+    image:
+      source: dockerfile
+      file: ./Dockerfile          # Dockerfile 路徑（normalize 絕對化）
+      context: .                  # 選填：build context 目錄；省略 → Dockerfile 所在目錄（normalize 絕對化）
+      platform: linux/amd64       # 選填：傳給 builder 的 --platform
+      build_args:                 # 選填：KEY: VALUE → --build-arg
+        VERSION: "1.2.3"
+```
+
+**做法（chefer-pack `dockerfile` 模組）**：chefer 本身不建 image——在**打包機**上偵測並呼叫既有的 container builder：
+1. **偵測 builder**：依序試 `docker` → `podman` → `nerdctl`（首個可執行者；以 `--version` 探測）。三者的 `build`/`save` CLI 相容。找不到任何一個 → 可行動錯誤：「`source: dockerfile` 需要打包機上有 container builder（docker/podman/nerdctl），但 PATH 上找不到；請安裝其一，或先自行 build 後改用 `source: tar` / `source: image`」。
+2. **build**：`<tool> build --platform <platform> [--build-arg K=V …] -f <dockerfile> -t <暫時 tag> <context>`，stdio 直通讓使用者看到建置過程；非零 → 透傳 builder 錯誤。
+3. **save**：`<tool> save -o <tmp>/image.tar <暫時 tag>`（docker-archive）。
+4. **接既有路徑**：把該 tar 當 `source: tar` 解析（`archive::extract_tar_to_dir` + `image::resolve_image`）→ 共用 repack。
+5. best-effort `<tool> image rm <暫時 tag>` 清掉暫時 image。
+
+**權衡（明示）**：`source: dockerfile` **不保證可重現**（Dockerfile 內 `apt`/`pip` 等每次拉到的版本可能不同；對齊 Docker 的本質）。要可重現請用 `source: image` 釘 digest。`--platform` 跨架構需 builder 端的 emulation（buildx/qemu binfmt）；建原生架構則免。執行期一如往常**不需** Docker——builder 只在打包時用到（與 `source: tar` 需要你先 `docker save` 的前提一致）。
+
+**驗證**：`appcipe-spec` 接受 `source: dockerfile`（檢查 `file` 非空）；不適用 `check_image_reference`（那是 registry ref 專用）。
 
 ### 健康檢查（depends_on wait-until-ready）— 設計
 

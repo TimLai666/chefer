@@ -54,16 +54,17 @@ services:
 
 service 名規則：`[a-z][a-z0-9_]*`，≤32。
 
-- **`image`**（必填）。兩種寫法：
-  - 短寫：`image: ./x.tar`（＝source tar、format auto、platform linux/amd64）。
-  - 完整：
+- **`image`**（必填）。寫法：
+  - 短寫：`image: ./x.tar`（tar 路徑）或 `image: redis:7.2-alpine`（registry ref，自動判別）。
+  - 完整（`source` 三選一）：
     ```yaml
     image:
-      source: tar                 # 目前**只支援 tar**（dockerfile/image 會被拒）
-      file: ./images/x.tar
-      format: docker-archive      # auto | docker-archive | oci-archive（**用連字號**，非底線）
+      source: tar                 # tar | image | dockerfile
+      file: ./images/x.tar        # tar=tar 路徑；image=registry ref（須釘版、非 latest）；dockerfile=Dockerfile 路徑
+      format: docker-archive      # auto | docker-archive | oci-archive（**用連字號**，非底線；僅 source=tar 有意義）
       platform: linux/amd64       # linux/amd64 | linux/arm64（windows/amd64 不支援執行）
     ```
+  - `source: dockerfile` 另可加 `context:`（build context 目錄，省略 = Dockerfile 所在目錄）與 `build_args: { K: V }`。**需打包機上有 docker/podman/nerdctl**；不保證可重現（要可重現用 `source: image` 釘 `@sha256` digest）。執行期仍不需 Docker。
 - **`cmd`**：字串或陣列，覆蓋映像的 **CMD（不覆蓋 ENTRYPOINT）**。有效命令 = entrypoint + (cmd 或 image CMD)。
 - **`workdir`**：容器內工作目錄。
 - **`env`**：`key: value`；key 須符合 `[A-Za-z_][A-Za-z0-9_]*`。會覆蓋映像自帶的同名 env。

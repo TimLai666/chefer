@@ -73,7 +73,7 @@ impl AppCipe {
                 errs.push(e);
             }
 
-            // --- image.source 僅支援 tar ---
+            // --- image.source：tar / image / dockerfile ---
             match &svc.image {
                 ImageSourceOrPath::TarPath(p) => {
                     if p.trim().is_empty() {
@@ -90,10 +90,13 @@ impl AppCipe {
                             ));
                         }
                     }
-                    ImageSourceType::Dockerfile => errs.push(format!(
-                        "service `{name}`：image.source = dockerfile 尚未支援（目前僅支援 tar；\
-                         請先以 `docker build` + `docker save` 產生 tar 後改用 source: tar）"
-                    )),
+                    ImageSourceType::Dockerfile => {
+                        if file.trim().is_empty() {
+                            errs.push(format!(
+                                "service `{name}`：image.file 不可為空（請填入 Dockerfile 路徑）"
+                            ));
+                        }
+                    }
                     ImageSourceType::Image => {
                         if let Err(e) = check_image_reference(file) {
                             errs.push(format!("service `{name}` 的 image ref `{file}` 無效：{e}"));
@@ -733,8 +736,9 @@ services:
     // ---------- image.source ----------
 
     #[test]
-    fn rejects_dockerfile_source() {
-        let e = validate_err(
+    fn accepts_dockerfile_source() {
+        // source: dockerfile 現已支援（建置在打包機上進行）。
+        let app = parse_raw(
             r#"
 version: "0.1"
 name: App
@@ -745,7 +749,23 @@ services:
       file: ./Dockerfile
 "#,
         );
-        assert!(e.contains("dockerfile 尚未支援"), "{e}");
+        assert!(app.validate().is_ok(), "{:?}", app.validate());
+    }
+
+    #[test]
+    fn rejects_dockerfile_with_empty_file() {
+        let e = validate_err(
+            r#"
+version: "0.1"
+name: App
+services:
+  a:
+    image:
+      source: dockerfile
+      file: ""
+"#,
+        );
+        assert!(e.contains("image.file"), "{e}");
     }
 
     #[test]

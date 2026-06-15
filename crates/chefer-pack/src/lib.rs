@@ -11,6 +11,7 @@
 
 mod archive;
 mod convert;
+mod dockerfile;
 mod image;
 mod layers;
 mod registry;
@@ -171,6 +172,27 @@ fn pack_service(
             eprintln!("[chefer] 從 registry 拉取 image：{reference}（{platform}）…");
             registry::pull_image(reference, &platform, tmp.path())
                 .with_context(|| format!("從 registry 拉取 image `{reference}` 失敗"))?
+        }
+        convert::ImageSrc::Dockerfile {
+            dockerfile,
+            context,
+            build_args,
+        } => {
+            // 在打包機上以既有 builder 建置成 docker-archive tar，再併入與 tar 相同的解析路徑。
+            let tar = dockerfile::build_image_tar(
+                name,
+                dockerfile,
+                context,
+                build_args,
+                &platform,
+                tmp.path(),
+            )?;
+            let extract = tmp.path().join("extract");
+            fs::create_dir_all(&extract)?;
+            archive::extract_tar_to_dir(&tar, &extract)
+                .with_context(|| format!("解開建置產生的 image tar 失敗：{}", tar.display()))?;
+            image::resolve_image(&extract, &platform)
+                .context("解析建置產生的 image archive 失敗")?
         }
     };
 
