@@ -2,17 +2,21 @@
 //!
 //! 安全規則（docs/DESIGN.md §0）：
 //! - 拒絕絕對路徑、`..`、Windows 磁碟前綴。
-//! - **直接拒絕 symlink 與 hardlink entry**。
+//! - **拒絕 symlink entry**。
+//! - **hardlink entry**：只允許目標經同樣越界檢查後落在解壓根內，並以「複製目標檔內容」
+//!   實作（不在磁碟上留下連結）。
 //!
-//! 為何拒絕而非「限制目標在根內」：純詞法的目標深度檢查可被
-//! `d -> .` 這類「深度放大器」繞過——先建一個指向自身目錄的 symlink，
-//! 再讓後續 entry 的路徑成分穿過它，落地時 `create_dir_all`/`File::create`
-//! 會跟隨磁碟上已建立的 symlink 而寫到解壓根之外（build 機任意檔案寫入）。
-//! 要正確防護需逐成分以 O_NOFOLLOW 重新解析（如 guest-agent::rootfs::secure_resolve）。
-//! 但合法的 docker-archive / oci-archive 頂層只有 manifest.json / index.json /
-//! blobs / oci-layout / repositories（皆為一般檔案與目錄），本就不含 symlink/hardlink；
-//! 層內的 symlink 位於 blob 的巢狀 tar，由容器內的 rootfs 組裝處理。
-//! 因此此處直接拒絕，攻擊面歸零且不影響任何合法輸入。
+//! 為何 symlink 一律拒絕：純詞法的目標深度檢查可被 `d -> .` 這類「深度放大器」繞過
+//! ——先建一個指向自身目錄的 symlink，再讓後續 entry 的路徑成分穿過它，落地時
+//! `create_dir_all`/`File::create` 會跟隨磁碟上已建立的 symlink 而寫到解壓根之外
+//! （build 機任意檔案寫入）。要正確防護需逐成分以 O_NOFOLLOW 重新解析。
+//!
+//! 為何 hardlink 可放行：tar 的 hardlink 指向同一 archive 內「先前的」一般檔案 entry，
+//! **不會在磁碟留下會重導後續路徑解析的連結**；我們把 linkname 當相對路徑做同樣的越界
+//! 檢查、確認目標在根內，再把目標檔內容複製過來（內容等同）。**podman / buildah 的
+//! docker-archive 會用 hardlink 去重相同的 `layer.tar`**，故不能像 symlink 一樣一律拒絕，
+//! 否則 `source: dockerfile` 用 podman 建置時會解不開。docker 的 `save` 不用 hardlink，
+//! 因此只有非-docker builder 會走到這條。
 
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
@@ -51,13 +55,42 @@ pub(crate) fn extract_tar_reader<R: Read>(reader: R, dest_root: &Path) -> Result
             EntryType::Directory => {
                 fs::create_dir_all(&dest)?;
             }
-            // symlink / hardlink：合法 image archive 頂層不含這兩種，
-            // 且純詞法目標檢查無法防 on-disk symlink 重導，故一律拒絕。
-            EntryType::Symlink | EntryType::Link => {
+            // symlink：會在磁碟留下重導，後續 entry 的路徑成分可能穿過它寫到根外，故一律拒絕。
+            EntryType::Symlink => {
                 bail!(
-                    "image archive 頂層不允許 symlink/hardlink（可能是惡意 image 的路徑逃逸嘗試）：{}",
+                    "image archive 不允許 symlink（可能是惡意 image 的路徑逃逸嘗試）：{}",
                     rel.display()
                 );
+            }
+            // hardlink：目標須經越界檢查且落在解壓根內；以複製目標檔內容實作（podman/buildah
+            // 的 docker-archive 會以 hardlink 去重相同 layer.tar）。
+            EntryType::Link => {
+                let target = entry
+                    .link_name()
+                    .context("讀取 hardlink 目標失敗")?
+                    .ok_or_else(|| anyhow::anyhow!("hardlink entry 缺少目標：{}", rel.display()))?
+                    .into_owned();
+                let safe_target = sanitize_rel_path(&target)
+                    .with_context(|| format!("hardlink 目標不安全：{}", target.display()))?;
+                let src = dest_root.join(&safe_target);
+                // tar 的 hardlink 必指向先前已出現的 entry；不存在 → archive 損毀。
+                if !src.is_file() {
+                    bail!(
+                        "hardlink 目標不存在或非一般檔案（image archive 可能損毀）：{} -> {}",
+                        rel.display(),
+                        safe_target.display()
+                    );
+                }
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::copy(&src, &dest).with_context(|| {
+                    format!(
+                        "複製 hardlink 目標失敗：{} -> {}",
+                        src.display(),
+                        dest.display()
+                    )
+                })?;
             }
             EntryType::Regular | EntryType::Continuous | EntryType::GNUSparse => {
                 if let Some(parent) = dest.parent() {
@@ -148,22 +181,47 @@ mod tests {
         let bytes = tar_with_entry(b"d", EntryType::Symlink, Some(b"."));
         let tmp = tempfile::tempdir().unwrap();
         let err = extract_tar_reader(bytes.as_slice(), tmp.path()).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("不允許 symlink/hardlink"),
-            "{err:#}"
-        );
+        assert!(format!("{err:#}").contains("不允許 symlink"), "{err:#}");
         assert!(!tmp.path().join("d").exists());
     }
 
     #[test]
-    fn extract_rejects_hardlink_entries() {
+    fn extract_rejects_escaping_hardlink() {
+        // 越界的 hardlink 目標（`..`）→ 仍被拒（目標越界檢查失敗）。
         let bytes = tar_with_entry(b"h", EntryType::Link, Some(b"../../etc/passwd"));
         let tmp = tempfile::tempdir().unwrap();
         let err = extract_tar_reader(bytes.as_slice(), tmp.path()).unwrap_err();
+        let msg = format!("{err:#}");
         assert!(
-            format!("{err:#}").contains("不允許 symlink/hardlink"),
-            "{err:#}"
+            msg.contains("hardlink 目標不安全") || msg.contains("`..`"),
+            "{msg}"
         );
+        assert!(!tmp.path().join("h").exists());
+    }
+
+    #[test]
+    fn extract_allows_in_root_hardlink_as_copy() {
+        // podman/buildah 風格：layer.tar 以 hardlink 去重 → 應以複製內容解出。
+        let mut b = tar::Builder::new(Vec::new());
+        let mut h1 = tar::Header::new_gnu();
+        h1.set_size(3);
+        h1.set_mode(0o644);
+        h1.set_entry_type(EntryType::Regular);
+        h1.set_cksum();
+        b.append_data(&mut h1, "a/layer.tar", &b"abc"[..]).unwrap();
+        let mut h2 = tar::Header::new_gnu();
+        h2.set_size(0);
+        h2.set_mode(0o644);
+        h2.set_entry_type(EntryType::Link);
+        h2.set_cksum();
+        b.append_link(&mut h2, "b/layer.tar", "a/layer.tar")
+            .unwrap();
+        let bytes = b.into_inner().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        extract_tar_reader(bytes.as_slice(), tmp.path()).unwrap();
+        assert_eq!(fs::read(tmp.path().join("b/layer.tar")).unwrap(), b"abc");
+        assert_eq!(fs::read(tmp.path().join("a/layer.tar")).unwrap(), b"abc");
     }
 
     #[test]
