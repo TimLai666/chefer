@@ -10,8 +10,12 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-/// 依序嘗試的 builder（首個可執行者；三者的 `build`/`save` CLI 相容）。
-const BUILDERS: &[&str] = &["docker", "podman", "nerdctl"];
+/// 依序嘗試的 builder（首個可執行者）。
+/// - `docker`/`podman`/`nerdctl`：`build` 與 `save -o` CLI 相容（docker-archive）。
+///   macOS 上的 **OrbStack / Docker Desktop** 都提供 drop-in `docker` CLI，故直接走這條。
+/// - `container`（Apple 開源 container 工具）：`build` 旗標相容，但 save 是
+///   `container image save -o`（產出 OCI archive，chefer 解析端兩種格式都吃）。
+const BUILDERS: &[&str] = &["docker", "podman", "nerdctl", "container"];
 
 /// 以 host builder 建置 Dockerfile 成 docker-archive tar，回傳 tar 路徑（位於 `out_dir`）。
 pub(crate) fn build_image_tar(
@@ -70,10 +74,16 @@ pub(crate) fn build_image_tar(
         );
     }
 
-    // save → docker-archive tar。
+    // save → image tar（docker/podman/nerdctl: docker-archive；Apple container: OCI archive）。
+    // Apple container 的 save 在 `image` 子命令下（`container image save`），其餘為 `<tool> save`。
     let tar = out_dir.join("image.tar");
-    let save = Command::new(builder)
-        .arg("save")
+    let mut save_cmd = Command::new(builder);
+    if builder == "container" {
+        save_cmd.arg("image").arg("save");
+    } else {
+        save_cmd.arg("save");
+    }
+    let save = save_cmd
         .arg("-o")
         .arg(&tar)
         .arg(&tag)
@@ -110,7 +120,8 @@ fn detect_builder() -> Result<&'static str> {
         }
     }
     bail!(
-        "source: dockerfile needs a container builder on this machine, but none of docker/podman/nerdctl \
-         were found on PATH. Install one (e.g. Docker), or pre-build the image and use source: tar / source: image."
+        "source: dockerfile needs a container builder on this machine, but none of \
+         docker/podman/nerdctl/container were found on PATH. Install one (e.g. Docker, OrbStack, \
+         or Apple's `container`), or pre-build the image and use source: tar / source: image."
     )
 }

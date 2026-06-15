@@ -342,7 +342,7 @@ services:
 ```
 
 **做法（chefer-pack `dockerfile` 模組）**：chefer 本身不建 image——在**打包機**上偵測並呼叫既有的 container builder：
-1. **偵測 builder**：依序試 `docker` → `podman` → `nerdctl`（首個可執行者；以 `--version` 探測）。三者的 `build`/`save` CLI 相容。找不到任何一個 → 可行動錯誤：「`source: dockerfile` 需要打包機上有 container builder（docker/podman/nerdctl），但 PATH 上找不到；請安裝其一，或先自行 build 後改用 `source: tar` / `source: image`」。
+1. **偵測 builder**：依序試 `docker` → `podman` → `nerdctl` → `container`（首個可執行者；以 `--version` 探測）。前三者的 `build`/`save` CLI 相容（docker-archive）；macOS 上的 **OrbStack / Docker Desktop** 都提供 drop-in `docker` CLI，故直接走 `docker` 那條、無需特別處理。**Apple `container`**（開源 container 工具）：`build` 旗標相容（`-t`/`-f`/`--platform os/arch`/context），但 save 在 `image` 子命令下（`container image save -o`，產出 **OCI archive**——chefer 的 image 解析端 docker-archive 與 OCI archive 兩種都吃）。找不到任何一個 → 可行動錯誤，列出支援的 builder。
 2. **build**：`<tool> build --platform <platform> [--build-arg K=V …] -f <dockerfile> -t <暫時 tag> <context>`，stdio 直通讓使用者看到建置過程；非零 → 透傳 builder 錯誤。
 3. **save**：`<tool> save -o <tmp>/image.tar <暫時 tag>`（docker-archive）。
 4. **接既有路徑**：把該 tar 當 `source: tar` 解析（`archive::extract_tar_to_dir` + `image::resolve_image`）→ 共用 repack。
