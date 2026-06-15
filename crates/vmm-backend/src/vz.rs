@@ -27,13 +27,13 @@ impl ExecBackend for VzBackend {
         let host_arch = std::env::consts::ARCH;
         let Some(arch) = vz_util::host_guest_arch(host_arch) else {
             return Availability::Unavailable(format!(
-                "不支援的 macOS host 架構：{host_arch}；目前僅支援 x86_64 與 aarch64"
+                "unsupported macOS host architecture: {host_arch}; only x86_64 and aarch64 are supported"
             ));
         };
         if vz_util::appliance_in_bundle(ctx.bundle_dir, arch).is_none() {
             return Availability::Unavailable(format!(
-                "此單檔未內嵌 macOS micro-VM appliance（缺 vm/{} 或 vm/{}）；\
-                 請使用含 appliance 的 kit 重新 `chefer build --target *-apple-darwin`",
+                "This single-file app has no embedded macOS micro-VM appliance (missing vm/{} or vm/{}); \
+                 rebuild with `chefer build --target *-apple-darwin` using a kit that includes the appliance",
                 chefer_bundle::layout::kernel_name(arch),
                 chefer_bundle::layout::initramfs_name(arch)
             ));
@@ -44,9 +44,10 @@ impl ExecBackend for VzBackend {
         // VZ 開機 shim 尚未實機驗證前仍誠實回報不可用。Linux+QEMU appliance
         // E2E 通過後，下一步才可把這裡接到真正的 Virtualization.framework helper。
         Availability::Unavailable(
-            "macOS appliance 已內嵌，且 host 架構可支援；但 Virtualization.framework \
-             開機 shim 尚待實體 Mac 驗證完成。目前請於 Linux 或 Windows 執行，\
-             或在實體 Apple Silicon Mac 上完成 vz helper 驗證後再啟用。"
+            "The macOS appliance is embedded and the host architecture is supported, but the \
+             Virtualization.framework boot shim has not yet been validated on a physical Mac. \
+             For now, run this app on Linux or Windows, or enable the vz backend after \
+             validating the vz helper on a physical Apple Silicon Mac."
                 .to_string(),
         )
     }
@@ -56,19 +57,19 @@ impl ExecBackend for VzBackend {
         // 讓錯誤訊息帶上實際診斷（哪個 arch、appliance 是否內嵌）。
         let host_arch = std::env::consts::ARCH;
         let arch = vz_util::host_guest_arch(host_arch)
-            .ok_or_else(|| anyhow::anyhow!("不支援的 host 架構：{host_arch}"))?;
+            .ok_or_else(|| anyhow::anyhow!("unsupported host architecture: {host_arch}"))?;
 
         match vz_util::appliance_in_bundle(ctx.bundle_dir, arch) {
             Some(ap) => anyhow::bail!(
-                "macOS 執行後端尚未實作（已找到內嵌 appliance：{}、{}）。\
-                 VM 開機 shim 待在實體 Mac 上完成；目前請於 Linux 或 Windows 執行。",
+                "The macOS execution backend is not implemented yet (embedded appliance found: {}, {}). \
+                 The VM boot shim still needs to be completed on a physical Mac; for now, run this app on Linux or Windows.",
                 ap.kernel.display(),
                 ap.initramfs.display()
             ),
             None => anyhow::bail!(
-                "此單檔未內嵌 macOS micro-VM appliance（缺 vm/chefer-vmlinuz-{arch} 或 \
-                 chefer-initramfs-{arch}），且 macOS 執行後端尚未實作；\
-                 目前請於 Linux 或 Windows 執行。"
+                "This single-file app has no embedded macOS micro-VM appliance (missing vm/chefer-vmlinuz-{arch} or \
+                 chefer-initramfs-{arch}), and the macOS execution backend is not implemented yet; \
+                 for now, run this app on Linux or Windows."
             ),
         }
     }
@@ -81,8 +82,8 @@ fn macos_version_unsupported_reason() -> Option<String> {
         .ok()?;
     if !out.status.success() {
         return Some(
-            "無法確認 macOS 版本（`sw_vers -productVersion` 失敗）；\
-             請確認系統支援 Apple Virtualization.framework"
+            "Could not determine the macOS version (`sw_vers -productVersion` failed); \
+             make sure the system supports Apple Virtualization.framework"
                 .to_string(),
         );
     }
@@ -90,11 +91,14 @@ fn macos_version_unsupported_reason() -> Option<String> {
     let mut parts = version.trim().split('.');
     let major = parts.next().and_then(|p| p.parse::<u32>().ok());
     let Some(major) = major else {
-        return Some(format!("無法解析 macOS 版本 `{}`", version.trim()));
+        return Some(format!(
+            "could not parse the macOS version `{}`",
+            version.trim()
+        ));
     };
     if major < 13 {
         Some(format!(
-            "macOS 版本過舊（{}）；Chefer vz 後端需要支援 virtiofs 的 macOS 13 以上",
+            "macOS version is too old ({}); the Chefer vz backend requires macOS 13 or newer (for virtiofs support)",
             version.trim()
         ))
     } else {

@@ -61,8 +61,8 @@ pub fn start_vm_udp_bridges(manifest: &Manifest) {
 
         let Some(vm_ip) = detect_primary_ipv4() else {
             eprintln!(
-                "[guest-agent] 找不到 VM 對外 IPv4，UDP 橋接略過；\
-                 host 端 UDP 埠可能無法連入（若服務綁 0.0.0.0 仍可經 VM IP 命中）"
+                "[guest-agent] could not find the VM's outbound IPv4, skipping UDP bridge; \
+                 host-side UDP ports may be unreachable (if the service binds 0.0.0.0 it can still be hit via the VM IP)"
             );
             return;
         };
@@ -72,14 +72,16 @@ pub fn start_vm_udp_bridges(manifest: &Manifest) {
                 Ok(sock) => {
                     let target = SocketAddr::from((Ipv4Addr::LOCALHOST, gp));
                     spawn_udp_relay(sock, move || new_upstream(target));
-                    eprintln!("[guest-agent] UDP 橋接已啟動：{vm_ip}:{gp} → 127.0.0.1:{gp}");
+                    eprintln!("[guest-agent] UDP bridge started: {vm_ip}:{gp} → 127.0.0.1:{gp}");
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                     // 服務已綁 0.0.0.0:gp（含 eth0）→ host 直接命中，不需橋接。
-                    eprintln!("[guest-agent] UDP {gp} 已在 eth0 監聽（服務直接綁定），略過橋接");
+                    eprintln!(
+                        "[guest-agent] UDP {gp} is already listening on eth0 (bound by the service directly), skipping bridge"
+                    );
                 }
                 Err(e) => {
-                    eprintln!("[guest-agent] UDP 橋接 bind {vm_ip}:{gp} 失敗：{e}");
+                    eprintln!("[guest-agent] UDP bridge failed to bind {vm_ip}:{gp}: {e}");
                 }
             }
         }
@@ -109,7 +111,7 @@ where
             let (n, src) = match listen.recv_from(&mut buf) {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("[udp-relay] 接收失敗：{e}");
+                    eprintln!("[udp-relay] receive failed: {e}");
                     thread::sleep(Duration::from_millis(50));
                     continue;
                 }
@@ -124,7 +126,7 @@ where
                     let up = match make_upstream() {
                         Ok(s) => Arc::new(s),
                         Err(e) => {
-                            eprintln!("[udp-relay] 建立 upstream 失敗：{e}");
+                            eprintln!("[udp-relay] failed to create upstream: {e}");
                             continue;
                         }
                     };

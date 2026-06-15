@@ -20,8 +20,8 @@ impl ExecBackend for NamespacesBackend {
     fn availability(&self, _ctx: &AppRunContext) -> Availability {
         if !Path::new("/proc/self/ns/user").exists() {
             return Availability::Unavailable(
-                "核心未啟用 user namespaces（缺 /proc/self/ns/user）；\
-                 請改用支援 user namespaces 的 Linux 核心（3.8 以上）"
+                "the kernel does not have user namespaces enabled (missing /proc/self/ns/user); \
+                 use a Linux kernel that supports user namespaces (3.8 or newer)"
                     .to_string(),
             );
         }
@@ -31,14 +31,14 @@ impl ExecBackend for NamespacesBackend {
                 Ok(v) if v.trim() == "1" => {}
                 Ok(_) => {
                     return Availability::Unavailable(
-                        "系統停用非特權 user namespaces；\
-                         請執行 `sudo sysctl -w kernel.unprivileged_userns_clone=1` 後重試"
+                        "unprivileged user namespaces are disabled on this system; \
+                         run `sudo sysctl -w kernel.unprivileged_userns_clone=1` and try again"
                             .to_string(),
                     );
                 }
                 Err(e) => {
                     return Availability::Unavailable(format!(
-                        "無法讀取 /proc/sys/kernel/unprivileged_userns_clone：{e}"
+                        "could not read /proc/sys/kernel/unprivileged_userns_clone: {e}"
                     ));
                 }
             }

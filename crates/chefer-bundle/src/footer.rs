@@ -58,12 +58,12 @@ impl Footer {
     /// 從 80 bytes 解析（不含檔案大小邊界檢查）。
     pub fn from_bytes(buf: &[u8; FOOTER_LEN as usize]) -> Result<Self> {
         if &buf[0..8] != MAGIC {
-            bail!("不是 Chefer 單檔（magic 不符）");
+            bail!("not a Chefer single-file executable (magic mismatch)");
         }
         let version = buf[8];
         if version != FOOTER_VERSION {
             bail!(
-                "不支援的 footer 版本 {version}（本版支援 {FOOTER_VERSION}）；請更新 Chefer 或以相同版本重新打包"
+                "unsupported footer version {version} (this build supports {FOOTER_VERSION}); update Chefer or repack with a matching version"
             );
         }
         let flags = buf[9];
@@ -83,10 +83,13 @@ impl Footer {
     /// 從檔案尾端讀出 footer，並檢查 offset/length 是否落在檔案範圍內。
     pub fn read_from_file(path: &Path) -> Result<Self> {
         let mut f =
-            File::open(path).with_context(|| format!("開啟檔案失敗：{}", path.display()))?;
+            File::open(path).with_context(|| format!("failed to open file: {}", path.display()))?;
         let size = f.metadata()?.len();
         if size < FOOTER_LEN {
-            bail!("檔案過小，沒有 Chefer footer：{}", path.display());
+            bail!(
+                "file is too small to contain a Chefer footer; it may be truncated or corrupted — re-download or repack it: {}",
+                path.display()
+            );
         }
         f.seek(SeekFrom::End(-(FOOTER_LEN as i64)))?;
         let mut buf = [0u8; FOOTER_LEN as usize];
@@ -98,7 +101,7 @@ impl Footer {
             .filter(|&end| end <= size.saturating_sub(FOOTER_LEN));
         if payload_end.is_none() {
             bail!(
-                "footer 的 offset/length 超出檔案範圍（offset={}, len={}, file_size={}）",
+                "footer offset/length is out of file range; the file may be truncated or corrupted — re-download or repack it (offset={}, len={}, file_size={})",
                 ft.offset,
                 ft.length,
                 size

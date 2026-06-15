@@ -22,13 +22,13 @@ impl MountSpec {
         let mut it = s.rsplitn(2, ':');
         let guest = it.next().unwrap_or_default();
         let Some(host) = it.next() else {
-            bail!("掛載格式錯誤，應為 \"<host_path>:<container_path>\"：{s}");
+            bail!("invalid mount format, expected \"<host_path>:<container_path>\": {s}");
         };
         if host.is_empty() {
-            bail!("掛載的 host 路徑不可為空：{s}");
+            bail!("mount host path must not be empty: {s}");
         }
         if !guest.starts_with('/') {
-            bail!("掛載的容器內路徑必須以 '/' 開頭：{s}");
+            bail!("mount container path must start with '/': {s}");
         }
         Ok(MountSpec {
             host: host.to_string(),

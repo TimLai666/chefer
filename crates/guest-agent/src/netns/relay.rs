@@ -49,10 +49,12 @@ pub fn start_inbound_relays(manifest: &Manifest, dialer: Dialer) {
                 let dialer = dialer.clone();
                 thread::spawn(move || tcp_listener_loop(listener, dialer, gp));
                 eprintln!(
-                    "[guest-agent] inbound relay（TCP）已啟動：127.0.0.1:{gp} → app-netns 127.0.0.1:{gp}"
+                    "[guest-agent] inbound relay (TCP) started: 127.0.0.1:{gp} → app-netns 127.0.0.1:{gp}"
                 );
             }
-            Err(e) => eprintln!("[guest-agent] inbound relay bind 127.0.0.1:{gp}/tcp 失敗：{e}"),
+            Err(e) => {
+                eprintln!("[guest-agent] inbound relay failed to bind 127.0.0.1:{gp}/tcp: {e}")
+            }
         }
     }
 
@@ -62,10 +64,12 @@ pub fn start_inbound_relays(manifest: &Manifest, dialer: Dialer) {
                 let dialer = dialer.clone();
                 spawn_udp_relay(listen, move || dialer.udp(gp));
                 eprintln!(
-                    "[guest-agent] inbound relay（UDP）已啟動：127.0.0.1:{gp} → app-netns 127.0.0.1:{gp}"
+                    "[guest-agent] inbound relay (UDP) started: 127.0.0.1:{gp} → app-netns 127.0.0.1:{gp}"
                 );
             }
-            Err(e) => eprintln!("[guest-agent] inbound relay bind 127.0.0.1:{gp}/udp 失敗：{e}"),
+            Err(e) => {
+                eprintln!("[guest-agent] inbound relay failed to bind 127.0.0.1:{gp}/udp: {e}")
+            }
         }
     }
 }
