@@ -1,16 +1,16 @@
-# Chefer GUI demo：把一個 X11 圖形程式（xeyes）打包成單檔。
+# Chefer GUI demo: package an X11 graphical program (xeyes) into a single file.
 #
-# 打包前先用 scripts/build-images.sh（或 .ps1）產生 images/gui.tar，
-# 再 `chefer build examples/gui-demo/appcipe.yml`。
+# Before packaging, run scripts/build-images.sh (or .ps1) to produce images/gui.tar,
+# then `chefer build examples/gui-demo/appcipe.yml`.
 version: "0.1"
 name: CheferGuiDemo
 app_version: "1.0.0"
 
 services:
-  # interface_mode: gui → chefer 會把 host 的 X11/Wayland socket 掛進容器並設 DISPLAY：
-  #   - Linux：直通 /tmp/.X11-unix 與 $XDG_RUNTIME_DIR/wayland-*。
-  #   - Windows：經 WSLg（distro 內 /tmp/.X11-unix → /mnt/wslg/.X11-unix，DISPLAY=:0）。
-  # 沒有 ports（GUI 不需對外開埠），也不需要持久化。
+  # interface_mode: gui -> chefer mounts the host's X11/Wayland socket into the container and sets DISPLAY:
+  #   - Linux: passes through /tmp/.X11-unix and $XDG_RUNTIME_DIR/wayland-*.
+  #   - Windows: via WSLg (inside the distro /tmp/.X11-unix -> /mnt/wslg/.X11-unix, DISPLAY=:0).
+  # No ports (a GUI does not need an exposed port), and no persistence needed.
   eyes:
     image: ./images/gui.tar
     interface_mode: gui

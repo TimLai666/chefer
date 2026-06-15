@@ -1,30 +1,30 @@
-# Chefer demo：應用 + 資料庫，示範 registry 拉取、內部網路、資料持久化、db 不對外暴露。
+# Chefer demo: app + database, showcasing registry pull, internal networking, data persistence, and a db that is not exposed externally.
 #
-# db 直接從 registry 拉（免 docker save）；只需先用 scripts/build-images.sh（或 .ps1）
-# 產生 images/app.tar，再 `chefer build examples/demo/appcipe.yml`。
+# The db is pulled straight from the registry (no docker save needed); just run scripts/build-images.sh (or .ps1)
+# first to produce images/app.tar, then `chefer build examples/demo/appcipe.yml`.
 version: "0.1"
 name: CheferDemo
 app_version: "1.0.0"
 
 services:
-  # 資料庫：官方 redis，**直接從 registry 拉取**（免 docker save）。釘 tag 以可重現。
-  # 沒有 ports → 不會被橋接出去；預設 network: bridge 讓本 app 有專屬 netns，
-  # 故 db 從 host 真正連不到（內部專用）。app 以 127.0.0.1:6379 連它（同 app 服務共享 netns）。
-  # 注意：官方 redis 的 entrypoint 會 chown/gosu 到 redis uid 999——WSL2 / macOS VM /
-  # 原生 Linux 以 root 執行時可行；原生 Linux rootless 下單 uid 映射會讓它失敗（見 Roadmap）。
+  # Database: official redis, **pulled straight from the registry** (no docker save). Pin the tag for reproducibility.
+  # No ports -> it is never bridged out; the default network: bridge gives this app its own netns,
+  # so the db is genuinely unreachable from the host (internal only). app connects to it at 127.0.0.1:6379 (services in the same app share the netns).
+  # Note: the official redis entrypoint does chown/gosu to redis uid 999 -- this works on WSL2 / macOS VM /
+  # native Linux running as root; on native Linux rootless, the single-uid mapping makes it fail (see Roadmap).
   db:
-    image: redis:7.2-alpine        # 從 registry 拉（pin tag，禁 latest）；無需先 docker save
+    image: redis:7.2-alpine        # pulled from the registry (pin the tag, no latest); no docker save needed
     cmd: ["redis-server", "--bind", "127.0.0.1", "--appendonly", "yes", "--dir", "/data"]
-    persist_path: /data            # redis 的 AOF 落在此，App 重啟後資料保留
+    persist_path: /data            # redis's AOF lands here, so data survives app restarts
     interface_mode: none
 
-  # 應用：HTTP 服務，連 db 做計數。只有它對外開埠（18080 → 容器內 8080）。
+  # Application: an HTTP service that connects to db to keep a count. Only this service exposes a port (18080 -> 8080 inside the container).
   app:
     image: ./images/app.tar
     env:
-      REDIS_HOST: "127.0.0.1"      # 內部網路：與 db 共享網路 namespace
+      REDIS_HOST: "127.0.0.1"      # internal network: shares the network namespace with db
       REDIS_PORT: "6379"
       PORT: "8080"
-    ports: ["18080:8080"]          # 唯一對外暴露的埠
+    ports: ["18080:8080"]          # the only externally exposed port
     interface_mode: none
-    depends_on: [db]               # 先啟動 db（app 啟動時仍會重試連線）
+    depends_on: [db]               # start db first (app still retries the connection on startup)
