@@ -84,6 +84,8 @@ mod linux {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::io::AsRawFd;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Condvar, Mutex};
 
     use anyhow::{Context, Result, bail};
 
@@ -253,18 +255,29 @@ mod linux {
         // 目錄權限延後套用：解壓中先確保 owner 可寫入（0o700），全部層解完後再 chmod 成精確值
         let mut dir_modes: BTreeMap<PathBuf, u32> = BTreeMap::new();
 
-        for layer in &svc.layers {
-            let layer_path = bundle_dir.join(&layer.rel_path);
-            let f = fs::File::open(&layer_path).with_context(|| {
-                format!(
-                    "failed to open layer: {}; the bundle may be incomplete, please re-extract or repack",
-                    layer_path.display()
-                )
-            })?;
-            let decoder = ruzstd::decoding::StreamingDecoder::new(std::io::BufReader::new(f))
-                .with_context(|| format!("zstd decompress failed: {}", layer_path.display()))?;
-            apply_layer(out_dir, decoder, &mut dir_modes)
-                .with_context(|| format!("failed to extract layer: {}", layer_path.display()))?;
+        // overlay 層必須**依序套用**（後層覆蓋前層 + whiteout 刪檔），但每層的 zstd 解壓
+        // 互相獨立且 CPU 吃重（musl static 用純 Rust ruzstd，較慢）。故多層時以 worker pool
+        // **提前平行解壓**到暫存 tar、主執行緒**仍照順序套用**——重疊解壓與套用以縮短首次組裝。
+        let par = decode_parallelism(svc.layers.len());
+        if par <= 1 {
+            for layer in &svc.layers {
+                let layer_path = bundle_dir.join(&layer.rel_path);
+                let f = fs::File::open(&layer_path).with_context(|| {
+                    format!(
+                        "failed to open layer: {}; the bundle may be incomplete, please re-extract or repack",
+                        layer_path.display()
+                    )
+                })?;
+                let decoder = ruzstd::decoding::StreamingDecoder::new(std::io::BufReader::new(f))
+                    .with_context(|| {
+                    format!("zstd decompress failed: {}", layer_path.display())
+                })?;
+                apply_layer(out_dir, decoder, &mut dir_modes).with_context(|| {
+                    format!("failed to extract layer: {}", layer_path.display())
+                })?;
+            }
+        } else {
+            apply_layers_pipelined(bundle_dir, &svc.layers, out_dir, &mut dir_modes, par)?;
         }
 
         // 套用精確的目錄權限（whiteout 可能已刪除部分目錄 → 忽略 NotFound）
@@ -337,6 +350,164 @@ mod linux {
             }
         }
         Ok(cur)
+    }
+
+    /// 多層平行解壓的執行緒數：單層 / 單核 → 1（走串流、免 temp）；否則取核心數，
+    /// 上限 4（避免磁碟與記憶體壓力），且不超過層數。
+    fn decode_parallelism(n_layers: usize) -> usize {
+        if n_layers <= 1 {
+            return 1;
+        }
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        cpus.clamp(1, 4).min(n_layers)
+    }
+
+    /// 把單一 layer 的 zstd 解壓成未壓縮 tar，寫到 `out_tar`。
+    fn decompress_one(layer_path: &Path, out_tar: &Path) -> Result<()> {
+        let f = fs::File::open(layer_path).with_context(|| {
+            format!(
+                "failed to open layer: {}; the bundle may be incomplete, please re-extract or repack",
+                layer_path.display()
+            )
+        })?;
+        let mut dec = ruzstd::decoding::StreamingDecoder::new(std::io::BufReader::new(f))
+            .with_context(|| format!("zstd decompress failed: {}", layer_path.display()))?;
+        let mut out = fs::File::create(out_tar)
+            .with_context(|| format!("failed to create staged layer tar: {}", out_tar.display()))?;
+        std::io::copy(&mut dec, &mut out)
+            .with_context(|| format!("zstd decompress failed: {}", layer_path.display()))?;
+        Ok(()) // out 於此 drop（fs::File 無緩衝，drop 即關閉、內容已落地）
+    }
+
+    /// 平行（提前）解壓各層到暫存 tar，主執行緒**依序**套用。
+    /// staging 目錄與 `out_dir` 同層（不放進 rootfs 內），結束時清除。
+    fn apply_layers_pipelined(
+        bundle_dir: &Path,
+        layers: &[chefer_bundle::LayerRef],
+        out_dir: &Path,
+        dir_modes: &mut BTreeMap<PathBuf, u32>,
+        workers: usize,
+    ) -> Result<()> {
+        let parent = out_dir.parent().unwrap_or_else(|| Path::new("."));
+        let dirname = out_dir
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "rootfs".into());
+        // 獨佔鎖保證同一 target 只有一個 builder；pid + 目錄名即足以唯一。
+        let staging = parent.join(format!(".staging-{}-{dirname}", std::process::id()));
+        let _ = fs::remove_dir_all(&staging);
+        fs::create_dir_all(&staging).with_context(|| {
+            format!("failed to create layer staging dir: {}", staging.display())
+        })?;
+
+        let result = pipeline_inner(bundle_dir, layers, out_dir, dir_modes, workers, &staging);
+        let _ = fs::remove_dir_all(&staging);
+        result
+    }
+
+    /// 待套用層的狀態（主執行緒只會依序消費 index 0..n 各一次）。
+    enum Slot {
+        Pending,
+        Ready(PathBuf),
+        Failed(String),
+        Taken,
+    }
+    struct PipeState {
+        slots: Vec<Slot>,
+        applied: usize,
+        stop: bool, // 完成或出錯 → 通知 worker 收工
+    }
+
+    fn pipeline_inner(
+        bundle_dir: &Path,
+        layers: &[chefer_bundle::LayerRef],
+        out_dir: &Path,
+        dir_modes: &mut BTreeMap<PathBuf, u32>,
+        workers: usize,
+        staging: &Path,
+    ) -> Result<()> {
+        let n = layers.len();
+        let limit = workers + 1; // 提前解壓的 look-ahead 視窗（限制暫存 tar 數量）
+        let st = Mutex::new(PipeState {
+            slots: (0..n).map(|_| Slot::Pending).collect(),
+            applied: 0,
+            stop: false,
+        });
+        let cv = Condvar::new();
+        let next = AtomicUsize::new(0);
+
+        std::thread::scope(|scope| -> Result<()> {
+            for _ in 0..workers {
+                scope.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::SeqCst);
+                        if i >= n {
+                            break;
+                        }
+                        // 背壓：i 必須落在 [applied, applied+limit) 視窗內才解壓；stop 則收工。
+                        {
+                            let mut g = st.lock().unwrap();
+                            while !g.stop && i >= g.applied + limit {
+                                g = cv.wait(g).unwrap();
+                            }
+                            if g.stop {
+                                break;
+                            }
+                        }
+                        let tar_path = staging.join(format!("{i}.tar"));
+                        let res = decompress_one(&bundle_dir.join(&layers[i].rel_path), &tar_path);
+                        let mut g = st.lock().unwrap();
+                        match res {
+                            Ok(()) => g.slots[i] = Slot::Ready(tar_path),
+                            Err(e) => {
+                                g.slots[i] = Slot::Failed(format!("{e:#}"));
+                                g.stop = true;
+                            }
+                        }
+                        cv.notify_all();
+                    }
+                });
+            }
+
+            // 主執行緒：依序等待第 i 層就緒 → 套用 → 推進視窗。
+            let mut run = || -> Result<()> {
+                for i in 0..n {
+                    let tar_path = {
+                        let mut g = st.lock().unwrap();
+                        loop {
+                            match std::mem::replace(&mut g.slots[i], Slot::Taken) {
+                                Slot::Ready(p) => break p,
+                                Slot::Failed(e) => return Err(anyhow::anyhow!(e)),
+                                other => {
+                                    g.slots[i] = other;
+                                    g = cv.wait(g).unwrap();
+                                }
+                            }
+                        }
+                    };
+                    let f = fs::File::open(&tar_path).with_context(|| {
+                        format!("failed to open staged layer tar: {}", tar_path.display())
+                    })?;
+                    apply_layer(out_dir, std::io::BufReader::new(f), dir_modes)
+                        .with_context(|| format!("failed to extract layer {i}"))?;
+                    let _ = fs::remove_file(&tar_path);
+                    let mut g = st.lock().unwrap();
+                    g.applied = i + 1;
+                    cv.notify_all();
+                }
+                Ok(())
+            };
+            let result = run();
+            // 不論成敗都通知 worker 收工（避免成功時仍多解壓、或出錯時 worker 卡在等待）。
+            {
+                let mut g = st.lock().unwrap();
+                g.stop = true;
+                cv.notify_all();
+            }
+            result
+        })
     }
 
     /// 解開單一層：whiteout 先處理，其他 entry 正常落地。
