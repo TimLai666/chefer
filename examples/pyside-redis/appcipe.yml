@@ -1,26 +1,26 @@
-# Chefer demo：PySide6 GUI + redis，兩個容器打成一個單檔。
+# Chefer demo: PySide6 GUI + redis, two containers packed into a single file.
 #
-# db 直接從 registry 拉（免 docker save）；只需先用 scripts/build-images.sh（或 .ps1）
-# 產生 images/gui.tar，再 `chefer build examples/pyside-redis/appcipe.yml`。
+# The db is pulled straight from the registry (no docker save needed); just run scripts/build-images.sh (or .ps1)
+# first to produce images/gui.tar, then `chefer build examples/pyside-redis/appcipe.yml`.
 version: "0.1"
 name: CheferPysideRedis
 app_version: "1.0.0"
 
 services:
-  # 資料庫：官方 redis，**直接從 registry 拉取**（免 docker save）。釘 tag 以可重現。
-  # 預設 network: bridge → 本 app 專屬 netns、db 沒有 ports: → 從 host 真正連不到。
-  # 官方 redis 的 entrypoint 會 chown/gosu 到 redis uid 999：WSL2/VM/原生-root 可行，
-  # 原生 Linux rootless 需 newuidmap 委派（見 Roadmap）。
+  # Database: official redis, **pulled straight from the registry** (no docker save). Pin the tag for reproducibility.
+  # Default network: bridge -> this app gets its own netns, and db has no ports: -> it is genuinely unreachable from the host.
+  # The official redis entrypoint does chown/gosu to redis uid 999: works on WSL2/VM/native-root,
+  # native Linux rootless needs newuidmap delegation (see Roadmap).
   db:
-    image: redis:7.2-alpine        # 從 registry 拉（pin tag，禁 latest）
+    image: redis:7.2-alpine        # pulled from the registry (pin the tag, no latest)
     cmd: ["redis-server", "--bind", "127.0.0.1", "--appendonly", "yes", "--dir", "/data"]
     persist_path: /data
     interface_mode: none
 
-  # GUI：PySide6 視窗，連同一個 app 的 redis（127.0.0.1，內部網路）。
+  # GUI: a PySide6 window that connects to the same app's redis (127.0.0.1, internal network).
   gui:
     image: ./images/gui.tar
-    interface_mode: gui          # chefer 掛 X11/Wayland socket、設 DISPLAY
+    interface_mode: gui          # chefer mounts the X11/Wayland socket and sets DISPLAY
     env:
       REDIS_HOST: "127.0.0.1"
       REDIS_PORT: "6379"

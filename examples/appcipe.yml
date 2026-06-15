@@ -1,98 +1,98 @@
-version: "0.1"                      # 必填：設定格式版本（目前固定 "0.1"）
+version: "0.1"                      # Required: spec format version (currently fixed at "0.1")
 
-# === 頭部（應用層級） ===
-name: StudioPro                     # 必填：應用名稱；同時用作輸出單檔檔名與資料目錄名
-                                    #   規則：[A-Za-z][A-Za-z0-9_-]*，最長 64 字元
-app_version: "2.3.1"                # 選填：應用版本；顯示用（不影響解析與打包）
-old_names: ["Studio", "StudioBeta"] # 選填：舊資料夾名清單；若新資料目錄不存在，會依序尋找並自動改名遷移
-data_dir: "D:/Apps/StudioPro"       # 選填：覆蓋預設資料目錄位置；未設定則用系統預設
+# === Header (app-level) ===
+name: StudioPro                     # Required: app name; also used as the output single-file name and the data directory name
+                                    #   Rule: [A-Za-z][A-Za-z0-9_-]*, max 64 chars
+app_version: "2.3.1"                # Optional: app version; display-only (does not affect parsing or packing)
+old_names: ["Studio", "StudioBeta"] # Optional: list of old folder names; if the new data dir doesn't exist, these are tried in order and auto-renamed (migrated)
+data_dir: "D:/Apps/StudioPro"       # Optional: override the default data directory location; if unset, the system default is used
                                     #   Windows: %LOCALAPPDATA%/{name}
                                     #   macOS:   ~/Library/Application Support/{name}
-                                    #   Linux:   $XDG_DATA_HOME/{name} 或 ~/.local/share/{name}
-crash: fail_fast                    # 選填：崩潰策略；目前僅支援 fail_fast（任一服務非 0 退出→整體退出並透傳該 exit code）
-                                    #   舊欄位名 crash_policy 仍相容（serde alias）
-network: bridge                     # 選填：網路模式（預設 bridge）。三選一：
-                                    #   bridge   — app 專屬網路、只開宣告的 ports:、可出網（NAT，類似 Docker 預設）；預設
-                                    #   internal — 同 bridge 但「無對外網路」(類似 Docker compose 的 internal: true)
-                                    #   shared   — 共用 host 網路；未宣告的 port 也能從 host 連到（不隔離；舊行為）
-                                    #   注意：省略此欄＝bridge＝隔離。要回到「未宣告 port 也可從 host 連到」請顯式寫 shared。
-                                    #   bridge 出網需 kit 內含 pasta（官方 release kit 已附）；缺 pasta 時自動退化為 internal。
-console: auto                       # 選填：共用主控台（彙整日誌 + Ctrl+C 的終端視窗）顯示策略（預設 auto）。三選一：
-                                    #   auto   — 有 terminal/both 服務→顯示；只有 gui→隱藏（Windows 雙擊時）；全無介面→顯示（保留停止介面）；預設
-                                    #   shown  — 一律顯示共用主控台
-                                    #   hidden — 隱藏共用主控台（限 app 另有 gui 或 terminal/both 可關閉；全無介面用 hidden 會驗證失敗）
-                                    #   隱藏只在 Windows 雙擊啟動時生效（且僅當該 console 由本程式獨佔）；從既有終端啟動或其他平台不受影響。
+                                    #   Linux:   $XDG_DATA_HOME/{name} or ~/.local/share/{name}
+crash: fail_fast                    # Optional: crash policy; only fail_fast is supported (any service exiting non-zero -> whole app exits with that exit code)
+                                    #   Legacy field name crash_policy is still accepted (serde alias)
+network: bridge                     # Optional: network mode (default bridge). One of:
+                                    #   bridge   — app-private network, only declared ports: are open, outbound allowed (NAT, like Docker's default); default
+                                    #   internal — same as bridge but with NO outbound network (like Docker Compose's internal: true)
+                                    #   shared   — shares the host network; undeclared ports are also reachable from the host (not isolated; legacy behavior)
+                                    #   Note: omitting this field = bridge = isolated. To restore "undeclared ports reachable from the host", set shared explicitly.
+                                    #   bridge outbound needs pasta in the kit (the official release kit ships it); without pasta it degrades to internal at runtime.
+console: auto                       # Optional: shared-console (aggregated logs + Ctrl-C terminal window) display policy (default auto). One of:
+                                    #   auto   — has a terminal/both service -> shown; gui-only -> hidden (when double-clicked on Windows); no interface at all -> shown (keeps a way to stop); default
+                                    #   shown  — always show the shared console
+                                    #   hidden — hide the shared console (only allowed if the app also has a gui or terminal/both to close it; using hidden with no interface fails validation)
+                                    #   Hiding only takes effect when double-clicked to launch on Windows (and only when this process owns the console exclusively); launching from an existing terminal, or other platforms, are unaffected.
 
-# === 服務定義 ===
+# === Service definitions ===
 services:
 
-  db:                                # 服務名稱；規則：[a-z][a-z0-9_]*，最長 32 字元
-    # --- 映像來源 ---
-    # 三選一：source: tar（本機 docker save / OCI archive）、source: image（建置時從 registry 拉）、
-    #         source: dockerfile（建置時在打包機上由 docker/podman/nerdctl 直接 build）。
-    # 最簡：直接給 registry ref → image: postgres:16-alpine（見下方 app1 短寫示範）。
-    image:                           # 必填：容器映像來源
-      source: tar                    # tar = image tar 檔；image = 從 registry 拉；dockerfile = 由 Dockerfile build
-      file: ./images/postgres16.tar  # source=tar：tar 路徑（可相對 appcipe.yml；docker save 與 OCI archive 皆可，自動偵測）
-                                     # source=image 時，file 改填 registry ref，且必須釘版：
-                                     #   postgres:16-alpine（明確 tag，非 latest）或 …@sha256:<digest>；
-                                     #   未標記或 :latest 會被拒（為了可重現）。公開 image 採匿名拉取。
-                                     # source=dockerfile 時，file 改填 Dockerfile 路徑；另可加：
-                                     #   context: <build context 目錄，省略 = Dockerfile 所在目錄>
-                                     #   build_args: { KEY: VALUE }（→ --build-arg）
-                                     #   注意：dockerfile 需打包機上有 docker/podman/nerdctl，且不保證可重現（要可重現用 source: image 釘 digest）。
-      format: auto                   # 選填：auto | docker-archive | oci-archive（預設 auto；僅 source=tar 有意義）
-      platform: linux/amd64          # 選填：預設 linux/amd64；multi-arch 來源用來挑平台（另支援 linux/arm64）
+  db:                                # Service name; rule: [a-z][a-z0-9_]*, max 32 chars
+    # --- Image source ---
+    # One of: source: tar (local docker save / OCI archive), source: image (pulled from a registry at build time),
+    #         source: dockerfile (built on the packing machine at build time via docker/podman/nerdctl).
+    # Simplest: just give a registry ref -> image: postgres:16-alpine (see the app1 short-form example below).
+    image:                           # Required: container image source
+      source: tar                    # tar = image tar file; image = pull from a registry; dockerfile = build from a Dockerfile
+      file: ./images/postgres16.tar  # source=tar: tar path (may be relative to appcipe.yml; both docker save and OCI archive are accepted, auto-detected)
+                                     # For source=image, file holds a registry ref instead, and it must be pinned:
+                                     #   postgres:16-alpine (explicit tag, not latest) or …@sha256:<digest>;
+                                     #   untagged or :latest is rejected (for reproducibility). Public images are pulled anonymously.
+                                     # For source=dockerfile, file holds a Dockerfile path instead; you may also add:
+                                     #   context: <build context dir; omitted = the Dockerfile's directory>
+                                     #   build_args: { KEY: VALUE } (-> --build-arg)
+                                     #   Note: dockerfile requires docker/podman/nerdctl on the packing machine and isn't guaranteed reproducible (for reproducibility use source: image with a pinned digest).
+      format: auto                   # Optional: auto | docker-archive | oci-archive (default auto; only meaningful for source=tar)
+      platform: linux/amd64          # Optional: default linux/amd64; selects the platform from a multi-arch source (linux/arm64 also supported)
 
-    # --- 執行參數 ---
-    cmd: ["postgres", "-c", "max_connections=200"]  # 選填：覆蓋 image 的 Cmd（不取代 Entrypoint，語意同 Docker）；可字串或陣列
-    workdir: /var/lib/postgresql/data               # 選填：容器內工作目錄
-    env:                                           # 選填：環境變數（key: value；與 image 內建 env 合併，此處優先）
+    # --- Execution parameters ---
+    cmd: ["postgres", "-c", "max_connections=200"]  # Optional: overrides the image's Cmd (does not replace Entrypoint, same semantics as Docker); string or array
+    workdir: /var/lib/postgresql/data               # Optional: working directory inside the container
+    env:                                           # Optional: environment variables (key: value; merged with the image's built-in env, these take precedence)
       POSTGRES_PASSWORD: "pw"
       PGDATA: "/var/lib/postgresql/data"
 
-    # --- 持久化（只有設定 persist_path 才會持久化） ---
-    persist_path: /var/lib/postgresql/data         # 選填：容器內需要持久化的路徑（必須以 / 開頭）
-                                                   #   實際 Host 路徑：{data_dir 或系統預設}/data/db/
+    # --- Persistence (only persisted if persist_path is set) ---
+    persist_path: /var/lib/postgresql/data         # Optional: in-container path to persist (must start with /)
+                                                   #   Actual host path: {data_dir or system default}/data/db/
 
-    # --- 埠口（host:guest[/proto]；預設 tcp） ---
-    ports: ["5432:5432"]                           # 選填：映射到 localhost；host≠guest 時由 runtime 以 TCP 代理轉送
-                                                   #   同一 app 內 host 埠不得重複
-                                                   #   注意：Windows 上 UDP 映射目前不生效（WSL2 localhost 轉送限制）
+    # --- Ports (host:guest[/proto]; default tcp) ---
+    ports: ["5432:5432"]                           # Optional: mapped to localhost; when host≠guest the runtime forwards via a TCP proxy
+                                                   #   Host ports must be unique within an app
+                                                   #   Note: UDP mappings currently don't work on Windows (WSL2 localhost forwarding limitation)
 
-    # --- 健康檢查（選填；驅動 depends_on 的 wait-until-ready，語意對齊 Docker HEALTHCHECK） ---
+    # --- Health check (optional; drives depends_on wait-until-ready, semantics aligned with Docker HEALTHCHECK) ---
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "postgres"] # 命令陣列（CMD=直接 argv；CMD-SHELL=sh -c）或字串（= sh -c）；exit 0 = 健康
-      interval: 2s                                  # 選填：兩次檢查間隔（預設 2s）。接受 <n>ms/<n>s/<n>m 或裸整數秒
-      timeout: 5s                                   # 選填：單次檢查逾時（預設 5s）
-      retries: 10                                   # 選填：連續失敗幾次才算 unhealthy → fail_fast（預設 10）
-      start_period: 0s                              # 選填：寬限期，期間失敗不計入 retries（預設 0s）
+      test: ["CMD", "pg_isready", "-U", "postgres"] # Command array (CMD=direct argv; CMD-SHELL=sh -c) or string (= sh -c); exit 0 = healthy
+      interval: 2s                                  # Optional: interval between checks (default 2s). Accepts <n>ms/<n>s/<n>m or a bare integer (seconds)
+      timeout: 5s                                   # Optional: per-check timeout (default 5s)
+      retries: 10                                   # Optional: consecutive failures before unhealthy -> fail_fast (default 10)
+      start_period: 0s                              # Optional: grace period during which failures don't count toward retries (default 0s)
 
-    # --- 終端/GUI ---
-    interface_mode: none                           # 選填：gui | terminal | both | none（預設 none）
+    # --- Terminal/GUI ---
+    interface_mode: none                           # Optional: gui | terminal | both | none (default none)
 
   ui:
-    # 短寫示範：image 直接給 tar 路徑（等價於 source: tar + format: auto + platform 預設）
-    image: ./images/studio-ui.tar                  # 必填(就此寫法)：tar 檔路徑
+    # Short-form example: image is a tar path directly (equivalent to source: tar + format: auto + default platform)
+    image: ./images/studio-ui.tar                  # Required (for this form): tar file path
 
-    cmd: ["sh", "-lc", "chmod +x /app/start && /app/start"]  # 選填
+    cmd: ["sh", "-lc", "chmod +x /app/start && /app/start"]  # Optional
     env:
       API_URL: "http://localhost:8080"
-    workdir: /app                                  # 選填
+    workdir: /app                                  # Optional
 
-    # 綁定資料夾：顯式讓容器看到 Host 的特定資料夾（不等於持久化）
-    mounts:                                        # 選填：每項 "<host_path>:<container_path>"
-      - ./presets:/app/presets                     # host 相對路徑（相對 appcipe.yml）：容器內路徑必須以 / 開頭
-      - /bigdata:/mnt/data                         # Host 絕對路徑（Windows 磁碟代號如 C:\data 也支援，建議加引號）
-      # 注意：啟動前會驗證 host 路徑存在，不存在則報錯
+    # Bind mounts: explicitly expose specific host folders to the container (not the same as persistence)
+    mounts:                                        # Optional: each entry "<host_path>:<container_path>"
+      - ./presets:/app/presets                     # Host relative path (relative to appcipe.yml): the in-container path must start with /
+      - /bigdata:/mnt/data                         # Host absolute path (Windows drive letters like C:\data also work; quoting recommended)
+      # Note: host paths are validated to exist before startup; a missing path is an error
 
     ports:
-      - "8080:8080"                                # 多行寫法示範
-      - "9000:9000/udp"                            # UDP 後綴示範（Windows 上不生效，見上）
+      - "8080:8080"                                # Multi-line form example
+      - "9000:9000/udp"                            # UDP suffix example (no effect on Windows, see above)
 
-    interface_mode: gui   # 選填：terminal | gui | both | none（預設 none）
-                          #   gui：Linux 直通 X11/Wayland socket；Windows 靠 WSLg（best-effort）
-                          #   terminal/both：stdin 直通；全 app 最多只能有一個 terminal/both 服務
+    interface_mode: gui   # Optional: terminal | gui | both | none (default none)
+                          #   gui: Linux passes through the X11/Wayland socket; Windows relies on WSLg (best-effort)
+                          #   terminal/both: stdin passthrough; an app may have at most one terminal/both service
     depends_on:
       - db
 
@@ -101,25 +101,25 @@ services:
       source: tar
       file: ./images/worker.tar
       format: auto
-    cmd: "sh -lc 'echo worker running; sleep 3600'" # 字串寫法示範（轉為 /bin/sh -c 執行）
+    cmd: "sh -lc 'echo worker running; sleep 3600'" # String form example (run as /bin/sh -c)
     env:
       LOG_LEVEL: "info"
-    # 未設定 persist_path → 不持久化（退出即清空）
-    mounts: []                                     # 空清單也合法；等同不綁定
-    ports: []                                      # 無對外埠
+    # persist_path not set -> not persisted (wiped on exit)
+    mounts: []                                     # An empty list is also valid; equivalent to no bind mounts
+    ports: []                                      # No exposed ports
     interface_mode: none
     depends_on:
       - db
       - ui
 
-# === 行為備註 ===
-# 1) 啟動單檔 → 依 depends_on 拓撲順序拉起 services。若某服務有 healthcheck，會等它 healthy
-#    才啟動下一個（即 depends_on 的 wait-until-ready）；沒 healthcheck 的服務 spawn 即視為就緒。
-#    任一服務異常退出（exit code ≠ 0）或 healthcheck 重試用盡 → fail_fast（終止其餘服務並整體退出）
-# 2) 所有服務正常結束（exit code 0）→ 整體以 0 退出；Ctrl-C / 關閉終端 → 終止全部服務後退出
-# 3) 持久化資料夾實際位置：
-#    {data_dir 或系統預設（含 {name}）}/data/{service_name}/...
-#    例如 Linux 預設：~/.local/share/StudioPro/data/db/
-# 4) 資料夾遷移：
-#    若新資料目錄不存在，會依 old_names 順序尋找舊資料夾並自動改名成新 {name}
-# 5) YAML 陣列可用 inline 或多行寫法；解析端一律視為等價
+# === Behavior notes ===
+# 1) Launch the single file -> services are started in depends_on topological order. If a service has a healthcheck,
+#    the next one waits until it's healthy (i.e. depends_on wait-until-ready); a service without a healthcheck is considered ready once spawned.
+#    Any service exiting abnormally (exit code ≠ 0) or exhausting healthcheck retries -> fail_fast (terminate the rest and exit the whole app).
+# 2) All services finishing normally (exit code 0) -> the whole app exits 0; Ctrl-C / closing the terminal -> terminate all services, then exit.
+# 3) Actual location of persisted folders:
+#    {data_dir or system default (including {name})}/data/{service_name}/...
+#    e.g. Linux default: ~/.local/share/StudioPro/data/db/
+# 4) Folder migration:
+#    If the new data dir doesn't exist, old folders are searched in old_names order and auto-renamed to the new {name}.
+# 5) YAML arrays may use inline or multi-line form; the parser treats them as equivalent.
