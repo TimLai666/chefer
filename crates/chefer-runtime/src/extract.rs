@@ -38,12 +38,14 @@ pub struct Extracted {
     pub bundle_dir: PathBuf,
 }
 
-/// 從 `exe` 的 `[ft.offset, ft.offset + ft.length)` 區段串流解壓 bundle。
+/// 從 `exe` 的 `[ft.offset, ft.offset + ft.length)` 區段串流解壓 bundle 到暫存目錄。
 ///
 /// 成功時回傳 [`Extracted`]；sha256 不符或內容損毀時報錯，
 /// 且暫存目錄已刪除（即使指定了 `--keep-tmp` 也不保留未通過驗證的內容）。
+///
+/// 這是「不快取」路徑（`--no-cache` / `--keep-tmp`）；預設啟動走
+/// [`extract_bundle_cached`]，跳過重複解壓。
 pub fn extract_bundle(exe: &Path, ft: &Footer, opts: &ExtractOptions<'_>) -> Result<Extracted> {
-    // ── 1. 準備暫存目錄 ─────────────────────────────────────────
     // 在驗證通過並決定 keep 之前，由 TempDir 負責出錯時的自動清理。
     let tempdir = match opts.extract_parent {
         Some(parent) => {
@@ -65,15 +67,141 @@ pub fn extract_bundle(exe: &Path, ft: &Footer, opts: &ExtractOptions<'_>) -> Res
         }
     };
 
-    // ── 2. 開自身檔案，限制在 payload 區段，邊讀邊算 sha256 ─────
+    // 解壓 + 驗證 + 佈局檢查；出錯時 tempdir 於此函式返回時 drop（內容刪除）。
+    extract_payload_to(tempdir.path(), exe, ft)?;
+    let bundle_dir = tempdir.path().join("bundle");
+
+    if opts.keep_tmp {
+        let root = tempdir.keep();
+        tracing::info!("Temp directory kept (--keep-tmp): {}", root.display());
+        Ok(Extracted {
+            _tempdir: None,
+            bundle_dir: root.join("bundle"),
+        })
+    } else {
+        Ok(Extracted {
+            _tempdir: Some(tempdir),
+            bundle_dir,
+        })
+    }
+}
+
+/// 持久化 bundle 解壓快取：依 payload 的 sha256 為鍵。
+///
+/// 首次啟動把 bundle 解到 `<cache_root>/<sha256>/` 並寫入 `.complete` 標記；
+/// 後續啟動（含其他 instance）若該目錄已存在且完整，**完全跳過開檔/解壓/sha 驗證**，
+/// 直接重用——這是大 image 重複啟動的主要加速來源。內容雜湊當鍵，故同內容必命中、
+/// 不同內容自然分流。快取命中代表先前已對「同一份內容」解壓並驗證過。
+pub fn extract_bundle_cached(exe: &Path, ft: &Footer, cache_root: &Path) -> Result<Extracted> {
+    let key = hex::encode(ft.sha256);
+    let cache_dir = cache_root.join(&key);
+    let bundle_dir = cache_dir.join("bundle");
+
+    if is_complete_cache(&cache_dir) {
+        tracing::info!("reusing cached bundle: {}", cache_dir.display());
+        return Ok(Extracted {
+            _tempdir: None,
+            bundle_dir,
+        });
+    }
+
+    // Miss：解到 cache_root 下的暫存目錄（同卷，rename 才是原子且免跨卷複製），
+    // 驗證通過後寫 .complete，再原子 rename 成 <sha>/。出錯時 staging 自動清除。
+    fs_err::create_dir_all(cache_root).with_context(|| {
+        format!(
+            "failed to create bundle cache dir: {}",
+            cache_root.display()
+        )
+    })?;
+    let staging = TempDir::with_prefix_in(".staging-", cache_root).with_context(|| {
+        format!(
+            "failed to create a staging dir under {}",
+            cache_root.display()
+        )
+    })?;
+    extract_payload_to(staging.path(), exe, ft)?;
+    fs_err::write(staging.path().join(COMPLETE_MARKER), b"")
+        .context("failed to write cache completion marker")?;
+
+    // 促成：rename staging → <sha>/。若目標已存在（另一 instance 先完成），rename 失敗，
+    // 改用既有的並刪掉自己的 staging。rename 是在 .complete 寫入「之後」才做，且為原子操作，
+    // 故 cache_dir 一旦存在即代表完整。
+    let staged = staging.keep();
+    match fs_err::rename(&staged, &cache_dir) {
+        Ok(()) => {}
+        Err(e) => {
+            let _ = fs_err::remove_dir_all(&staged);
+            if !is_complete_cache(&cache_dir) {
+                return Err(e).with_context(|| {
+                    format!(
+                        "failed to promote staged bundle into the cache: {}",
+                        cache_dir.display()
+                    )
+                });
+            }
+            tracing::info!(
+                "reusing cached bundle (won by a concurrent run): {}",
+                cache_dir.display()
+            );
+        }
+    }
+
+    Ok(Extracted {
+        _tempdir: None,
+        bundle_dir,
+    })
+}
+
+/// 快取目錄是否完整（已有 `.complete` 標記且含 manifest.json）。
+fn is_complete_cache(cache_dir: &Path) -> bool {
+    cache_dir.join(COMPLETE_MARKER).is_file()
+        && chefer_bundle::layout::manifest_path(&cache_dir.join("bundle")).is_file()
+}
+
+/// 快取完成標記檔名（存在 = 該目錄是一次完整、已驗證的解壓）。
+const COMPLETE_MARKER: &str = ".chefer-complete";
+
+/// 平台預設的 bundle 解壓快取根目錄：
+/// - Windows：`%LOCALAPPDATA%\chefer\cache\bundles`
+/// - macOS：`~/Library/Caches/chefer/bundles`
+/// - Linux／其他 unix：`$XDG_CACHE_HOME/chefer/bundles` 或 `~/.cache/chefer/bundles`
+/// - 取不到上述環境時退回系統 temp 下的 `chefer-bundle-cache`
+pub fn default_cache_root() -> PathBuf {
+    let sub = |base: PathBuf| base.join("chefer").join("bundles");
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(v) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
+            return sub(PathBuf::from(v).join("cache"));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(h) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+            return sub(PathBuf::from(h).join("Library").join("Caches"));
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(x) = std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
+            return sub(PathBuf::from(x));
+        }
+        if let Some(h) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+            return sub(PathBuf::from(h).join(".cache"));
+        }
+    }
+    std::env::temp_dir().join("chefer-bundle-cache")
+}
+
+/// 將 payload 串流解壓 + sha256 驗證 + 佈局檢查到 `dest`（呼叫端負責 `dest` 的清理）。
+fn extract_payload_to(dest: &Path, exe: &Path, ft: &Footer) -> Result<()> {
+    // 開自身檔案，限制在 payload 區段，邊讀邊算 sha256。
     let mut f = fs_err::File::open(exe)
         .with_context(|| format!("failed to open own executable: {}", exe.display()))?;
     f.seek(SeekFrom::Start(ft.offset))
         .with_context(|| format!("failed to seek to payload start (offset={})", ft.offset))?;
     let mut tee = TeeReader::new(f.take(ft.length));
 
-    // ── 3. 解壓（zstd → tar；非 zstd flag 時直接視為 tar）────────
-    let dest = tempdir.path();
+    // 解壓（zstd → tar；非 zstd flag 時直接視為 tar）。
     if ft.is_zstd() {
         let decoder = zstd::stream::read::Decoder::new(&mut tee).context(
             "failed to create the zstd decoder (the start of the payload may be corrupted)",
@@ -88,13 +216,10 @@ pub fn extract_bundle(exe: &Path, ft: &Footer, opts: &ExtractOptions<'_>) -> Res
         unpack_tar(&mut tee, dest)?;
     }
 
-    // ── 4. 排空剩餘 payload，讓 sha256 覆蓋完整的 footer.length ──
-    // tar 在結尾零區塊後即停止讀取，zstd 解碼器也可能殘留未消化的
-    // bytes；這裡把剩餘區段讀完（只進 hasher，不佔記憶體）。
+    // 排空剩餘 payload，讓 sha256 覆蓋完整的 footer.length。
     io::copy(&mut tee, &mut io::sink()).context("failed to read the end of the payload")?;
     let got = tee.finalize();
     if got != ft.sha256 {
-        // 直接返回錯誤：tempdir 在此 drop，解壓內容隨之刪除。
         bail!(
             "payload SHA-256 verification failed (expected {}, got {}); \
              the file may be corrupted or tampered with, and the extracted content has been deleted. Please re-download or repack this single file",
@@ -103,9 +228,8 @@ pub fn extract_bundle(exe: &Path, ft: &Footer, opts: &ExtractOptions<'_>) -> Res
         );
     }
 
-    // ── 5. 確認佈局：tar 內路徑以 bundle/ 為根 ───────────────────
-    let bundle_dir = dest.join("bundle");
-    let manifest_path = chefer_bundle::layout::manifest_path(&bundle_dir);
+    // 確認佈局：tar 內路徑以 bundle/ 為根。
+    let manifest_path = chefer_bundle::layout::manifest_path(&dest.join("bundle"));
     if !manifest_path.is_file() {
         bail!(
             "{} not found after extraction; the payload does not match the bundle layout (the tar should be rooted at bundle/). \
@@ -113,21 +237,7 @@ pub fn extract_bundle(exe: &Path, ft: &Footer, opts: &ExtractOptions<'_>) -> Res
             manifest_path.display()
         );
     }
-
-    // ── 6. --keep-tmp：真正保留目錄並印出路徑 ────────────────────
-    if opts.keep_tmp {
-        let root = tempdir.keep();
-        tracing::info!("Temp directory kept (--keep-tmp): {}", root.display());
-        Ok(Extracted {
-            _tempdir: None,
-            bundle_dir: root.join("bundle"),
-        })
-    } else {
-        Ok(Extracted {
-            _tempdir: Some(tempdir),
-            bundle_dir,
-        })
-    }
+    Ok(())
 }
 
 /// 串流解 tar 到 `dest`，每個 entry 先做路徑安全檢查再落地。
@@ -388,6 +498,43 @@ mod tests {
         assert!(
             format!("{err:#}").contains(".."),
             "錯誤應指出 `..`：{err:#}"
+        );
+    }
+
+    #[test]
+    fn cached_extract_reuses_and_skips_on_hit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("fake-app.exe");
+        let manifest_content = br#"{"cached": true}"#;
+        let payload = build_payload(manifest_content);
+        let ft = write_fake_single(&exe, 100, &payload);
+        let cache_root = tmp.path().join("cache");
+
+        // 第一次：miss → 解壓並促成快取。
+        let first = extract_bundle_cached(&exe, &ft, &cache_root).unwrap();
+        assert_eq!(
+            fs::read(first.bundle_dir.join("manifest.json")).unwrap(),
+            manifest_content
+        );
+        let cache_dir = cache_root.join(hex::encode(ft.sha256));
+        assert!(cache_dir.join(COMPLETE_MARKER).is_file(), "應寫入完成標記");
+        // 快取路徑不隨 drop 刪除（持久）。
+        let bundle_dir = first.bundle_dir.clone();
+        drop(first);
+        assert!(bundle_dir.join("manifest.json").is_file(), "快取應保留");
+
+        // 第二次：把 exe 的 payload 整段毀掉——若仍成功，證明命中時根本沒重讀/解壓。
+        {
+            use std::io::Write;
+            let mut f = fs::OpenOptions::new().write(true).open(&exe).unwrap();
+            f.seek(SeekFrom::Start(ft.offset)).unwrap();
+            f.write_all(&vec![0u8; payload.len()]).unwrap();
+        }
+        let second = extract_bundle_cached(&exe, &ft, &cache_root).unwrap();
+        assert_eq!(
+            fs::read(second.bundle_dir.join("manifest.json")).unwrap(),
+            manifest_content,
+            "命中快取應重用,毋須重讀 payload"
         );
     }
 
