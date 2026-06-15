@@ -107,15 +107,26 @@ pub(crate) fn build_image_tar(
     Ok(tar)
 }
 
-/// 偵測可用的 container builder（以 `--version` 探測）。找不到 → 可行動錯誤。
+/// 偵測可用的 container builder。`CHEFER_DOCKERFILE_BUILDER` 可覆寫自動偵測
+/// （限已知 builder 之一，避免被指使去執行任意檔）。找不到 → 可行動錯誤。
 fn detect_builder() -> Result<&'static str> {
+    if let Ok(forced) = std::env::var("CHEFER_DOCKERFILE_BUILDER") {
+        let forced = forced.trim();
+        if !forced.is_empty() {
+            let Some(&b) = BUILDERS.iter().find(|b| **b == forced) else {
+                bail!(
+                    "CHEFER_DOCKERFILE_BUILDER=`{forced}` is not a supported builder \
+                     (expected one of docker/podman/nerdctl/container)"
+                );
+            };
+            if runnable(b) {
+                return Ok(b);
+            }
+            bail!("CHEFER_DOCKERFILE_BUILDER=`{b}` was set, but `{b}` is not runnable on PATH");
+        }
+    }
     for b in BUILDERS {
-        let ok = Command::new(b)
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if ok {
+        if runnable(b) {
             return Ok(b);
         }
     }
@@ -124,4 +135,13 @@ fn detect_builder() -> Result<&'static str> {
          docker/podman/nerdctl/container were found on PATH. Install one (e.g. Docker, OrbStack, \
          or Apple's `container`), or pre-build the image and use source: tar / source: image."
     )
+}
+
+/// builder 是否可執行（以 `--version` 探測）。
+fn runnable(builder: &str) -> bool {
+    Command::new(builder)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
 }
