@@ -63,6 +63,11 @@ jobs:
       - name: Install pasta (passt) for bridge networking E2E
         run: sudo apt-get install -y passt
 
+      # podman 讓 `source: dockerfile` 的 E2E 多測一條「非-docker、docker 相容 CLI」builder。
+      # linux-e2e.sh 偵測到 podman 就會以 CHEFER_DOCKERFILE_BUILDER=podman 再 build 一次。
+      - name: Install podman for non-docker Dockerfile builder E2E
+        run: sudo apt-get install -y podman
+
       - name: Docker info
         run: docker info
 

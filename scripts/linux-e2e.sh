@@ -813,45 +813,69 @@ YAML
   note "Healthcheck negative E2E passed: unhealthy service tore the app down (exit=${bad_code}, ${elapsed}s)"
 }
 
-# source: dockerfile —— chefer 直接從 Dockerfile build（偵測 host docker），免手動 docker save。
+# source: dockerfile —— chefer 直接從 Dockerfile build（偵測 host builder），免手動 docker save。
+# 先以自動偵測（docker）跑一次；若 podman 存在，再強制用 podman 跑一次，
+# 把「非-docker、docker 相容 CLI」這條路徑也納入實測。
 run_dockerfile_e2e() {
   local work="$1" output_target="$2" image_platform="$3" cli="$4" kit="$5" base_image="$6"
 
-  note "Dockerfile build E2E: chefer builds the image straight from a Dockerfile (no docker save)"
-  mkdir -p "$work/df/ctx"
-  cat >"$work/df/ctx/Dockerfile" <<DOCKER
+  _dockerfile_build_run "$work" "$output_target" "$image_platform" "$cli" "$kit" "$base_image" "" "default"
+
+  if command -v podman >/dev/null 2>&1; then
+    _dockerfile_build_run "$work" "$output_target" "$image_platform" "$cli" "$kit" "$base_image" "podman" "podman"
+  else
+    note "podman not found on PATH; skipping the podman builder check"
+  fi
+}
+
+# 內部：以指定 builder（空字串 = 自動偵測）build 一份 Dockerfile app 並執行驗證。
+_dockerfile_build_run() {
+  local work="$1" output_target="$2" image_platform="$3" cli="$4" kit="$5" base_image="$6"
+  local builder="$7" tag="$8"
+  local d="$work/df-$tag"
+
+  note "Dockerfile build E2E (${tag}): chefer builds straight from a Dockerfile${builder:+ forcing ${builder}}"
+  mkdir -p "$d/ctx"
+  cat >"$d/ctx/Dockerfile" <<DOCKER
 FROM ${base_image}
 CMD ["sh", "-lc", "echo CHEFER_DOCKERFILE_OK"]
 DOCKER
-  cat >"$work/df/appcipe.yml" <<YAML
+  cat >"$d/appcipe.yml" <<YAML
 version: "0.1"
-name: LinuxDockerfile
+name: LinuxDockerfile_${tag}
 app_version: "e2e"
-data_dir: "$work/df-data"
+data_dir: "$d/data"
 crash: fail_fast
 network: shared
 services:
   app:
     image:
       source: dockerfile
-      file: "$work/df/ctx/Dockerfile"
+      file: "$d/ctx/Dockerfile"
       platform: ${image_platform}
     interface_mode: none
 YAML
-  "$cli" build "$work/df/appcipe.yml" --out "$work/out-df" --kit-dir "$kit" --target "$output_target"
-  local df_app="$work/out-df/LinuxDockerfile/LinuxDockerfile_${output_target}"
+
+  # builder 非空 → 以 CHEFER_DOCKERFILE_BUILDER 強制，否則走自動偵測。
+  if [[ -n "$builder" ]]; then
+    CHEFER_DOCKERFILE_BUILDER="$builder" "$cli" build "$d/appcipe.yml" --out "$d/out" --kit-dir "$kit" --target "$output_target"
+  else
+    "$cli" build "$d/appcipe.yml" --out "$d/out" --kit-dir "$kit" --target "$output_target"
+  fi
+
+  local df_app="$d/out/LinuxDockerfile_${tag}/LinuxDockerfile_${tag}_${output_target}"
   [[ -f "$df_app" ]] || die "missing built dockerfile app: $df_app"
   chmod +x "$df_app"
-  local df_log="$work/df.log"
+  local df_log="$d/run.log"
   set +e
   "$df_app" >"$df_log" 2>&1
   local df_code=$?
   set -e
   if [[ "$df_code" -ne 0 ]] || ! grep -q "CHEFER_DOCKERFILE_OK" "$df_log"; then
     cat "$df_log" >&2 || true
-    die "Dockerfile build E2E failed: exit=${df_code}, expected CHEFER_DOCKERFILE_OK"
+    die "Dockerfile build E2E (${tag}) failed: exit=${df_code}, expected CHEFER_DOCKERFILE_OK"
   fi
-  note "Dockerfile build E2E passed: Dockerfile -> chefer build (host docker) -> single-file run"
+  note "Dockerfile build E2E (${tag}) passed: Dockerfile -> chefer build -> single-file run"
 }
 
 main() {
