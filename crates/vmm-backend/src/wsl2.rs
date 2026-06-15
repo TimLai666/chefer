@@ -29,8 +29,8 @@ impl ExecBackend for Wsl2Backend {
         match wsl_command().arg("--status").output() {
             Ok(out) if out.status.success() => Availability::Available,
             Ok(out) => Availability::Unavailable(format!(
-                "`wsl.exe --status` 失敗（exit {}）：{}；\
-                 請以系統管理員身分執行 `wsl --install` 啟用 WSL2 後重試",
+                "WSL2 is not installed or not running (`wsl.exe --status` failed, exit {}): {}. \
+                 Run `wsl --install` in an Administrator PowerShell, then re-run this app.",
                 out.status.code().unwrap_or(-1),
                 first_line(
                     &decode_wsl_output(&out.stderr),
@@ -38,8 +38,8 @@ impl ExecBackend for Wsl2Backend {
                 ),
             )),
             Err(e) => Availability::Unavailable(format!(
-                "找不到或無法執行 wsl.exe：{e}；\
-                 請以系統管理員身分執行 `wsl --install` 啟用 WSL2 後重試"
+                "WSL2 is not installed or not running (could not find or run wsl.exe: {e}). \
+                 Run `wsl --install` in an Administrator PowerShell, then re-run this app."
             )),
         }
     }
@@ -51,14 +51,14 @@ impl ExecBackend for Wsl2Backend {
             .join(chefer_bundle::layout::guest_agent_name(arch));
         if !agent_path.exists() {
             bail!(
-                "此單檔未內嵌 guest-agent（缺 {}），無法在 Windows 執行；\
-                 請在打包時提供 kit（含 guest-agent-{arch}），\
-                 詳見 `chefer build` 的 --kit-dir 參數或環境變數 CHEFER_KIT_DIR",
+                "This single-file app has no embedded guest-agent (missing {}) and cannot run \
+                 on Windows. Rebuild with a kit that includes guest-agent-{arch}; see the \
+                 `chefer build` --kit-dir flag or the CHEFER_KIT_DIR environment variable.",
                 agent_path.display()
             );
         }
         let agent_bytes = std::fs::read(&agent_path)
-            .with_context(|| format!("讀取 guest-agent 失敗：{}", agent_path.display()))?;
+            .with_context(|| format!("failed to read guest-agent: {}", agent_path.display()))?;
 
         // b. distro 名 = chefer-rt-<agent sha256 前 8 碼>（同 hash 冪等重用）
         let distro = agent_distro_name(&agent_bytes);
@@ -69,12 +69,24 @@ impl ExecBackend for Wsl2Backend {
         }
 
         // d. Windows 路徑 → WSL 路徑
-        let bundle_wsl = to_wsl_path(ctx.bundle_dir)
-            .with_context(|| format!("轉換 bundle 路徑失敗：{}", ctx.bundle_dir.display()))?;
-        std::fs::create_dir_all(ctx.data_dir)
-            .with_context(|| format!("建立資料目錄失敗：{}", ctx.data_dir.display()))?;
-        let data_wsl = to_wsl_path(ctx.data_dir)
-            .with_context(|| format!("轉換資料目錄路徑失敗：{}", ctx.data_dir.display()))?;
+        let bundle_wsl = to_wsl_path(ctx.bundle_dir).with_context(|| {
+            format!(
+                "failed to convert bundle path: {}",
+                ctx.bundle_dir.display()
+            )
+        })?;
+        std::fs::create_dir_all(ctx.data_dir).with_context(|| {
+            format!(
+                "failed to create data directory: {}",
+                ctx.data_dir.display()
+            )
+        })?;
+        let data_wsl = to_wsl_path(ctx.data_dir).with_context(|| {
+            format!(
+                "failed to convert data directory path: {}",
+                ctx.data_dir.display()
+            )
+        })?;
 
         // e. UDP 埠：wslrelay 不轉 UDP，故在啟動 guest-agent 前先取 VM eth0 的 IPv4，
         //    對每個 UDP PortSpec 於 host 端起 `127.0.0.1:host → <vm_ip>:guest` relay
@@ -111,7 +123,7 @@ impl ExecBackend for Wsl2Backend {
         }
         let status = cmd
             .status()
-            .with_context(|| format!("在 WSL distro `{distro}` 內啟動 guest-agent 失敗"))?;
+            .with_context(|| format!("failed to start guest-agent in WSL distro `{distro}`"))?;
         Ok(status.code().unwrap_or(1))
     }
 }
@@ -139,10 +151,10 @@ fn query_vm_ipv4(distro: &str) -> Result<Ipv4Addr> {
         .arg("/bin/guest-agent")
         .arg("vmip")
         .output()
-        .with_context(|| format!("在 WSL distro `{distro}` 內查詢 VM IP 失敗"))?;
+        .with_context(|| format!("failed to query VM IP in WSL distro `{distro}`"))?;
     if !out.status.success() {
         bail!(
-            "guest-agent vmip 失敗（exit {}）：{}；無法為 UDP 埠建立轉發",
+            "guest-agent vmip failed (exit {}): {}; cannot set up forwarding for UDP ports",
             out.status.code().unwrap_or(-1),
             first_line(
                 &decode_wsl_output(&out.stderr),
@@ -157,7 +169,7 @@ fn query_vm_ipv4(distro: &str) -> Result<Ipv4Addr> {
         .find(|l| !l.is_empty())
         .unwrap_or("");
     line.parse::<Ipv4Addr>().with_context(|| {
-        format!("無法解析 guest-agent vmip 的輸出為 IPv4：{line:?}（distro `{distro}`）")
+        format!("could not parse guest-agent vmip output as IPv4: {line:?} (distro `{distro}`)")
     })
 }
 
@@ -174,15 +186,16 @@ fn start_host_udp_relays(vm_ip: Ipv4Addr, specs: &[(u16, u16)]) -> Result<()> {
                     up.connect(target)?;
                     Ok(up)
                 });
-                eprintln!("[chefer] UDP 埠轉發：127.0.0.1:{host} → {vm_ip}:{guest}");
+                eprintln!("[chefer] UDP port forward: 127.0.0.1:{host} → {vm_ip}:{guest}");
             }
-            Err(e) => failures.push(format!("  - {host}/udp：bind 127.0.0.1:{host} 失敗：{e}")),
+            Err(e) => failures.push(format!("  - {host}/udp: bind 127.0.0.1:{host} failed: {e}")),
         }
     }
     if !failures.is_empty() {
         bail!(
-            "以下 host UDP 埠無法啟動轉發（埠可能已被其他程式占用；\
-             請關閉占用的程式，或調整 appcipe.yml 的 ports 後重新打包）：\n{}",
+            "Could not start forwarding for the following host UDP ports (a port may already \
+             be in use by another program; close that program, or adjust the `ports` in \
+             appcipe.yml and repack):\n{}",
             failures.join("\n")
         );
     }
@@ -201,7 +214,9 @@ fn host_guest_arch() -> Result<&'static str> {
     match std::env::consts::ARCH {
         "x86_64" => Ok("x86_64"),
         "aarch64" => Ok("aarch64"),
-        other => bail!("不支援的 host 架構：{other}；WSL2 後端目前支援 x86_64 與 aarch64"),
+        other => bail!(
+            "unsupported host architecture: {other}; the WSL2 backend currently supports x86_64 and aarch64"
+        ),
     }
 }
 
@@ -212,11 +227,11 @@ fn to_wsl_path(path: &Path) -> Result<String> {
         path.to_path_buf()
     } else {
         std::fs::canonicalize(path)
-            .with_context(|| format!("無法解析為絕對路徑：{}", path.display()))?
+            .with_context(|| format!("could not resolve to an absolute path: {}", path.display()))?
     };
     let s = abs.to_str().ok_or_else(|| {
         anyhow::anyhow!(
-            "路徑含無法以 UTF-8 表示的字元，無法轉換為 WSL 路徑：{}",
+            "path contains characters that cannot be represented in UTF-8, cannot convert to a WSL path: {}",
             abs.display()
         )
     })?;
@@ -228,7 +243,7 @@ fn distro_exists(name: &str) -> Result<bool> {
     let out = wsl_command()
         .args(["-l", "-q"])
         .output()
-        .context("無法執行 `wsl.exe -l -q` 列出 distro；請確認已安裝 WSL（`wsl --install`）")?;
+        .context("failed to run `wsl.exe -l -q` to list distros; make sure WSL is installed (`wsl --install`)")?;
     if !out.status.success() {
         // 尚無任何 distro 或 WSL 未初始化時可能回非 0——視為不存在，由匯入流程建立
         return Ok(false);
@@ -245,21 +260,29 @@ fn distro_exists(name: &str) -> Result<bool> {
 /// 搶先建立），視為成功；否則才真正回報錯誤，並清掉殘留的安裝目錄。
 fn ensure_distro_imported(distro: &str, agent_bytes: &[u8]) -> Result<()> {
     let local_app_data = std::env::var_os("LOCALAPPDATA").ok_or_else(|| {
-        anyhow::anyhow!("找不到 %LOCALAPPDATA% 環境變數，無法決定 WSL distro 安裝目錄")
+        anyhow::anyhow!("%LOCALAPPDATA% environment variable not found; cannot determine the WSL distro install directory")
     })?;
     let install_dir = PathBuf::from(local_app_data)
         .join("chefer")
         .join("wsl")
         .join(distro);
-    std::fs::create_dir_all(&install_dir)
-        .with_context(|| format!("建立 distro 安裝目錄失敗：{}", install_dir.display()))?;
+    std::fs::create_dir_all(&install_dir).with_context(|| {
+        format!(
+            "failed to create distro install directory: {}",
+            install_dir.display()
+        )
+    })?;
 
     // 在記憶體產 tar，寫到暫存目錄（讓 wsl.exe 能開檔讀取；TempDir 於離開時清理）
     let tar_bytes = build_min_rootfs_tar(agent_bytes)?;
-    let tmp_dir = tempfile::tempdir().context("建立暫存目錄失敗")?;
+    let tmp_dir = tempfile::tempdir().context("failed to create temporary directory")?;
     let tar_path = tmp_dir.path().join("rootfs.tar");
-    std::fs::write(&tar_path, &tar_bytes)
-        .with_context(|| format!("寫入暫存 rootfs tar 失敗：{}", tar_path.display()))?;
+    std::fs::write(&tar_path, &tar_bytes).with_context(|| {
+        format!(
+            "failed to write temporary rootfs tar: {}",
+            tar_path.display()
+        )
+    })?;
 
     let out = wsl_command()
         .arg("--import")
@@ -269,7 +292,7 @@ fn ensure_distro_imported(distro: &str, agent_bytes: &[u8]) -> Result<()> {
         .arg("--version")
         .arg("2")
         .output()
-        .context("執行 `wsl --import` 失敗")?;
+        .context("failed to run `wsl --import`")?;
     if out.status.success() {
         return Ok(());
     }
@@ -283,10 +306,10 @@ fn ensure_distro_imported(distro: &str, agent_bytes: &[u8]) -> Result<()> {
     // 真正失敗：清掉本次建立的殘留安裝目錄（避免殘留 vhdx 卡死後續 import）。
     let _ = std::fs::remove_dir_all(&install_dir);
     bail!(
-        "匯入 WSL distro `{distro}` 失敗（exit {}）：{}；\
-         請確認 WSL2 已啟用（`wsl --status`）後重試。\
-         （注意：若同名 distro 正被另一個 Chefer app 使用，請勿手動 unregister，\
-         直接重試即可。）",
+        "failed to import WSL distro `{distro}` (exit {}): {}. \
+         Make sure WSL2 is enabled (`wsl --status`), then try again. \
+         (Note: if a distro of the same name is in use by another Chefer app, do not \
+         unregister it manually — just retry.)",
         out.status.code().unwrap_or(-1),
         first_line(
             &decode_wsl_output(&out.stderr),
@@ -300,7 +323,7 @@ pub(crate) fn cleanup_distros_impl() -> Result<Vec<String>> {
     let out = wsl_command()
         .args(["-l", "-q"])
         .output()
-        .context("無法執行 `wsl.exe -l -q` 列出 distro；請確認已安裝 WSL（`wsl --install`）")?;
+        .context("failed to run `wsl.exe -l -q` to list distros; make sure WSL is installed (`wsl --install`)")?;
     if !out.status.success() {
         // 沒有任何 distro 時可能回非 0——無事可清
         return Ok(Vec::new());
@@ -316,11 +339,11 @@ pub(crate) fn cleanup_distros_impl() -> Result<Vec<String>> {
             .arg("--unregister")
             .arg(name)
             .output()
-            .with_context(|| format!("執行 `wsl --unregister {name}` 失敗"))?;
+            .with_context(|| format!("failed to run `wsl --unregister {name}`"))?;
         if !st.status.success() {
             bail!(
-                "移除 WSL distro `{name}` 失敗（exit {}）：{}；\
-                 可手動執行 `wsl --unregister {name}`",
+                "failed to remove WSL distro `{name}` (exit {}): {}; \
+                 you can run `wsl --unregister {name}` manually",
                 st.status.code().unwrap_or(-1),
                 first_line(
                     &decode_wsl_output(&st.stderr),
@@ -347,6 +370,6 @@ fn first_line<'a>(stderr: &'a str, stdout: &'a str) -> &'a str {
     };
     pick.lines()
         .find(|l| !l.trim().is_empty())
-        .unwrap_or("（無輸出）")
+        .unwrap_or("(no output)")
         .trim()
 }

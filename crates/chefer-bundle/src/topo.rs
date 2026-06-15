@@ -19,10 +19,14 @@ pub fn topo_sort(services: &[ServiceEntry]) -> Result<Vec<&ServiceEntry>> {
         indeg.entry(s.name.as_str()).or_insert(0);
         for d in &s.depends_on {
             if !by_name.contains_key(d.as_str()) {
-                bail!("service `{}` 依賴不存在的 service `{}`", s.name, d);
+                bail!(
+                    "service `{}` depends on nonexistent service `{}`",
+                    s.name,
+                    d
+                );
             }
             if d == &s.name {
-                bail!("service `{}` 不可依賴自己", s.name);
+                bail!("service `{}` must not depend on itself", s.name);
             }
             *indeg.entry(s.name.as_str()).or_insert(0) += 1;
             rdeps.entry(d.as_str()).or_default().push(s.name.as_str());
@@ -61,7 +65,7 @@ pub fn topo_sort(services: &[ServiceEntry]) -> Result<Vec<&ServiceEntry>> {
             .map(|(&n, _)| n)
             .collect();
         bail!(
-            "depends_on 存在循環依賴，無法決定啟動順序：{}",
+            "depends_on has a dependency cycle; cannot determine startup order: {}",
             stuck.join(", ")
         );
     }

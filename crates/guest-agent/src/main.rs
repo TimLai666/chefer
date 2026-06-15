@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "guest-agent",
-    about = "Chefer guest agent：於 Linux 環境內組裝 rootfs 並執行 bundle 服務",
+    about = "Chefer guest agent: assembles the rootfs and runs bundle services inside a Linux environment",
     version
 )]
 struct Cli {
@@ -22,36 +22,36 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// 執行 bundle：組裝各服務 rootfs、依 depends_on 順序啟動並監控
+    /// Run a bundle: assemble each service's rootfs, then start and monitor them in depends_on order
     Run {
-        /// bundle 目錄（內含 manifest.json）
+        /// Bundle directory (containing manifest.json)
         #[arg(long)]
         bundle: PathBuf,
-        /// app 資料目錄（persist 資料與預設 rootfs 快取的根）
+        /// App data directory (root for persist data and the default rootfs cache)
         #[arg(long)]
         data: PathBuf,
-        /// rootfs 快取目錄（預設 <data>/.rootfs-cache）
+        /// Rootfs cache directory (default <data>/.rootfs-cache)
         #[arg(long)]
         cache: Option<PathBuf>,
-        /// 服務結束後保留已組裝的 rootfs（供下次啟動重用）
+        /// Keep the assembled rootfs after services exit (for reuse on the next launch)
         #[arg(long)]
         keep_rootfs: bool,
-        /// VM 後端（wsl2/vz）專用：在 VM 內補起 UDP 埠的 eth0→loopback 橋接
-        /// （因 wslrelay/VZ NAT 不轉 UDP）。原生 Linux 後端不應設定此旗標。
+        /// VM backend (wsl2/vz) only: set up an eth0→loopback bridge for UDP ports inside the VM
+        /// (because wslrelay/VZ NAT does not forward UDP). The native Linux backend must not set this flag.
         #[arg(long)]
         udp_bridge: bool,
     },
-    /// 印出本機（VM）對外的主要 IPv4，供 host 端後端建立 UDP relay 用；無則非 0 退出
+    /// Print this machine's (the VM's) primary outward-facing IPv4 for the host backend to build a UDP relay; exits non-zero if none
     Vmip,
-    /// 只組裝單一服務的 rootfs 到指定目錄（除錯用）
+    /// Assemble only a single service's rootfs into a given directory (for debugging)
     AssembleRootfs {
-        /// bundle 目錄（內含 manifest.json）
+        /// Bundle directory (containing manifest.json)
         #[arg(long)]
         bundle: PathBuf,
-        /// 服務名稱
+        /// Service name
         #[arg(long)]
         service: String,
-        /// 輸出目錄
+        /// Output directory
         #[arg(long)]
         out: PathBuf,
     },
@@ -84,7 +84,7 @@ fn main() -> ExitCode {
                 // exit code 透傳（clamp 至 u8 範圍；>255 取低位元組慣例）
                 Ok(code) => ExitCode::from((code & 0xff) as u8),
                 Err(e) => {
-                    eprintln!("guest-agent 執行失敗：{e:#}");
+                    eprintln!("guest-agent failed: {e:#}");
                     ExitCode::from(1)
                 }
             }
@@ -95,7 +95,7 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
             None => {
-                eprintln!("guest-agent vmip：找不到對外 IPv4（只有 loopback？）");
+                eprintln!("guest-agent vmip: no outward-facing IPv4 found (loopback only?)");
                 ExitCode::from(1)
             }
         },
@@ -106,7 +106,7 @@ fn main() -> ExitCode {
         } => match assemble_rootfs_cmd(&bundle, &service, &out) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
-                eprintln!("guest-agent assemble-rootfs 失敗：{e:#}");
+                eprintln!("guest-agent assemble-rootfs failed: {e:#}");
                 ExitCode::from(1)
             }
         },
@@ -124,7 +124,7 @@ fn assemble_rootfs_cmd(
         let manifest = guest_agent::load_manifest(bundle)?;
         let svc = manifest.service(service).ok_or_else(|| {
             anyhow::anyhow!(
-                "bundle 內沒有服務 `{service}`；現有服務：{}",
+                "no service `{service}` in the bundle; available services: {}",
                 manifest
                     .services
                     .iter()
@@ -134,15 +134,18 @@ fn assemble_rootfs_cmd(
             )
         })?;
         guest_agent::rootfs::assemble_rootfs_at(bundle, svc, out)?;
-        println!("已組裝服務 `{service}` 的 rootfs 至 {}", out.display());
+        println!(
+            "assembled the rootfs for service `{service}` at {}",
+            out.display()
+        );
         Ok(())
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (bundle, service, out);
         anyhow::bail!(
-            "guest-agent 僅能於 Linux 環境執行（目前平台：{}）；\
-             rootfs 需在 Linux（namespaces / WSL2 / VM）內組裝",
+            "guest-agent can only run in a Linux environment (current platform: {}); \
+             the rootfs must be assembled inside Linux (namespaces / WSL2 / VM)",
             std::env::consts::OS
         )
     }

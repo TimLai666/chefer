@@ -419,7 +419,7 @@ mod tests {
         let err = read_embedded_manifest(&exe, &ft).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("超過上限") || msg.contains("manifest.json"),
+            msg.contains("exceeds the limit") || msg.contains("manifest.json"),
             "應因超過解壓上限而報錯：{msg}"
         );
     }

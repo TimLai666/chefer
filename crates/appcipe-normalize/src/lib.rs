@@ -69,26 +69,34 @@ pub fn normalize(app: &mut AppCipe, base: &Path) -> anyhow::Result<()> {
 /// 一站式載入入口：讀檔 → serde 解析 → normalize（路徑絕對化）→ validate。
 /// 注意順序：**先 normalize 再 validate**。
 pub fn load(path: &Path) -> anyhow::Result<AppCipe> {
-    let s = std::fs::read_to_string(path)
-        .with_context(|| format!("無法讀取設定檔 {}（請確認檔案存在且可讀）", path.display()))?;
-    let mut app: AppCipe =
-        serde_yaml::from_str(&s).context("appcipe.yml 解析失敗（YAML 格式或欄位型別錯誤）")?;
+    let s = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "failed to read config file {} (check that it exists and is readable)",
+            path.display()
+        )
+    })?;
+    let mut app: AppCipe = serde_yaml::from_str(&s).with_context(|| {
+        format!(
+            "failed to parse {} (invalid YAML syntax or wrong field type)",
+            path.display()
+        )
+    })?;
 
     // base = 設定檔所在目錄（絕對化；相對的設定檔路徑以目前工作目錄補全）
     let parent = path.parent().unwrap_or_else(|| Path::new(""));
     let base = if parent.as_os_str().is_empty() {
-        std::env::current_dir().context("無法取得目前工作目錄")?
+        std::env::current_dir().context("failed to get the current working directory")?
     } else if parent.is_absolute() {
         parent.to_path_buf()
     } else {
         std::env::current_dir()
-            .context("無法取得目前工作目錄")?
+            .context("failed to get the current working directory")?
             .join(parent)
     };
 
     normalize(&mut app, &base)?;
     app.validate()
-        .map_err(|e| anyhow::anyhow!("appcipe.yml 驗證失敗：\n{e}"))?;
+        .map_err(|e| anyhow::anyhow!("appcipe.yml validation failed:\n{e}"))?;
     Ok(app)
 }
 
@@ -432,7 +440,7 @@ services:
         )
         .unwrap();
         let err = load(&yml).unwrap_err().to_string();
-        assert!(err.contains("驗證失敗"), "{err}");
+        assert!(err.contains("validation failed"), "{err}");
         assert!(err.contains("不支援的 version"), "{err}");
         assert!(err.contains("persist_path"), "{err}");
     }
@@ -462,7 +470,7 @@ services:
         let err = load(Path::new("Z:/definitely/not/here/appcipe.yml"))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("無法讀取設定檔"), "{err}");
+        assert!(err.contains("failed to read config file"), "{err}");
     }
 
     #[test]
@@ -471,6 +479,6 @@ services:
         let yml = dir.path().join("appcipe.yml");
         std::fs::write(&yml, "version: [this is: not valid\n").unwrap();
         let err = load(&yml).unwrap_err().to_string();
-        assert!(err.contains("解析失敗"), "{err}");
+        assert!(err.contains("failed to parse"), "{err}");
     }
 }

@@ -36,14 +36,16 @@ impl PortSpec {
                 let proto = match p.to_ascii_lowercase().as_str() {
                     "tcp" => PortProto::Tcp,
                     "udp" => PortProto::Udp,
-                    other => bail!("不支援的協定 `{other}`（僅支援 tcp/udp）：{s}"),
+                    other => {
+                        bail!("unsupported protocol `{other}` (only tcp/udp are supported): {s}")
+                    }
                 };
                 (m, proto)
             }
             None => (s, PortProto::Tcp),
         };
         let Some((h, g)) = mapping.split_once(':') else {
-            bail!("埠映射格式錯誤，應為 \"host:guest[/proto]\"：{s}");
+            bail!("invalid port mapping format, expected \"host:guest[/proto]\": {s}");
         };
         let host = parse_port(h, s)?;
         let guest = parse_port(g, s)?;
@@ -55,9 +57,9 @@ fn parse_port(p: &str, whole: &str) -> Result<u16> {
     let n: u32 = p
         .trim()
         .parse()
-        .map_err(|_| anyhow::anyhow!("埠號不是數字：`{p}`（於 \"{whole}\"）"))?;
+        .map_err(|_| anyhow::anyhow!("port is not a number: `{p}` (in \"{whole}\")"))?;
     if n == 0 || n > 65535 {
-        bail!("埠號超出範圍 1..=65535：`{p}`（於 \"{whole}\"）");
+        bail!("port out of range 1..=65535: `{p}` (in \"{whole}\")");
     }
     Ok(n as u16)
 }

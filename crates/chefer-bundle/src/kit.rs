@@ -82,14 +82,14 @@ fn find_first<S: AsRef<str>>(dirs: &[PathBuf], names: &[S]) -> Option<PathBuf> {
 pub fn not_found_help(kit_dirs: &[PathBuf], expected: &str) -> String {
     let searched: Vec<String> = kit_dirs.iter().map(|d| d.display().to_string()).collect();
     format!(
-        "找不到 `{expected}`。已搜尋：{}。\n\
-         解法：1) 從 GitHub Releases 下載 runtime kit 放到 chefer 旁的 kit/ 目錄；\
-         2) 或以 `cargo build --release -p chefer-runtime`（及 musl 目標的 guest-agent）自建後，\
-         用 --kit-dir 或 CHEFER_KIT_DIR 指向其所在目錄。",
+        "`{expected}` not found. Searched: {}.\n\
+         Fix: 1) download the runtime kit from GitHub Releases and place it in a kit/ directory next to chefer; \
+         2) or build it yourself with `cargo build --release -p chefer-runtime` (plus the guest-agent for musl targets), \
+         then point --kit-dir or CHEFER_KIT_DIR at the directory containing it.",
         if searched.is_empty() {
-            "（無可搜尋目錄）".to_string()
+            "(no directories to search)".to_string()
         } else {
-            searched.join("、")
+            searched.join(", ")
         }
     )
 }

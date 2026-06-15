@@ -48,13 +48,13 @@ pub fn load_manifest(bundle_dir: &Path) -> Result<chefer_bundle::Manifest> {
     let path = chefer_bundle::layout::manifest_path(bundle_dir);
     if !path.exists() {
         anyhow::bail!(
-            "找不到 bundle manifest：{}；請確認 --bundle 指向解壓後的 bundle 目錄（內含 manifest.json），\
-             或先以 `chefer build` 重新產生 bundle",
+            "bundle manifest not found: {}; make sure --bundle points to an extracted bundle directory (containing manifest.json), \
+             or regenerate the bundle with `chefer build`",
             path.display()
         );
     }
     chefer_bundle::Manifest::load(&path)
-        .with_context(|| format!("載入 bundle manifest 失敗：{}", path.display()))
+        .with_context(|| format!("failed to load bundle manifest: {}", path.display()))
 }
 
 /// 執行整個 bundle：組裝各服務 rootfs、依依賴順序啟動並監控，回傳 app 整體 exit code。
@@ -69,8 +69,8 @@ pub fn run_bundle(cfg: &RunConfig) -> Result<i32> {
     {
         let _ = cfg;
         anyhow::bail!(
-            "guest-agent 僅能於 Linux 環境執行（目前平台：{}）；\
-             請改用 chefer 產出的單一執行檔，由其在 Windows 透過 WSL2、在 macOS 透過 VM 後端啟動",
+            "guest-agent can only run in a Linux environment (current platform: {}); \
+             use the single-file executable produced by chefer instead, which launches it via WSL2 on Windows and via the VM backend on macOS",
             std::env::consts::OS
         )
     }
@@ -107,7 +107,7 @@ mod linux_impl {
                     .join(chefer_bundle::layout::pasta_name(std::env::consts::ARCH));
                 let net = netns::setup_app_netns(rootless, bridge, Some(pasta_hint))?;
                 eprintln!(
-                    "[guest-agent] 網路模式 {}：已建立 per-app network namespace（僅 lo）",
+                    "[guest-agent] network mode {}: created a per-app network namespace (lo only)",
                     if bridge { "bridge" } else { "internal" }
                 );
                 Some(net)
@@ -156,7 +156,7 @@ mod linux_impl {
             for (name, lease) in leases {
                 if !lease.cleanup() {
                     eprintln!(
-                        "[guest-agent] 服務 `{name}` 的 rootfs 仍被其他執行中的 instance 使用，略過清理"
+                        "[guest-agent] the rootfs for service `{name}` is still in use by another running instance, skipping cleanup"
                     );
                 }
             }
@@ -170,8 +170,8 @@ mod linux_impl {
         for svc in order {
             if chefer_bundle::layout::platform_to_arch(&svc.platform).is_none() {
                 bail!(
-                    "service `{}` 的平台 `{}` 尚未支援執行（目前支援 linux/amd64、linux/arm64）；\
-                     請改用 Linux 平台的 image 重新打包",
+                    "service `{}` platform `{}` is not yet supported for execution (currently supported: linux/amd64, linux/arm64); \
+                     repack using a Linux-platform image",
                     svc.name,
                     svc.platform
                 );
@@ -186,8 +186,8 @@ mod linux_impl {
             .collect();
         if terminals.len() > 1 {
             bail!(
-                "同時有多個服務宣告 terminal 介面（{}）；terminal/both 介面最多只能有一個服務，\
-                 請調整 appcipe.yml 的 interface 設定後重新打包",
+                "multiple services declare a terminal interface ({}); at most one service may use a terminal/both interface, \
+                 adjust the interface setting in appcipe.yml and repack",
                 terminals.join(", ")
             );
         }
@@ -203,7 +203,7 @@ mod linux_impl {
         }
         if !missing.is_empty() {
             bail!(
-                "下列掛載的 host 路徑不存在，請先建立（或修正 appcipe.yml 的 mounts 後重新打包）：\n{}",
+                "the following mount host paths do not exist, please create them first (or fix the mounts in appcipe.yml and repack):\n{}",
                 missing.join("\n")
             );
         }
@@ -242,6 +242,6 @@ mod tests {
             udp_bridge: false,
         };
         let err = run_bundle(&cfg).unwrap_err();
-        assert!(format!("{err}").contains("僅能於 Linux"));
+        assert!(format!("{err}").contains("can only run in a Linux"));
     }
 }

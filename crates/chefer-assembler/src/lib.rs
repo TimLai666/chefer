@@ -80,33 +80,37 @@ pub fn assemble(
     // ── 前置檢查 ────────────────────────────────────────────────
     if !runtime_bin.is_file() {
         bail!(
-            "找不到 runtime 執行檔：{}。\n\
-             解法：以 `cargo build --release -p chefer-runtime` 自建，\
-             或從 GitHub Releases 下載 runtime kit（搜尋目錄見 chefer_bundle::kit）。",
+            "runtime executable not found: {}.\n\
+             Fix: build it yourself with `cargo build --release -p chefer-runtime`, \
+             or download the runtime kit from GitHub Releases (search paths: see chefer_bundle::kit).",
             runtime_bin.display()
         );
     }
     if !bundle_dir.is_dir() {
         bail!(
-            "bundle 目錄不存在：{}。請先以 chefer-pack（或 `chefer build`）產生 bundle。",
+            "bundle directory does not exist: {}. Generate the bundle first with chefer-pack (or `chefer build`).",
             bundle_dir.display()
         );
     }
     let manifest_path = chefer_bundle::layout::manifest_path(bundle_dir);
     if !manifest_path.is_file() {
         bail!(
-            "bundle 缺少 manifest.json（預期位置：{}）。\
-             請先以 chefer-pack（或 `chefer build`）產生完整 bundle 再組裝。",
+            "bundle is missing manifest.json (expected at: {}). \
+             Generate a complete bundle with chefer-pack (or `chefer build`) before assembling.",
             manifest_path.display()
         );
     }
     // 順帶驗證 manifest 可解析且格式版本相容，避免組出無法執行的單檔。
-    chefer_bundle::Manifest::load(&manifest_path)
-        .with_context(|| format!("bundle 的 manifest.json 無效：{}", manifest_path.display()))?;
+    chefer_bundle::Manifest::load(&manifest_path).with_context(|| {
+        format!(
+            "bundle manifest.json is invalid: {}",
+            manifest_path.display()
+        )
+    })?;
 
     let bundle_canon = bundle_dir
         .canonicalize()
-        .with_context(|| format!("解析 bundle 路徑失敗：{}", bundle_dir.display()))?;
+        .with_context(|| format!("failed to resolve bundle path: {}", bundle_dir.display()))?;
 
     // 防呆：out 不可與 runtime 是同一檔案（append 會破壞來源）。
     if out_path.exists()
@@ -114,7 +118,7 @@ pub fn assemble(
         && a == b
     {
         bail!(
-            "--out 不可與 --runtime 指向同一個檔案：{}（append payload 會破壞 runtime 來源）",
+            "--out must not point to the same file as --runtime: {} (appending the payload would corrupt the runtime source)",
             a.display()
         );
     }
@@ -124,13 +128,13 @@ pub fn assemble(
         && !parent.as_os_str().is_empty()
     {
         fs_err::create_dir_all(parent)
-            .with_context(|| format!("建立輸出目錄失敗：{}", parent.display()))?;
+            .with_context(|| format!("failed to create output directory: {}", parent.display()))?;
         if let Ok(parent_canon) = parent.canonicalize()
             && parent_canon.starts_with(&bundle_canon)
         {
             bail!(
-                "--out 不可位於 bundle 目錄內（{}），否則 tar 會收錄寫入中的半成品；\
-                 請改放到 bundle 之外的目錄。",
+                "--out must not be inside the bundle directory ({}), otherwise tar would capture the in-progress output; \
+                 place it in a directory outside the bundle.",
                 bundle_canon.display()
             );
         }
@@ -139,7 +143,7 @@ pub fn assemble(
     // ── 1. 複製 runtime → out（覆蓋），大小即 payload offset ─────
     fs_err::copy(runtime_bin, out_path).with_context(|| {
         format!(
-            "複製 runtime 失敗：{} → {}",
+            "failed to copy runtime: {} → {}",
             runtime_bin.display(),
             out_path.display()
         )
@@ -154,10 +158,15 @@ pub fn assemble(
     let file = fs_err::OpenOptions::new()
         .append(true)
         .open(out_path)
-        .with_context(|| format!("開啟輸出檔（append）失敗：{}", out_path.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to open output file (append): {}",
+                out_path.display()
+            )
+        })?;
     let tee = HashingWriter::new(BufWriter::new(file));
     let encoder = zstd::stream::write::Encoder::new(tee, opts.zstd_level)
-        .with_context(|| format!("建立 zstd 編碼器失敗（level={}）", opts.zstd_level))?;
+        .with_context(|| format!("failed to create zstd encoder (level={})", opts.zstd_level))?;
     let mut tar = tar::Builder::new(encoder);
 
     // tar 根目錄項：bundle/
@@ -172,21 +181,21 @@ pub fn assemble(
     }
 
     // 依序關閉各層串流（tar 結尾區塊 → zstd frame 結尾）。
-    let encoder = tar.into_inner().context("關閉 tar 串流失敗")?;
-    let tee = encoder.finish().context("關閉 zstd 串流失敗")?;
+    let encoder = tar.into_inner().context("failed to close tar stream")?;
+    let tee = encoder.finish().context("failed to close zstd stream")?;
     let (mut writer, sha256, payload_len) = tee.finalize()?;
 
     // ── 4. 寫 footer（統一走 chefer_bundle::Footer）──────────────
     let footer = chefer_bundle::Footer::new_zstd(payload_offset, payload_len, sha256);
     writer
         .write_all(&footer.to_bytes())
-        .context("寫入 footer 失敗")?;
-    writer.flush().context("輸出緩衝區排清失敗")?;
+        .context("failed to write footer")?;
+    writer.flush().context("failed to flush output buffer")?;
     let file = writer
         .into_inner()
-        .map_err(|e| anyhow::anyhow!("輸出緩衝區排清失敗：{e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to flush output buffer: {e}"))?;
     file.sync_all()
-        .with_context(|| format!("同步輸出檔失敗：{}", out_path.display()))?;
+        .with_context(|| format!("failed to sync output file: {}", out_path.display()))?;
     drop(file);
 
     // ── 5. 大小自我檢查 ─────────────────────────────────────────
@@ -194,8 +203,8 @@ pub fn assemble(
     let actual = fs_err::metadata(out_path)?.len();
     if actual != out_size {
         bail!(
-            "內部錯誤：輸出大小不符（預期 {out_size}，實際 {actual}）；\
-             輸出檔可能在組裝期間被其他程式修改：{}",
+            "internal error: output size mismatch (expected {out_size}, actual {actual}); \
+             the output file may have been modified by another program during assembly: {}",
             out_path.display()
         );
     }
@@ -206,8 +215,14 @@ pub fn assemble(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs_err::set_permissions(out_path, std::fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("設定執行權限（755）失敗：{}", out_path.display()))?;
+        fs_err::set_permissions(out_path, std::fs::Permissions::from_mode(0o755)).with_context(
+            || {
+                format!(
+                    "failed to set executable permission (755): {}",
+                    out_path.display()
+                )
+            },
+        )?;
     }
 
     Ok(AssembleReport {
@@ -228,16 +243,16 @@ struct WalkEntry {
 /// 以檔名排序遞迴走訪目錄（深度優先），確保跨平台、跨次執行的順序一致。
 fn walk_sorted(dir: &Path, rel_prefix: &str, out: &mut Vec<WalkEntry>) -> Result<()> {
     let mut items = fs_err::read_dir(dir)
-        .with_context(|| format!("讀取目錄失敗：{}", dir.display()))?
+        .with_context(|| format!("failed to read directory: {}", dir.display()))?
         .collect::<io::Result<Vec<_>>>()
-        .with_context(|| format!("讀取目錄項目失敗：{}", dir.display()))?;
+        .with_context(|| format!("failed to read directory entries: {}", dir.display()))?;
     items.sort_by_key(|e| e.file_name());
 
     for item in items {
         let name_os = item.file_name();
         let Some(name) = name_os.to_str() else {
             bail!(
-                "bundle 內檔名不是有效 UTF-8：{}；tar 路徑需可攜，請重新命名該檔案",
+                "filename in bundle is not valid UTF-8: {}; tar paths must be portable, please rename the file",
                 item.path().display()
             );
         };
@@ -248,7 +263,7 @@ fn walk_sorted(dir: &Path, rel_prefix: &str, out: &mut Vec<WalkEntry>) -> Result
         };
         let ft = item
             .file_type()
-            .with_context(|| format!("讀取檔案類型失敗：{}", item.path().display()))?;
+            .with_context(|| format!("failed to read file type: {}", item.path().display()))?;
         if ft.is_dir() {
             out.push(WalkEntry {
                 abs: item.path(),
@@ -266,8 +281,8 @@ fn walk_sorted(dir: &Path, rel_prefix: &str, out: &mut Vec<WalkEntry>) -> Result
             // chefer-pack 產生的 bundle 只含一般檔案與目錄；symlink 在
             // Windows host 無法忠實保存，直接拒絕以免產出不一致的單檔。
             bail!(
-                "bundle 內含不支援的項目（symlink 或特殊檔案）：{}；\
-                 bundle 只應包含一般檔案與目錄，請重新打包",
+                "bundle contains an unsupported entry (symlink or special file): {}; \
+                 a bundle should only contain regular files and directories, please repack",
                 item.path().display()
             );
         }
@@ -291,7 +306,7 @@ fn deterministic_header(entry_type: tar::EntryType, mode: u32, size: u64) -> tar
 fn append_dir_entry<W: Write>(tar: &mut tar::Builder<W>, tar_path: &str) -> Result<()> {
     let mut h = deterministic_header(tar::EntryType::Directory, 0o755, 0);
     tar.append_data(&mut h, format!("{tar_path}/"), io::empty())
-        .with_context(|| format!("寫入 tar 目錄項失敗：{tar_path}/"))?;
+        .with_context(|| format!("failed to write tar directory entry: {tar_path}/"))?;
     Ok(())
 }
 
@@ -301,10 +316,11 @@ fn append_file_entry<W: Write>(
     tar_path: &str,
     src: &Path,
 ) -> Result<()> {
-    let f = fs_err::File::open(src).with_context(|| format!("開啟檔案失敗：{}", src.display()))?;
+    let f = fs_err::File::open(src)
+        .with_context(|| format!("failed to open file: {}", src.display()))?;
     let len = f
         .metadata()
-        .with_context(|| format!("讀取檔案中繼資料失敗：{}", src.display()))?
+        .with_context(|| format!("failed to read file metadata: {}", src.display()))?
         .len();
     // agents/ 下是 guest-agent 二進位，解出後需可執行；其餘為資料檔。
     let mode = if tar_path.starts_with("bundle/agents/") {
@@ -314,7 +330,7 @@ fn append_file_entry<W: Write>(
     };
     let mut h = deterministic_header(tar::EntryType::Regular, mode, len);
     tar.append_data(&mut h, tar_path, BufReader::new(f))
-        .with_context(|| format!("寫入 tar 檔案失敗：{}（{}）", tar_path, src.display()))?;
+        .with_context(|| format!("failed to write tar file: {} ({})", tar_path, src.display()))?;
     Ok(())
 }
 
@@ -356,8 +372,8 @@ impl<W: Write> Write for HashingWriter<W> {
 
 /// 串流計算檔案中 `[offset, offset+len)` 區段的 SHA-256（驗證用）。
 pub fn hash_payload(path: &Path, offset: u64, len: u64) -> Result<[u8; 32]> {
-    let mut f =
-        fs_err::File::open(path).with_context(|| format!("開啟檔案失敗：{}", path.display()))?;
+    let mut f = fs_err::File::open(path)
+        .with_context(|| format!("failed to open file: {}", path.display()))?;
     f.seek(SeekFrom::Start(offset))?;
     let mut limited = f.take(len);
     let mut hasher = Sha256::new();
@@ -366,7 +382,9 @@ pub fn hash_payload(path: &Path, offset: u64, len: u64) -> Result<[u8; 32]> {
     while remaining > 0 {
         let n = limited.read(&mut buf)?;
         if n == 0 {
-            bail!("payload 區段不足：預期 {len} bytes，提前讀到 EOF（檔案可能損毀）");
+            bail!(
+                "payload segment is too short: expected {len} bytes, hit EOF early (the file may be corrupt)"
+            );
         }
         hasher.update(&buf[..n]);
         remaining -= n as u64;
@@ -598,7 +616,7 @@ mod tests {
         make_fake_bundle(&bundle);
 
         let err = assemble(&runtime, &bundle, &runtime, &AssembleOptions::default()).unwrap_err();
-        assert!(err.to_string().contains("同一個檔案"), "{err:#}");
+        assert!(err.to_string().contains("same file"), "{err:#}");
     }
 
     #[test]
@@ -612,7 +630,7 @@ mod tests {
 
         let out = bundle.join("app");
         let err = assemble(&runtime, &bundle, &out, &AssembleOptions::default()).unwrap_err();
-        assert!(err.to_string().contains("bundle 目錄內"), "{err:#}");
+        assert!(err.to_string().contains("inside the bundle"), "{err:#}");
     }
 
     #[test]

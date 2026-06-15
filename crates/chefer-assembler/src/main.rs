@@ -42,15 +42,15 @@ fn main() -> ExitCode {
     };
     match assemble(&cli.runtime, &cli.bundle, &cli.out, &opts) {
         Ok(report) => {
-            println!("已輸出單一執行檔：{}", cli.out.display());
+            println!("wrote single-file executable: {}", cli.out.display());
             println!("  payload offset : {} bytes", report.payload_offset);
             println!("  payload length : {} bytes", report.payload_len);
             println!("  payload sha256 : {}", report.sha256_hex());
-            println!("  輸出檔總大小   : {} bytes", report.out_size);
+            println!("  total out size : {} bytes", report.out_size);
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("錯誤：{e:#}");
+            eprintln!("error: {e:#}");
             ExitCode::FAILURE
         }
     }

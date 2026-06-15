@@ -57,7 +57,7 @@ impl<R: Read> Read for LimitedReader<R> {
                 _ => Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "解壓內容超過上限 {} bytes（可能是惡意的解壓炸彈或損毀檔案）",
+                        "decompressed content exceeds the limit of {} bytes (possibly a malicious decompression bomb or a corrupted file)",
                         self.limit
                     ),
                 )),

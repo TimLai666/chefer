@@ -94,7 +94,7 @@ struct ChildPlan {
 fn join_guest(rootfs: &Path, guest: &str) -> Result<PathBuf> {
     let stripped = guest.strip_prefix('/').unwrap_or(guest);
     let Some(rel) = crate::rootfs::sanitize_rel_path(stripped)? else {
-        bail!("容器內路徑無效（不可為根目錄或空路徑）：{guest}");
+        bail!("invalid in-container path (must not be the root directory or empty): {guest}");
     };
     Ok(rootfs.join(rel))
 }
@@ -108,21 +108,21 @@ pub fn spawn_service(spec: &SpawnSpec) -> Result<Spawned> {
     let (out_r, out_w, err_r, err_w) = if spec.terminal {
         (None, None, None, None)
     } else {
-        let (or_, ow) =
-            nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).context("建立 stdout 管線失敗")?;
-        let (er, ew) =
-            nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).context("建立 stderr 管線失敗")?;
+        let (or_, ow) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+            .context("failed to create stdout pipe")?;
+        let (er, ew) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+            .context("failed to create stderr pipe")?;
         (Some(or_), Some(ow), Some(er), Some(ew))
     };
 
     // pid 回報管線：中繼行程在二次 fork 後，把孫行程（pid-ns init）的 host pid
     // 寫回給 supervisor。CLOEXEC：服務 exec 後不繼承。
-    let (pid_r, pid_w) =
-        nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).context("建立 pid 回報管線失敗")?;
+    let (pid_r, pid_w) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+        .context("failed to create pid report pipe")?;
 
     // SAFETY: fork 後子行程僅呼叫 async-signal 相對安全的操作與系統呼叫，
     // 失敗一律以 _exit 結束，不返回呼叫端。
-    match unsafe { fork() }.with_context(|| format!("fork 服務 `{}` 失敗", svc.name))? {
+    match unsafe { fork() }.with_context(|| format!("failed to fork service `{}`", svc.name))? {
         ForkResult::Parent { child } => {
             // 與子行程雙邊 setpgid，消除 killpg 競態
             let _ = setpgid(child, child);
@@ -178,7 +178,7 @@ fn build_plan(spec: &SpawnSpec) -> Result<ChildPlan> {
     if let Some(persist) = &svc.persist_path {
         let host = spec.data_dir.join("data").join(&svc.name);
         fs::create_dir_all(&host)
-            .with_context(|| format!("建立 persist 目錄失敗：{}", host.display()))?;
+            .with_context(|| format!("failed to create persist directory: {}", host.display()))?;
         binds.push(BindEntry {
             host,
             target: join_guest(spec.rootfs, persist)?,
@@ -275,12 +275,12 @@ fn build_plan(spec: &SpawnSpec) -> Result<ChildPlan> {
         .iter()
         .map(|s| CString::new(s.as_bytes()))
         .collect::<Result<Vec<_>, _>>()
-        .context("命令參數含 NUL 字元，無法執行")?;
+        .context("command argument contains a NUL byte, cannot execute")?;
     let envp = env
         .iter()
         .map(|(k, v)| CString::new(format!("{k}={v}")))
         .collect::<Result<Vec<_>, _>>()
-        .context("環境變數含 NUL 字元，無法執行")?;
+        .context("environment variable contains a NUL byte, cannot execute")?;
 
     Ok(ChildPlan {
         name: svc.name.clone(),
@@ -360,8 +360,8 @@ fn middle_child(
         }
         if let Err(e) = unshare(flags) {
             eprintln!(
-                "[guest-agent] 服務 `{}` unshare({}) 失敗：{e}；\
-                 請確認核心允許 unprivileged user namespaces（/proc/sys/kernel/unprivileged_userns_clone = 1）",
+                "[guest-agent] service `{}` unshare({}) failed: {e}; \
+                 make sure the kernel allows unprivileged user namespaces (/proc/sys/kernel/unprivileged_userns_clone = 1)",
                 plan.name,
                 if real_root {
                     "mount+pid"
@@ -373,7 +373,7 @@ fn middle_child(
         }
         if !real_root && let Err(e) = write_id_maps(plan.uid, plan.gid) {
             eprintln!(
-                "[guest-agent] 服務 `{}` 寫入 uid/gid map 失敗：{e:#}",
+                "[guest-agent] service `{}` failed to write uid/gid map: {e:#}",
                 plan.name
             );
             return 126;
@@ -394,7 +394,10 @@ fn middle_child(
                     Ok(_) => continue,
                     Err(Errno::EINTR) => continue,
                     Err(e) => {
-                        eprintln!("[guest-agent] 等待服務 `{}` 失敗：{e}", plan.name);
+                        eprintln!(
+                            "[guest-agent] failed to wait for service `{}`: {e}",
+                            plan.name
+                        );
                         return 126;
                     }
                 }
@@ -406,11 +409,17 @@ fn middle_child(
                 Err(e) => e,
                 Ok(never) => match never {},
             };
-            eprintln!("[guest-agent] 服務 `{}` 啟動失敗：{err:#}", plan.name);
+            eprintln!(
+                "[guest-agent] service `{}` failed to start: {err:#}",
+                plan.name
+            );
             unsafe { libc::_exit(126) }
         }
         Err(e) => {
-            eprintln!("[guest-agent] 服務 `{}` 二次 fork 失敗：{e}", plan.name);
+            eprintln!(
+                "[guest-agent] service `{}` second fork failed: {e}",
+                plan.name
+            );
             126
         }
     }
@@ -429,20 +438,20 @@ fn join_app_netns(name: &str, join: crate::netns::NetnsJoin, _real_root: bool) -
         // SAFETY: user_fd 由 supervisor 經 fork 繼承，於本行程使用期間有效。
         let fd = unsafe { BorrowedFd::borrow_raw(user_fd) };
         if let Err(e) = setns(fd, CloneFlags::CLONE_NEWUSER) {
-            eprintln!("[guest-agent] 服務 `{name}` 加入 app user ns 失敗：{e}");
+            eprintln!("[guest-agent] service `{name}` failed to join the app user ns: {e}");
             return Err(126);
         }
     }
     // SAFETY: net_fd 由 supervisor 經 fork 繼承，於本行程使用期間有效。
     let net = unsafe { BorrowedFd::borrow_raw(join.net) };
     if let Err(e) = setns(net, CloneFlags::CLONE_NEWNET) {
-        eprintln!("[guest-agent] 服務 `{name}` 加入 app network ns 失敗：{e}");
+        eprintln!("[guest-agent] service `{name}` failed to join the app network ns: {e}");
         return Err(126);
     }
     if let Err(e) = unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID) {
         eprintln!(
-            "[guest-agent] 服務 `{name}` unshare(mount+pid) 失敗：{e}；\
-             請確認核心允許所需的 namespaces"
+            "[guest-agent] service `{name}` unshare(mount+pid) failed: {e}; \
+             make sure the kernel allows the required namespaces"
         );
         return Err(126);
     }
@@ -462,12 +471,12 @@ fn write_id_maps(uid: u32, gid: u32) -> Result<()> {
         Ok(()) => {}
         // 舊核心（< 3.19）沒有此檔案 → 可直接寫 gid_map
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).context("寫入 /proc/self/setgroups 失敗"),
+        Err(e) => return Err(e).context("failed to write /proc/self/setgroups"),
     }
     fs::write("/proc/self/uid_map", format!("0 {uid} 1"))
-        .context("寫入 /proc/self/uid_map 失敗")?;
+        .context("failed to write /proc/self/uid_map")?;
     fs::write("/proc/self/gid_map", format!("0 {gid} 1"))
-        .context("寫入 /proc/self/gid_map 失敗")?;
+        .context("failed to write /proc/self/gid_map")?;
     Ok(())
 }
 
@@ -495,7 +504,7 @@ fn setup_and_exec(plan: &ChildPlan) -> Result<Infallible> {
         MsFlags::MS_REC | MsFlags::MS_PRIVATE,
         None,
     )
-    .context("設定掛載傳播為 private 失敗")?;
+    .context("failed to set mount propagation to private")?;
 
     // 2) rootfs bind 到自身，成為掛載點（pivot_root 的前提）
     mnt(
@@ -505,11 +514,11 @@ fn setup_and_exec(plan: &ChildPlan) -> Result<Infallible> {
         MsFlags::MS_BIND | MsFlags::MS_REC,
         None,
     )
-    .with_context(|| format!("bind rootfs 失敗：{}", root.display()))?;
+    .with_context(|| format!("failed to bind rootfs: {}", root.display()))?;
 
     // 3) /proc（proc 型別；此時已在新 pid ns）
     let proc_dir = root.join("proc");
-    fs::create_dir_all(&proc_dir).context("建立 /proc 目錄失敗")?;
+    fs::create_dir_all(&proc_dir).context("failed to create /proc directory")?;
     mnt(
         Some(Path::new("proc")),
         &proc_dir,
@@ -517,7 +526,7 @@ fn setup_and_exec(plan: &ChildPlan) -> Result<Infallible> {
         MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
         None,
     )
-    .context("掛載 /proc 失敗")?;
+    .context("failed to mount /proc")?;
 
     // 4) /dev
     setup_dev(root)?;
@@ -525,16 +534,25 @@ fn setup_and_exec(plan: &ChildPlan) -> Result<Infallible> {
     // 5) persist / bind mounts / GUI socket
     for b in &plan.binds {
         if b.is_dir {
-            fs::create_dir_all(&b.target)
-                .with_context(|| format!("建立掛載目標目錄失敗：{}", b.target.display()))?;
+            fs::create_dir_all(&b.target).with_context(|| {
+                format!(
+                    "failed to create mount target directory: {}",
+                    b.target.display()
+                )
+            })?;
         } else {
             if let Some(parent) = b.target.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("建立掛載目標上層目錄失敗：{}", parent.display()))?;
+                fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "failed to create mount target parent directory: {}",
+                        parent.display()
+                    )
+                })?;
             }
             if !b.target.exists() {
-                fs::File::create(&b.target)
-                    .with_context(|| format!("建立掛載目標檔案失敗：{}", b.target.display()))?;
+                fs::File::create(&b.target).with_context(|| {
+                    format!("failed to create mount target file: {}", b.target.display())
+                })?;
             }
         }
         mnt(
@@ -546,7 +564,7 @@ fn setup_and_exec(plan: &ChildPlan) -> Result<Infallible> {
         )
         .with_context(|| {
             format!(
-                "bind mount 失敗：{} → {}",
+                "bind mount failed: {} → {}",
                 b.host.display(),
                 b.target.display()
             )
@@ -559,7 +577,7 @@ fn setup_and_exec(plan: &ChildPlan) -> Result<Infallible> {
                 MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
                 None,
             )
-            .with_context(|| format!("設定唯讀掛載失敗：{}", b.target.display()))?;
+            .with_context(|| format!("failed to set read-only mount: {}", b.target.display()))?;
         }
     }
 
@@ -567,18 +585,19 @@ fn setup_and_exec(plan: &ChildPlan) -> Result<Infallible> {
     //    kernel 會以 EINVAL 拒絕 pivot_root，此時退回 MS_MOVE + chroot
     //    （macOS vz / QEMU appliance 從 initramfs 開機即屬此情形）。
     let put_old = root.join(".chefer-put-old");
-    fs::create_dir_all(&put_old).context("建立 pivot_root 暫目錄失敗")?;
+    fs::create_dir_all(&put_old).context("failed to create pivot_root temp directory")?;
     match nix::unistd::pivot_root(root, &put_old) {
         Ok(()) => {
-            nix::unistd::chdir("/").context("chdir(/) 失敗")?;
-            umount2("/.chefer-put-old", MntFlags::MNT_DETACH).context("卸載舊根失敗")?;
+            nix::unistd::chdir("/").context("chdir(/) failed")?;
+            umount2("/.chefer-put-old", MntFlags::MNT_DETACH)
+                .context("failed to unmount old root")?;
             let _ = fs::remove_dir("/.chefer-put-old");
         }
         Err(Errno::EINVAL) => {
             // initramfs rootfs 無法 pivot_root。改用 switch_root 慣用法：
             // chdir(新根) → MS_MOVE 把新根掛載移成 / → chroot(".")。
             let _ = fs::remove_dir(&put_old); // 此路徑不需 put_old
-            nix::unistd::chdir(root).context("chdir(新根) 失敗")?;
+            nix::unistd::chdir(root).context("chdir(new root) failed")?;
             mnt(
                 Some(Path::new(".")),
                 Path::new("/"),
@@ -586,17 +605,17 @@ fn setup_and_exec(plan: &ChildPlan) -> Result<Infallible> {
                 MsFlags::MS_MOVE,
                 None,
             )
-            .context("MS_MOVE 新根到 / 失敗（pivot_root 退回路徑）")?;
-            nix::unistd::chroot(".").context("chroot(新根) 失敗")?;
-            nix::unistd::chdir("/").context("chdir(/) 失敗")?;
+            .context("MS_MOVE of new root to / failed (pivot_root fallback path)")?;
+            nix::unistd::chroot(".").context("chroot(new root) failed")?;
+            nix::unistd::chdir("/").context("chdir(/) failed")?;
         }
-        Err(e) => return Err(anyhow::anyhow!("pivot_root 失敗：{e}")),
+        Err(e) => return Err(anyhow::anyhow!("pivot_root failed: {e}")),
     }
 
     // 7) chdir 至工作目錄（workdir_override > image working_dir > /）
     nix::unistd::chdir(Path::new(&plan.workdir)).with_context(|| {
         format!(
-            "切換至工作目錄 `{}` 失敗；請確認 image 內含該目錄或修正 workdir 設定",
+            "failed to change to working directory `{}`; make sure the image contains this directory or fix the workdir setting",
             plan.workdir
         )
     })?;
@@ -615,17 +634,17 @@ fn setup_and_exec(plan: &ChildPlan) -> Result<Infallible> {
     let prog = resolve_program(&plan.program, &plan.path_env)?;
     nix::unistd::execve(&prog, &plan.argv, &plan.envp).with_context(|| {
         format!(
-            "執行 `{}` 失敗；請確認該檔案存在且可執行（或其直譯器存在於 image 內）",
+            "failed to execute `{}`; make sure the file exists and is executable (or that its interpreter is present in the image)",
             plan.program
         )
     })?;
-    unreachable!("execve 成功時不會返回");
+    unreachable!("execve does not return on success");
 }
 
 /// 建立容器的 /dev：tmpfs + bind host 基本裝置 + devpts + shm + 慣用 symlink。
 fn setup_dev(root: &Path) -> Result<()> {
     let dev = root.join("dev");
-    fs::create_dir_all(&dev).context("建立 /dev 目錄失敗")?;
+    fs::create_dir_all(&dev).context("failed to create /dev directory")?;
     mnt(
         Some(Path::new("tmpfs")),
         &dev,
@@ -633,7 +652,7 @@ fn setup_dev(root: &Path) -> Result<()> {
         MsFlags::MS_NOSUID,
         Some("mode=755,size=65536k"),
     )
-    .context("掛載 /dev (tmpfs) 失敗")?;
+    .context("failed to mount /dev (tmpfs)")?;
 
     // host 基本裝置 bind 進來（不存在者略過——如無 controlling tty 時的 /dev/tty）
     for name in ["null", "zero", "random", "urandom", "tty"] {
@@ -642,14 +661,15 @@ fn setup_dev(root: &Path) -> Result<()> {
             continue;
         }
         let target = dev.join(name);
-        fs::File::create(&target).with_context(|| format!("建立 /dev/{name} 掛載點失敗"))?;
+        fs::File::create(&target)
+            .with_context(|| format!("failed to create /dev/{name} mount point"))?;
         mnt(Some(host.as_path()), &target, None, MsFlags::MS_BIND, None)
-            .with_context(|| format!("bind /dev/{name} 失敗"))?;
+            .with_context(|| format!("failed to bind /dev/{name}"))?;
     }
 
     // /dev/pts（devpts 新實例；gid 未映射 → 不指定 gid 選項）
     let pts = dev.join("pts");
-    fs::create_dir_all(&pts).context("建立 /dev/pts 失敗")?;
+    fs::create_dir_all(&pts).context("failed to create /dev/pts")?;
     mnt(
         Some(Path::new("devpts")),
         &pts,
@@ -657,11 +677,11 @@ fn setup_dev(root: &Path) -> Result<()> {
         MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
         Some("newinstance,ptmxmode=0666,mode=0620"),
     )
-    .context("掛載 /dev/pts 失敗")?;
+    .context("failed to mount /dev/pts")?;
 
     // /dev/shm（tmpfs，1777）
     let shm = dev.join("shm");
-    fs::create_dir_all(&shm).context("建立 /dev/shm 失敗")?;
+    fs::create_dir_all(&shm).context("failed to create /dev/shm")?;
     mnt(
         Some(Path::new("tmpfs")),
         &shm,
@@ -669,7 +689,7 @@ fn setup_dev(root: &Path) -> Result<()> {
         MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
         Some("mode=1777,size=65536k"),
     )
-    .context("掛載 /dev/shm 失敗")?;
+    .context("failed to mount /dev/shm")?;
 
     // 慣用 symlink
     let links = [
@@ -688,7 +708,7 @@ fn setup_dev(root: &Path) -> Result<()> {
 /// 在容器內 PATH 中尋找可執行檔（argv[0] 含 `/` 時直接使用）。
 fn resolve_program(program: &str, path_env: &str) -> Result<CString> {
     if program.contains('/') {
-        return CString::new(program).context("執行檔路徑含 NUL 字元");
+        return CString::new(program).context("executable path contains a NUL byte");
     }
     for dir in path_env.split(':').filter(|d| !d.is_empty()) {
         let cand = Path::new(dir).join(program);
@@ -696,11 +716,12 @@ fn resolve_program(program: &str, path_env: &str) -> Result<CString> {
             && md.is_file()
             && (md.permissions().mode() & 0o111) != 0
         {
-            return CString::new(cand.as_os_str().as_bytes()).context("執行檔路徑含 NUL 字元");
+            return CString::new(cand.as_os_str().as_bytes())
+                .context("executable path contains a NUL byte");
         }
     }
     bail!(
-        "找不到可執行檔 `{program}`（搜尋 PATH={path_env}）；\
-         請確認 image 內含該命令，或在 appcipe 的 cmd 指定完整路徑"
+        "executable not found: `{program}` (searched PATH={path_env}); \
+         make sure the image contains this command, or specify a full path in the appcipe `cmd`"
     )
 }

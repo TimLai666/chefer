@@ -55,21 +55,21 @@ pub fn parse_mount_args<I: IntoIterator<Item = String>>(args: I) -> Result<Mount
             // -n：不寫 mtab；-f：fake；-v：verbose——皆可安全忽略
             "-i" | "-n" | "-f" | "-v" => {}
             "-t" => {
-                let v = it.next().ok_or("-t 需要參數")?;
+                let v = it.next().ok_or("-t requires an argument")?;
                 req.fstype = Some(v);
             }
             "-o" => {
-                let v = it.next().ok_or("-o 需要參數")?;
+                let v = it.next().ok_or("-o requires an argument")?;
                 opt_strings.push(v);
             }
             "-r" => opt_strings.push("ro".into()),
             "-w" => opt_strings.push("rw".into()),
-            other => return Err(format!("不支援的 mount 參數：{other}")),
+            other => return Err(format!("unsupported mount argument: {other}")),
         }
     }
 
     if positionals.len() > 2 {
-        return Err(format!("過多位置參數：{positionals:?}"));
+        return Err(format!("too many positional arguments: {positionals:?}"));
     }
     let mut pos = positionals.into_iter();
     match (pos.next(), pos.next()) {
@@ -161,7 +161,7 @@ pub fn parse_umount_args<I: IntoIterator<Item = String>>(args: I) -> Result<Umou
             "-n" | "-v" | "-i" | "-d" | "-r" => {}
             "--" => {}
             other if other.starts_with('-') => {
-                return Err(format!("不支援的 umount 參數：{other}"));
+                return Err(format!("unsupported umount argument: {other}"));
             }
             target => req.targets.push(target.to_string()),
         }
@@ -227,7 +227,7 @@ fn do_mount(req: &MountRequest) -> i32 {
                 return 0;
             }
             Err(e) => {
-                eprintln!("mount: 無法讀取 /proc/mounts：{e}");
+                eprintln!("mount: cannot read /proc/mounts: {e}");
                 return 1;
             }
         }
@@ -237,7 +237,7 @@ fn do_mount(req: &MountRequest) -> i32 {
         return 0;
     }
     let (Some(source), Some(target)) = (&req.source, &req.target) else {
-        eprintln!("mount: 缺少 source/target");
+        eprintln!("mount: missing source/target");
         return 1;
     };
 
@@ -281,7 +281,7 @@ fn do_mount(req: &MountRequest) -> i32 {
         Ok(()) => 0,
         Err(e) => {
             eprintln!(
-                "mount: 掛載 {source} 到 {target}（type={:?}）失敗：{e}",
+                "mount: failed to mount {source} on {target} (type={:?}): {e}",
                 req.fstype
             );
             32 // util-linux mount 的失敗碼慣例
@@ -291,7 +291,7 @@ fn do_mount(req: &MountRequest) -> i32 {
 
 #[cfg(not(target_os = "linux"))]
 fn do_mount(_req: &MountRequest) -> i32 {
-    eprintln!("mount: 僅支援 Linux");
+    eprintln!("mount: only supported on Linux");
     1
 }
 
@@ -313,7 +313,7 @@ fn do_umount(req: &UmountRequest) -> i32 {
     let mut code = 0;
     for t in &req.targets {
         if let Err(e) = umount2(t.as_str(), flags) {
-            eprintln!("umount: 卸載 {t} 失敗：{e}");
+            eprintln!("umount: failed to unmount {t}: {e}");
             code = 32;
         }
     }
@@ -322,7 +322,7 @@ fn do_umount(req: &UmountRequest) -> i32 {
 
 #[cfg(not(target_os = "linux"))]
 fn do_umount(_req: &UmountRequest) -> i32 {
-    eprintln!("umount: 僅支援 Linux");
+    eprintln!("umount: only supported on Linux");
     1
 }
 

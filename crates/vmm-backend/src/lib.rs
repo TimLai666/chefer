@@ -93,8 +93,8 @@ pub fn run_app(ctx: &AppRunContext) -> Result<i32> {
     let list = backends();
     if list.is_empty() {
         anyhow::bail!(
-            "目前平台（{}）尚無可用的執行後端；chefer 單檔目前支援 Linux（namespaces）、\
-             Windows（WSL2）與 macOS（規劃中）",
+            "No execution backend is available on this platform ({}). chefer single-file \
+             apps currently support Linux (namespaces), Windows (WSL2), and macOS (planned).",
             std::env::consts::OS
         );
     }
@@ -103,11 +103,14 @@ pub fn run_app(ctx: &AppRunContext) -> Result<i32> {
         match backend.availability(ctx) {
             Availability::Available => return backend.run(ctx),
             Availability::Unavailable(reason) => {
-                reasons.push(format!("  - {}：{}", backend.name(), reason));
+                reasons.push(format!("  - {}: {}", backend.name(), reason));
             }
         }
     }
-    anyhow::bail!("沒有可用的執行後端：\n{}", reasons.join("\n"))
+    anyhow::bail!(
+        "No execution backend is available. Tried the following:\n{}",
+        reasons.join("\n")
+    )
 }
 
 /// 清理所有由 chefer 建立的 WSL distro（`chefer-rt-` 前綴）；回傳已移除的 distro 名稱。
@@ -121,8 +124,8 @@ pub fn cleanup_distros() -> Result<Vec<String>> {
     #[cfg(not(target_os = "windows"))]
     {
         anyhow::bail!(
-            "cleanup_distros 僅支援 Windows（WSL2 後端）；目前平台（{}）沒有 chefer 專用的 \
-             WSL distro 需要清理",
+            "cleanup_distros is only supported on Windows (WSL2 backend); this platform ({}) \
+             has no chefer-dedicated WSL distros to clean up",
             std::env::consts::OS
         )
     }
@@ -152,6 +155,6 @@ mod tests {
     #[test]
     fn cleanup_distros_errors_off_windows() {
         let err = cleanup_distros().unwrap_err();
-        assert!(format!("{err}").contains("僅支援 Windows"));
+        assert!(format!("{err}").contains("only supported on Windows"));
     }
 }

@@ -53,8 +53,8 @@ pub fn install_signal_handlers() -> Result<()> {
     );
     // SAFETY: handler 僅寫入 AtomicBool，為 async-signal-safe。
     unsafe {
-        sigaction(Signal::SIGTERM, &action).context("安裝 SIGTERM 處理失敗")?;
-        sigaction(Signal::SIGINT, &action).context("安裝 SIGINT 處理失敗")?;
+        sigaction(Signal::SIGTERM, &action).context("failed to install SIGTERM handler")?;
+        sigaction(Signal::SIGINT, &action).context("failed to install SIGINT handler")?;
     }
     Ok(())
 }
@@ -84,9 +84,12 @@ pub fn run_services(
             terminate_all(&mut running);
             return Ok(130);
         }
-        let rootfs = rootfs_map
-            .get(&svc.name)
-            .ok_or_else(|| anyhow::anyhow!("內部錯誤：服務 `{}` 缺少 rootfs 對應", svc.name))?;
+        let rootfs = rootfs_map.get(&svc.name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "internal error: service `{}` has no rootfs mapping",
+                svc.name
+            )
+        })?;
         let terminal = svc.interface_mode.wants_terminal();
         let spawned = spawn_service(&SpawnSpec {
             service: svc,
@@ -95,7 +98,7 @@ pub fn run_services(
             terminal,
             netns: netns_join,
         })
-        .with_context(|| format!("啟動服務 `{}` 失敗", svc.name));
+        .with_context(|| format!("failed to start service `{}`", svc.name));
         let spawned = match spawned {
             Ok(s) => s,
             Err(e) => {
@@ -117,7 +120,7 @@ pub fn run_services(
             is_interface: svc.interface_mode.wants_gui() || svc.interface_mode.wants_terminal(),
         });
         eprintln!(
-            "[guest-agent] 服務 `{}` 已啟動（pid {}）",
+            "[guest-agent] service `{}` started (pid {})",
             svc.name, spawned.pid
         );
 
@@ -139,7 +142,7 @@ pub fn run_services(
                         .map(|r| r.describe())
                         .unwrap_or_else(|| "no probe completed".to_string());
                     eprintln!(
-                        "[guest-agent] 服務 `{}` 的 healthcheck 在 {} 次重試後仍未通過（{detail}）；視為啟動失敗（fail_fast）",
+                        "[guest-agent] service `{}` healthcheck still failing after {} retries ({detail}); treating as a startup failure (fail_fast)",
                         svc.name, hc.retries
                     );
                     terminate_all(&mut running);
@@ -178,7 +181,9 @@ fn await_healthy(
     name: &str,
 ) -> Gate {
     let Some(init) = init else {
-        eprintln!("[guest-agent] 服務 `{name}` 取不到 init pid，略過 healthcheck（視為已就緒）");
+        eprintln!(
+            "[guest-agent] could not get init pid for service `{name}`, skipping healthcheck (treating as ready)"
+        );
         return Gate::Healthy;
     };
     let interval = Duration::from_millis(hc.interval_ms.max(1));
@@ -186,7 +191,7 @@ fn await_healthy(
     let started = Instant::now();
     let mut failures: u32 = 0;
     let mut last_fail: Option<crate::health::ProbeFail> = None;
-    eprintln!("[guest-agent] 等待服務 `{name}` 通過 healthcheck…");
+    eprintln!("[guest-agent] waiting for service `{name}` to pass its healthcheck…");
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
             return Gate::ShuttingDown;
@@ -197,11 +202,13 @@ fn await_healthy(
         }
         match crate::health::probe(init, hc) {
             Ok(crate::health::Probe::Healthy) => {
-                eprintln!("[guest-agent] 服務 `{name}` 已就緒（healthy）");
+                eprintln!("[guest-agent] service `{name}` is ready (healthy)");
                 return Gate::Healthy;
             }
             Ok(crate::health::Probe::Failed(reason)) => last_fail = Some(reason),
-            Err(e) => eprintln!("[guest-agent] 服務 `{name}` 的 healthcheck 無法執行：{e:#}"),
+            Err(e) => {
+                eprintln!("[guest-agent] could not run healthcheck for service `{name}`: {e:#}")
+            }
         }
         // start_period 寬限期內的失敗不計入 retries。
         if started.elapsed() >= start_period {
@@ -224,19 +231,19 @@ fn reap_crashed_nonblocking(running: &mut Vec<Running>) -> Option<i32> {
                     let r = running.remove(idx);
                     if code != 0 {
                         eprintln!(
-                            "[guest-agent] 服務 `{}` 以非零代碼 {code} 結束（fail_fast）",
+                            "[guest-agent] service `{}` exited with non-zero exit code {code} (fail_fast)",
                             r.name
                         );
                         return Some(code);
                     }
-                    eprintln!("[guest-agent] 服務 `{}` 正常結束", r.name);
+                    eprintln!("[guest-agent] service `{}` exited normally", r.name);
                 }
             }
             Ok(WaitStatus::Signaled(pid, sig, _)) => {
                 if let Some(idx) = running.iter().position(|r| r.mid == pid) {
                     let r = running.remove(idx);
                     eprintln!(
-                        "[guest-agent] 服務 `{}` 被訊號 {sig:?} 終止（fail_fast）",
+                        "[guest-agent] service `{}` was terminated by signal {sig:?} (fail_fast)",
                         r.name
                     );
                     return Some(128 + sig as i32);
@@ -268,7 +275,7 @@ fn sleep_interruptible(total: Duration) {
 fn monitor(running: &mut Vec<Running>) -> Result<i32> {
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) {
-            eprintln!("[guest-agent] 收到終止訊號，正在停止所有服務…");
+            eprintln!("[guest-agent] received a termination signal, stopping all services…");
             terminate_all(running);
             return Ok(130);
         }
@@ -279,7 +286,7 @@ fn monitor(running: &mut Vec<Running>) -> Result<i32> {
             Ok(s) => s,
             Err(Errno::EINTR) => continue, // 可能是 SIGTERM/SIGINT，回頭檢查旗標
             Err(Errno::ECHILD) => return Ok(0),
-            Err(e) => bail!("等待子行程失敗：{e}"),
+            Err(e) => bail!("failed to wait for child process: {e}"),
         };
         let (pid, code) = match status {
             WaitStatus::Exited(pid, code) => (pid, code),
@@ -294,19 +301,21 @@ fn monitor(running: &mut Vec<Running>) -> Result<i32> {
         let name = done.name;
         if code != 0 {
             eprintln!(
-                "[guest-agent] 服務 `{name}` 以非零代碼 {code} 結束（fail_fast）；正在終止其餘服務…"
+                "[guest-agent] service `{name}` exited with non-zero exit code {code} (fail_fast); terminating the remaining services…"
             );
             terminate_all(running);
             return Ok(code);
         }
         // 介面服務（gui/terminal/both）正常結束 = 使用者關掉視窗/終端 → 收掉整個 app。
         if done.is_interface {
-            eprintln!("[guest-agent] 介面服務 `{name}` 結束（視窗/終端關閉）；正在終止其餘服務…");
+            eprintln!(
+                "[guest-agent] interface service `{name}` exited (window/terminal closed); terminating the remaining services…"
+            );
             terminate_all(running);
             return Ok(0);
         }
         // 非介面服務正常結束（背景/一次性任務）→ 其餘繼續跑。
-        eprintln!("[guest-agent] 服務 `{name}` 正常結束");
+        eprintln!("[guest-agent] service `{name}` exited normally");
     }
 }
 
@@ -340,7 +349,7 @@ fn terminate_all(running: &mut Vec<Running>) {
     }
     for r in running.iter() {
         eprintln!(
-            "[guest-agent] 服務 `{}` 未在 5 秒內結束，強制終止（SIGKILL）",
+            "[guest-agent] service `{}` did not exit within 5 seconds, forcing termination (SIGKILL)",
             r.name
         );
         let _ = killpg(r.mid, Signal::SIGKILL);

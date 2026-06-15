@@ -29,24 +29,28 @@ pub fn windows_path_to_wsl(path: &str) -> Result<String> {
             rest
         } else {
             bail!(
-                "不支援 UNC 網路路徑或裝置路徑：{path}；請將檔案放在本機磁碟（如 C:\\...）後重試"
+                "UNC network paths and device paths are not supported: {path}; put the file on a local drive (e.g. C:\\...) and try again"
             );
         }
     } else if path.starts_with(r"\\") || path.starts_with("//") {
-        bail!("不支援 UNC 網路路徑或裝置路徑：{path}；請將檔案放在本機磁碟（如 C:\\...）後重試");
+        bail!(
+            "UNC network paths and device paths are not supported: {path}; put the file on a local drive (e.g. C:\\...) and try again"
+        );
     } else {
         path
     };
 
     let b = s.as_bytes();
     if b.len() < 2 || !b[0].is_ascii_alphabetic() || b[1] != b':' {
-        bail!("無法轉換為 WSL 路徑（需要絕對 Windows 路徑，如 C:\\foo\\bar）：{path}");
+        bail!(
+            "cannot convert to a WSL path (an absolute Windows path is required, e.g. C:\\foo\\bar): {path}"
+        );
     }
     let drive = (b[0] as char).to_ascii_lowercase();
     let rest = &s[2..];
     if !(rest.is_empty() || rest.starts_with('\\') || rest.starts_with('/')) {
         bail!(
-            "無法轉換磁碟相對路徑（如 C:foo）為 WSL 路徑：{path}；請提供完整絕對路徑（如 C:\\foo）"
+            "cannot convert a drive-relative path (e.g. C:foo) to a WSL path: {path}; provide a full absolute path (e.g. C:\\foo)"
         );
     }
     let rest = rest.replace('\\', "/");

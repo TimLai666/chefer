@@ -201,7 +201,7 @@ impl ServiceEntry {
         }
         if argv.is_empty() {
             bail!(
-                "service `{}` 沒有可執行的命令：image 未定義 Entrypoint/Cmd，appcipe 也未指定 cmd",
+                "service `{}` has no command to run: the image defines no Entrypoint/Cmd and the appcipe specifies no cmd",
                 self.name
             );
         }
@@ -230,12 +230,12 @@ impl ServiceEntry {
 impl Manifest {
     pub fn load(path: &Path) -> Result<Self> {
         let s = std::fs::read_to_string(path)
-            .with_context(|| format!("讀取 manifest 失敗：{}", path.display()))?;
+            .with_context(|| format!("failed to read manifest: {}", path.display()))?;
         let m: Manifest = serde_json::from_str(&s)
-            .with_context(|| format!("解析 manifest 失敗：{}", path.display()))?;
+            .with_context(|| format!("failed to parse manifest: {}", path.display()))?;
         if m.format_version != MANIFEST_FORMAT_VERSION {
             bail!(
-                "不支援的 manifest 格式版本 {}（本版支援 {}）；請以相同版本的 chefer 重新打包",
+                "unsupported manifest format version {} (this build supports {}); repack with a matching chefer version",
                 m.format_version,
                 MANIFEST_FORMAT_VERSION
             );
@@ -246,7 +246,7 @@ impl Manifest {
     pub fn save(&self, path: &Path) -> Result<()> {
         let s = serde_json::to_string_pretty(self)?;
         std::fs::write(path, s)
-            .with_context(|| format!("寫入 manifest 失敗：{}", path.display()))?;
+            .with_context(|| format!("failed to write manifest: {}", path.display()))?;
         Ok(())
     }
 

@@ -53,7 +53,7 @@ pub fn is_rootfs_complete(dir: &Path) -> bool {
 /// - `Ok(None)` 表示路徑正規化後為空（如 `"./"`），呼叫端應跳過該 entry。
 pub fn sanitize_rel_path(entry_path: &str) -> Result<Option<PathBuf>> {
     if entry_path.starts_with('/') {
-        bail!("tar entry 使用絕對路徑，已拒絕：{entry_path}");
+        bail!("tar entry uses an absolute path, rejected: {entry_path}");
     }
     let mut out = PathBuf::new();
     let mut depth = 0usize;
@@ -62,7 +62,7 @@ pub fn sanitize_rel_path(entry_path: &str) -> Result<Option<PathBuf>> {
             continue;
         }
         if comp == ".." {
-            bail!("tar entry 含上層目錄參照（..），已拒絕：{entry_path}");
+            bail!("tar entry contains a parent-directory reference (..), rejected: {entry_path}");
         }
         out.push(comp);
         depth += 1;
@@ -157,8 +157,12 @@ mod linux {
         cache_root: &Path,
     ) -> Result<RootfsLease> {
         let target = service_rootfs_dir(cache_root, svc);
-        fs::create_dir_all(cache_root)
-            .with_context(|| format!("建立快取根目錄失敗：{}", cache_root.display()))?;
+        fs::create_dir_all(cache_root).with_context(|| {
+            format!(
+                "failed to create cache root directory: {}",
+                cache_root.display()
+            )
+        })?;
 
         // 鎖檔放在 cache_root（不在 target 內，因為 target 會被 remove_dir_all）。
         let dir_name = target
@@ -172,33 +176,46 @@ mod linux {
             .create(true)
             .truncate(false)
             .open(&lock_path)
-            .with_context(|| format!("開啟 rootfs 鎖檔失敗：{}", lock_path.display()))?;
+            .with_context(|| format!("failed to open rootfs lock file: {}", lock_path.display()))?;
 
         // 1) 先取共享鎖：快取已完成即走快路徑（並行 instance 互不阻塞）。
-        flock(&lock, libc::LOCK_SH)
-            .with_context(|| format!("取得 rootfs 共享鎖失敗：{}", lock_path.display()))?;
+        flock(&lock, libc::LOCK_SH).with_context(|| {
+            format!(
+                "failed to acquire rootfs shared lock: {}",
+                lock_path.display()
+            )
+        })?;
         if is_rootfs_complete(&target) {
             return Ok(RootfsLease { dir: target, lock });
         }
 
         // 2) 未完成 → 釋放共享鎖、取獨佔鎖重建（獨佔只在「真的要建」時才需要）。
-        flock(&lock, libc::LOCK_UN)
-            .with_context(|| format!("釋放 rootfs 共享鎖失敗：{}", lock_path.display()))?;
-        flock(&lock, libc::LOCK_EX)
-            .with_context(|| format!("取得 rootfs 獨佔鎖失敗：{}", lock_path.display()))?;
+        flock(&lock, libc::LOCK_UN).with_context(|| {
+            format!(
+                "failed to release rootfs shared lock: {}",
+                lock_path.display()
+            )
+        })?;
+        flock(&lock, libc::LOCK_EX).with_context(|| {
+            format!(
+                "failed to acquire rootfs exclusive lock: {}",
+                lock_path.display()
+            )
+        })?;
 
         // 雙重檢查：等待獨佔鎖期間可能已被其他 process 建好。
         if !is_rootfs_complete(&target) {
             if target.exists() {
                 fs::remove_dir_all(&target).with_context(|| {
                     format!(
-                        "移除不完整的 rootfs 快取失敗：{}；請手動刪除後重試",
+                        "failed to remove incomplete rootfs cache: {}; delete it manually and retry",
                         target.display()
                     )
                 })?;
             }
-            fs::create_dir_all(&target)
-                .with_context(|| format!("建立 rootfs 目錄失敗：{}", target.display()))?;
+            fs::create_dir_all(&target).with_context(|| {
+                format!("failed to create rootfs directory: {}", target.display())
+            })?;
 
             if let Err(e) = assemble_rootfs_at(bundle_dir, svc, &target) {
                 // 失敗時盡力清掉半成品，避免下次誤用
@@ -207,13 +224,20 @@ mod linux {
             }
 
             fs::write(target.join(COMPLETE_MARKER), b"").with_context(|| {
-                format!("寫入 {COMPLETE_MARKER} 標記失敗：{}", target.display())
+                format!(
+                    "failed to write {COMPLETE_MARKER} marker: {}",
+                    target.display()
+                )
             })?;
         }
 
         // 3) 降回 SH 並持有至 run 結束（允許並行共用，擋下他人 cleanup）。
-        flock(&lock, libc::LOCK_SH)
-            .with_context(|| format!("降為 rootfs 共享鎖失敗：{}", lock_path.display()))?;
+        flock(&lock, libc::LOCK_SH).with_context(|| {
+            format!(
+                "failed to downgrade to rootfs shared lock: {}",
+                lock_path.display()
+            )
+        })?;
 
         Ok(RootfsLease { dir: target, lock })
     }
@@ -225,7 +249,7 @@ mod linux {
         out_dir: &Path,
     ) -> Result<()> {
         fs::create_dir_all(out_dir)
-            .with_context(|| format!("建立 rootfs 目錄失敗：{}", out_dir.display()))?;
+            .with_context(|| format!("failed to create rootfs directory: {}", out_dir.display()))?;
         // 目錄權限延後套用：解壓中先確保 owner 可寫入（0o700），全部層解完後再 chmod 成精確值
         let mut dir_modes: BTreeMap<PathBuf, u32> = BTreeMap::new();
 
@@ -233,14 +257,14 @@ mod linux {
             let layer_path = bundle_dir.join(&layer.rel_path);
             let f = fs::File::open(&layer_path).with_context(|| {
                 format!(
-                    "開啟 layer 失敗：{}；bundle 可能不完整，請重新解壓或重新打包",
+                    "failed to open layer: {}; the bundle may be incomplete, please re-extract or repack",
                     layer_path.display()
                 )
             })?;
             let decoder = ruzstd::decoding::StreamingDecoder::new(std::io::BufReader::new(f))
-                .with_context(|| format!("zstd 解壓失敗：{}", layer_path.display()))?;
+                .with_context(|| format!("zstd decompress failed: {}", layer_path.display()))?;
             apply_layer(out_dir, decoder, &mut dir_modes)
-                .with_context(|| format!("解開 layer 失敗：{}", layer_path.display()))?;
+                .with_context(|| format!("failed to extract layer: {}", layer_path.display()))?;
         }
 
         // 套用精確的目錄權限（whiteout 可能已刪除部分目錄 → 忽略 NotFound）
@@ -249,7 +273,9 @@ mod linux {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    return Err(e).with_context(|| format!("設定目錄權限失敗：{}", dir.display()));
+                    return Err(e).with_context(|| {
+                        format!("failed to set directory permissions: {}", dir.display())
+                    });
                 }
             }
         }
@@ -276,10 +302,13 @@ mod linux {
             match fs::symlink_metadata(&next) {
                 Ok(md) if md.file_type().is_symlink() => {
                     budget = budget.checked_sub(1).filter(|&b| b > 0).ok_or_else(|| {
-                        anyhow::anyhow!("symlink 層數過深（疑似循環）：{}", next.display())
+                        anyhow::anyhow!(
+                            "symlink nesting too deep (possible cycle): {}",
+                            next.display()
+                        )
                     })?;
                     let target = fs::read_link(&next)
-                        .with_context(|| format!("讀取 symlink 失敗：{}", next.display()))?;
+                        .with_context(|| format!("failed to read symlink: {}", next.display()))?;
                     if target.is_absolute() {
                         // 容器內絕對路徑 → 以 rootfs 根重新解析
                         cur = root.to_path_buf();
@@ -317,9 +346,12 @@ mod linux {
         dir_modes: &mut BTreeMap<PathBuf, u32>,
     ) -> Result<()> {
         let mut archive = tar::Archive::new(reader);
-        for entry in archive.entries().context("讀取 tar entry 失敗")? {
-            let mut entry = entry.context("讀取 tar entry 失敗")?;
-            let path_buf = entry.path().context("tar entry 路徑無法解析")?.into_owned();
+        for entry in archive.entries().context("failed to read tar entry")? {
+            let mut entry = entry.context("failed to read tar entry")?;
+            let path_buf = entry
+                .path()
+                .context("could not parse tar entry path")?
+                .into_owned();
             // tar 規格僅以 `/` 為分隔，不可把 `\` 當分隔（`\` 是合法 Linux 檔名字元）。
             let path_str = path_buf.to_string_lossy().into_owned();
 
@@ -340,10 +372,10 @@ mod linux {
                 None => root.to_path_buf(),
             };
             fs::create_dir_all(&parent_abs)
-                .with_context(|| format!("建立目錄失敗：{}", parent_abs.display()))?;
+                .with_context(|| format!("failed to create directory: {}", parent_abs.display()))?;
             let file_name = rel
                 .file_name()
-                .ok_or_else(|| anyhow::anyhow!("tar entry 缺少檔名：{path_str}"))?;
+                .ok_or_else(|| anyhow::anyhow!("tar entry is missing a file name: {path_str}"))?;
             let dest = parent_abs.join(file_name);
 
             extract_entry(root, &mut entry, &dest, &path_str, dir_modes)?;
@@ -382,7 +414,8 @@ mod linux {
 
     /// 清空目錄內容但保留目錄本身。
     fn clear_dir_contents(dir: &Path) -> Result<()> {
-        for e in fs::read_dir(dir).with_context(|| format!("讀取目錄失敗：{}", dir.display()))?
+        for e in fs::read_dir(dir)
+            .with_context(|| format!("failed to read directory: {}", dir.display()))?
         {
             let e = e?;
             remove_path(&e.path())?;
@@ -396,14 +429,15 @@ mod linux {
             Ok(md) => {
                 if md.is_dir() {
                     fs::remove_dir_all(p)
-                        .with_context(|| format!("刪除目錄失敗：{}", p.display()))?;
+                        .with_context(|| format!("failed to delete directory: {}", p.display()))?;
                 } else {
-                    fs::remove_file(p).with_context(|| format!("刪除檔案失敗：{}", p.display()))?;
+                    fs::remove_file(p)
+                        .with_context(|| format!("failed to delete file: {}", p.display()))?;
                 }
                 Ok(())
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e).with_context(|| format!("檢查路徑失敗：{}", p.display())),
+            Err(e) => Err(e).with_context(|| format!("failed to check path: {}", p.display())),
         }
     }
 
@@ -434,31 +468,37 @@ mod linux {
                     _ => {}
                 }
                 fs::create_dir_all(dest)
-                    .with_context(|| format!("建立目錄失敗：{}", dest.display()))?;
+                    .with_context(|| format!("failed to create directory: {}", dest.display()))?;
                 // 先給 owner rwx 確保後續可寫入；精確權限延後套用
                 fs::set_permissions(dest, fs::Permissions::from_mode((mode & 0o7777) | 0o700))
-                    .with_context(|| format!("設定目錄權限失敗：{}", dest.display()))?;
+                    .with_context(|| {
+                        format!("failed to set directory permissions: {}", dest.display())
+                    })?;
                 dir_modes.insert(dest.to_path_buf(), mode);
             }
             EntryType::Regular | EntryType::Continuous | EntryType::GNUSparse => {
                 remove_existing(dest)?;
                 let mut f = fs::File::create(dest)
-                    .with_context(|| format!("建立檔案失敗：{}", dest.display()))?;
+                    .with_context(|| format!("failed to create file: {}", dest.display()))?;
                 std::io::copy(entry, &mut f)
-                    .with_context(|| format!("寫入檔案失敗：{}", dest.display()))?;
+                    .with_context(|| format!("failed to write file: {}", dest.display()))?;
                 f.set_permissions(fs::Permissions::from_mode(mode & 0o7777))
-                    .with_context(|| format!("設定檔案權限失敗：{}", dest.display()))?;
+                    .with_context(|| {
+                        format!("failed to set file permissions: {}", dest.display())
+                    })?;
             }
             EntryType::Symlink => {
                 let target = entry
                     .link_name()
-                    .context("讀取 symlink 目標失敗")?
-                    .ok_or_else(|| anyhow::anyhow!("symlink entry 缺少目標：{path_str}"))?;
+                    .context("failed to read symlink target")?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("symlink entry is missing a target: {path_str}")
+                    })?;
                 // symlink 目標保留原樣（容器內語意；絕對路徑指向 rootfs 內）
                 remove_existing(dest)?;
                 std::os::unix::fs::symlink(&target, dest).with_context(|| {
                     format!(
-                        "建立 symlink 失敗：{} → {}",
+                        "failed to create symlink: {} → {}",
                         dest.display(),
                         target.display()
                     )
@@ -468,18 +508,20 @@ mod linux {
                 // hardlink 目標必須在 rootfs 內：先做路徑安全檢查再解析
                 let target = entry
                     .link_name()
-                    .context("讀取 hardlink 目標失敗")?
-                    .ok_or_else(|| anyhow::anyhow!("hardlink entry 缺少目標：{path_str}"))?;
+                    .context("failed to read hardlink target")?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("hardlink entry is missing a target: {path_str}")
+                    })?;
                 let target_str = target.to_string_lossy();
                 let target_str = target_str.strip_prefix('/').unwrap_or(&target_str);
                 let Some(target_rel) = sanitize_rel_path(target_str)? else {
-                    bail!("hardlink 目標無效：{path_str} → {target_str}");
+                    bail!("invalid hardlink target: {path_str} → {target_str}");
                 };
                 let target_abs = secure_resolve(root, &target_rel)?;
                 remove_existing(dest)?;
                 fs::hard_link(&target_abs, dest).with_context(|| {
                     format!(
-                        "建立 hardlink 失敗：{} → {}（目標須先存在於 rootfs 內）",
+                        "failed to create hardlink: {} → {} (the target must already exist inside the rootfs)",
                         dest.display(),
                         target_abs.display()
                     )
@@ -491,7 +533,7 @@ mod linux {
                     dest,
                     nix::sys::stat::Mode::from_bits_truncate(mode & 0o7777),
                 )
-                .with_context(|| format!("建立 fifo 失敗：{}", dest.display()))?;
+                .with_context(|| format!("failed to create fifo: {}", dest.display()))?;
             }
             EntryType::Char | EntryType::Block => {
                 // userns 內通常無法 mknod 實體裝置；容器所需基本裝置由執行期掛載提供 → 略過

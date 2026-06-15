@@ -84,7 +84,7 @@ impl Dialer {
         let guard = self
             .sock
             .lock()
-            .map_err(|_| io::Error::other("factory 通道毒化"))?;
+            .map_err(|_| io::Error::other("factory channel poisoned"))?;
         let req = [proto, (port & 0xff) as u8, (port >> 8) as u8];
         // 請求：3-byte (proto, port_le)。
         nix::unistd::write(&*guard, &req).map_err(io::Error::from)?;
@@ -117,9 +117,11 @@ impl Dialer {
             (0, Some(fd)) => Ok(unsafe { OwnedFd::from_raw_fd(fd) }),
             (_, Some(fd)) => {
                 let _ = unsafe { OwnedFd::from_raw_fd(fd) };
-                Err(io::Error::other("holder 回報建立 upstream 失敗"))
+                Err(io::Error::other(
+                    "holder reported failure creating upstream",
+                ))
             }
-            _ => Err(io::Error::other("holder 未回傳 upstream fd")),
+            _ => Err(io::Error::other("holder did not return an upstream fd")),
         }
     }
 }
@@ -207,8 +209,8 @@ pub fn setup_app_netns(
     };
 
     // 就緒/錯誤回報管線：holder 設定完成後寫 1 byte（1=ok / 0=fail）。
-    let (rd, wr) =
-        nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).context("建立 netns 就緒管線失敗")?;
+    let (rd, wr) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+        .context("failed to create netns readiness pipe")?;
     // socket factory 通道：SEQPACKET 保訊息邊界；parent 送 (proto,port)、holder 回 SCM_RIGHTS fd。
     let (sv_parent, sv_holder) = socketpair(
         AddressFamily::Unix,
@@ -216,11 +218,11 @@ pub fn setup_app_netns(
         None,
         SockFlag::SOCK_CLOEXEC,
     )
-    .context("建立 netns factory socketpair 失敗")?;
+    .context("failed to create netns factory socketpair")?;
 
     // SAFETY: fork 後 holder 子行程僅呼叫相對安全的系統呼叫；holder 為 fork-without-exec
     //（在尚未生成任何執行緒的早期階段建立，見 run_bundle_linux 的呼叫順序）。
-    match unsafe { fork() }.context("fork netns holder 失敗")? {
+    match unsafe { fork() }.context("failed to fork netns holder")? {
         ForkResult::Child => {
             drop(rd);
             drop(sv_parent);
@@ -239,8 +241,8 @@ pub fn setup_app_netns(
                 let _ = kill(child, Signal::SIGKILL);
                 let _ = waitpid(child, None);
                 bail!(
-                    "建立 app network namespace 失敗（holder 行程未就緒）；\
-                     請確認核心允許 {}（rootless 需 unprivileged user namespaces）",
+                    "failed to create the app network namespace (holder process not ready); \
+                     check that the kernel allows {} (rootless requires unprivileged user namespaces)",
                     if rootless {
                         "unprivileged user+net namespaces"
                     } else {
@@ -304,15 +306,15 @@ fn start_pasta(holder: Pid, net_uid: u32, net_gid: u32, hint: Option<PathBuf>) -
     match cmd.spawn() {
         Ok(child) => {
             eprintln!(
-                "[guest-agent] bridge 出網：已啟動 pasta（{}）對 app netns 提供 NAT",
+                "[guest-agent] bridge outbound: started pasta ({}) providing NAT for the app netns",
                 prog.to_string_lossy()
             );
             Some(child)
         }
         Err(e) => {
             eprintln!(
-                "[guest-agent] bridge 模式找不到/無法啟動 pasta（{}：{e}）→ 退化為 internal\
-                 （只有 lo、無對外網路）。請在 kit 內附上 pasta，或設定 CHEFER_PASTA 指向其路徑。",
+                "[guest-agent] bridge mode could not find/start pasta ({}: {e}) → degrading to internal\
+                 (only lo, no outbound network). Bundle pasta in the kit, or set CHEFER_PASTA to its path.",
                 prog.to_string_lossy()
             );
             None
@@ -353,7 +355,7 @@ fn open_ns_fd(pid: Pid, which: &str) -> Result<OwnedFd> {
     let raw = unsafe { libc::open(path.as_ptr() as *const libc::c_char, libc::O_CLOEXEC) };
     if raw < 0 {
         return Err(io::Error::last_os_error())
-            .with_context(|| format!("開啟 {} 失敗", &path[..path.len() - 1]));
+            .with_context(|| format!("failed to open {}", &path[..path.len() - 1]));
     }
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
@@ -383,12 +385,12 @@ fn holder_main(net_uid: u32, net_gid: u32, wr: OwnedFd, factory: OwnedFd) -> ! {
     // 先 setgroups→setgid→setuid（setuid 後即失去改 gid/groups 的權限）。
     if nix::unistd::geteuid().as_raw() != net_uid {
         if let Err(e) = setgroups(&[]) {
-            eprintln!("[guest-agent] netns holder setgroups 失敗：{e}");
+            eprintln!("[guest-agent] netns holder setgroups failed: {e}");
             report(false);
             unsafe { libc::_exit(1) }
         }
         if setgid(Gid::from_raw(net_gid)).is_err() || setuid(Uid::from_raw(net_uid)).is_err() {
-            eprintln!("[guest-agent] netns holder 降權到 nobody 失敗");
+            eprintln!("[guest-agent] netns holder failed to drop privileges to nobody");
             report(false);
             unsafe { libc::_exit(1) }
         }
@@ -404,23 +406,23 @@ fn holder_main(net_uid: u32, net_gid: u32, wr: OwnedFd, factory: OwnedFd) -> ! {
     let real_uid = nix::unistd::getuid().as_raw();
     let real_gid = nix::unistd::getgid().as_raw();
     if let Err(e) = unshare(CloneFlags::CLONE_NEWUSER) {
-        eprintln!("[guest-agent] netns holder unshare(user) 失敗：{e}");
+        eprintln!("[guest-agent] netns holder unshare(user) failed: {e}");
         report(false);
         unsafe { libc::_exit(1) }
     }
     if let Err(e) = write_self_id_maps(real_uid, real_gid) {
-        eprintln!("[guest-agent] netns holder 寫入 uid/gid map 失敗：{e:#}");
+        eprintln!("[guest-agent] netns holder failed to write uid/gid map: {e:#}");
         report(false);
         unsafe { libc::_exit(1) }
     }
     // 此時已是 user ns 內 root（持 CAP_NET_ADMIN），再建 net ns。
     if let Err(e) = unshare(CloneFlags::CLONE_NEWNET) {
-        eprintln!("[guest-agent] netns holder unshare(net) 失敗：{e}");
+        eprintln!("[guest-agent] netns holder unshare(net) failed: {e}");
         report(false);
         unsafe { libc::_exit(1) }
     }
     if let Err(e) = bring_lo_up() {
-        eprintln!("[guest-agent] netns holder 拉起 lo 失敗：{e:#}");
+        eprintln!("[guest-agent] netns holder failed to bring up lo: {e:#}");
         report(false);
         unsafe { libc::_exit(1) }
     }
@@ -466,7 +468,7 @@ fn make_upstream(proto: u8, port: u16) -> io::Result<OwnedFd> {
             s.connect((Ipv4Addr::LOCALHOST, port))?;
             Ok(OwnedFd::from(s))
         }
-        _ => Err(io::Error::other("未知 proto")),
+        _ => Err(io::Error::other("unknown proto")),
     }
 }
 
@@ -492,12 +494,12 @@ fn write_self_id_maps(uid: u32, gid: u32) -> Result<()> {
     match std::fs::write("/proc/self/setgroups", "deny") {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).context("寫入 /proc/self/setgroups 失敗"),
+        Err(e) => return Err(e).context("failed to write /proc/self/setgroups"),
     }
     std::fs::write("/proc/self/uid_map", format!("0 {uid} 1"))
-        .context("寫入 holder uid_map 失敗")?;
+        .context("failed to write holder uid_map")?;
     std::fs::write("/proc/self/gid_map", format!("0 {gid} 1"))
-        .context("寫入 holder gid_map 失敗")?;
+        .context("failed to write holder gid_map")?;
     Ok(())
 }
 
@@ -505,7 +507,7 @@ fn write_self_id_maps(uid: u32, gid: u32) -> Result<()> {
 fn bring_lo_up() -> Result<()> {
     let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if sock < 0 {
-        return Err(io::Error::last_os_error()).context("建立 ioctl socket 失敗");
+        return Err(io::Error::last_os_error()).context("failed to create ioctl socket");
     }
     let result = (|| -> Result<()> {
         let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
@@ -515,14 +517,14 @@ fn bring_lo_up() -> Result<()> {
             ifr.ifr_name[i] = *b as libc::c_char;
         }
         if unsafe { libc::ioctl(sock, libc::SIOCGIFFLAGS as _, &mut ifr) } < 0 {
-            return Err(io::Error::last_os_error()).context("SIOCGIFFLAGS(lo) 失敗");
+            return Err(io::Error::last_os_error()).context("SIOCGIFFLAGS(lo) failed");
         }
         // SAFETY: 讀取 ifreq 的 flags union 欄位（寫入 union 欄位本身不需 unsafe）。
         // 只設 IFF_UP（IFF_RUNNING 由核心管理，手動設可能被拒）。
         let cur = unsafe { ifr.ifr_ifru.ifru_flags };
         ifr.ifr_ifru.ifru_flags = cur | (libc::IFF_UP as i16);
         if unsafe { libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &ifr) } < 0 {
-            return Err(io::Error::last_os_error()).context("SIOCSIFFLAGS(lo, UP) 失敗");
+            return Err(io::Error::last_os_error()).context("SIOCSIFFLAGS(lo, UP) failed");
         }
         Ok(())
     })();
