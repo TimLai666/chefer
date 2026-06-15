@@ -180,6 +180,7 @@ fn make_service(image: ImageSourceOrPath) -> Service {
         mounts: vec![],
         interface_mode: Default::default(),
         depends_on: vec![],
+        healthcheck: None,
     }
 }
 

@@ -709,6 +709,7 @@ mod linux_tests {
             mounts: vec![],
             interface_mode: chefer_bundle::InterfaceMode::None,
             depends_on: vec![],
+            healthcheck: None,
         }
     }
 

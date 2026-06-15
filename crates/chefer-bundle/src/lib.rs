@@ -16,7 +16,7 @@ pub mod topo;
 pub use footer::{FLAG_ZSTD, FOOTER_LEN, Footer, MAGIC};
 pub use limit::{LimitedReader, bomb_limit_for};
 pub use manifest::{
-    AppMeta, CmdSpec, ConsoleMode, CrashPolicy, ImageConfig, InterfaceMode, LayerRef,
+    AppMeta, CmdSpec, ConsoleMode, CrashPolicy, HealthCheck, ImageConfig, InterfaceMode, LayerRef,
     MANIFEST_FORMAT_VERSION, Manifest, NetworkMode, ServiceEntry,
 };
 pub use mounts::MountSpec;

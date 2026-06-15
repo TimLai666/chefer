@@ -73,7 +73,12 @@ service 名規則：`[a-z][a-z0-9_]*`，≤32。
   只有列在這裡的埠才會被 chefer 代理到 host。
 - **`mounts`**：`["<host路徑>:<容器內絕對路徑>"]`；容器內路徑須以 `/` 開頭；host 路徑在 build 時須存在。
 - **`interface_mode`**：`gui | terminal | both | none`（預設 none）。**全 app 最多一個 terminal/both**。
-- **`depends_on`**：服務名清單。**只決定啟動順序，不做健康檢查**；須指向存在的服務、不可循環、不可自指。
+- **`depends_on`**：服務名清單。決定啟動順序；若被依賴的服務有 `healthcheck`，依賴者會**等它 healthy 才啟動**（wait-until-ready），否則等它 spawn 即可。須指向存在的服務、不可循環、不可自指。
+- **`healthcheck`**（選填，對齊 Docker HEALTHCHECK）：
+  - `test`：命令字串（= `sh -c`）或陣列（`["CMD", ...]` 直接 argv；`["CMD-SHELL", "..."]` 走 `sh -c`）。在容器內執行，exit 0 = 健康。例：`["CMD", "redis-cli", "ping"]`、`["CMD", "pg_isready", "-U", "postgres"]`。
+  - `interval`（預設 `2s`）、`timeout`（預設 `5s`）、`start_period`（預設 `0s`）：接受 `<n>ms`/`<n>s`/`<n>m` 或裸整數（秒）。
+  - `retries`（預設 `10`）：連續失敗幾次（扣除 start_period 寬限）才算 unhealthy → **fail_fast 拆掉整個 app**。
+  - 啟動目前**序列化**：一個服務的 healthcheck 會擋住其後所有服務（含不相依者），通常無感；之後會改成只擋實際 dependents。
 
 ## 內部網路與「不對外暴露」（重要、實測過）
 

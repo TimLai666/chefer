@@ -16,6 +16,8 @@ pub mod whiteout;
 #[cfg(target_os = "linux")]
 pub mod exec;
 #[cfg(target_os = "linux")]
+pub mod health;
+#[cfg(target_os = "linux")]
 pub mod netns;
 #[cfg(target_os = "linux")]
 pub mod supervisor;

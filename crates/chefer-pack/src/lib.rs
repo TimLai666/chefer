@@ -238,7 +238,34 @@ fn pack_service(
         mounts,
         interface_mode: convert::to_interface_mode(&svc.interface_mode),
         depends_on: svc.depends_on.clone(),
+        healthcheck: svc.healthcheck.as_ref().map(map_healthcheck),
     })
+}
+
+/// appcipe healthcheck → manifest healthcheck（duration 正規化為毫秒；test 正規化為 CmdSpec）。
+/// 驗證已保證 test 非空、duration 可解析；此處 unwrap_or(default) 以防萬一。
+fn map_healthcheck(hc: &appcipe_spec::HealthCheck) -> chefer_bundle::HealthCheck {
+    use appcipe_spec::TestCmd;
+    let test = match hc.test.to_cmd() {
+        Some(TestCmd::Shell(s)) => chefer_bundle::CmdSpec::Shell(s),
+        Some(TestCmd::Argv(v)) => chefer_bundle::CmdSpec::Argv(v),
+        // 驗證期已擋空 test；保底給一個永遠失敗的探針而非 panic。
+        None => chefer_bundle::CmdSpec::Argv(vec!["false".to_string()]),
+    };
+    let ms = |d: std::time::Duration| d.as_millis() as u64;
+    chefer_bundle::HealthCheck {
+        test,
+        interval_ms: ms(hc
+            .interval()
+            .unwrap_or(appcipe_spec::HealthCheck::DEFAULT_INTERVAL)),
+        timeout_ms: ms(hc
+            .timeout()
+            .unwrap_or(appcipe_spec::HealthCheck::DEFAULT_TIMEOUT)),
+        retries: hc.retries(),
+        start_period_ms: ms(hc
+            .start_period()
+            .unwrap_or(appcipe_spec::HealthCheck::DEFAULT_START_PERIOD)),
+    }
 }
 
 /// 對 services 用到的每個 linux guest 架構，從 kit 複製 musl guest-agent 到 agents/。
