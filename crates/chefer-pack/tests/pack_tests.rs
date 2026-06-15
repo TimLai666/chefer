@@ -192,6 +192,7 @@ fn make_app(name: &str, services: Vec<(&str, Service)>) -> AppCipe {
         data_dir: None,
         crash: Default::default(),
         network: Default::default(),
+        console: Default::default(),
         services: services
             .into_iter()
             .map(|(n, s)| (n.to_string(), s))

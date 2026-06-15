@@ -176,6 +176,22 @@ impl AppCipe {
             ));
         }
 
+        // --- console: hidden 需有可關閉的介面（gui 或 terminal/both），否則 app 無從停止 ---
+        if self.console == ConsoleMode::Hidden {
+            let has_gui = self
+                .services
+                .values()
+                .any(|s| matches!(s.interface_mode, InterfaceMode::Gui | InterfaceMode::Both));
+            let has_terminal = !terminal_svcs.is_empty(); // terminal 或 both
+            if !has_gui && !has_terminal {
+                errs.push(
+                    "console: hidden 需要至少一個 gui 或 terminal/both 服務（否則 app 啟動後\
+                     無從停止——共用主控台是唯一的停止介面）；請改用 auto/shown，或加上有介面的服務"
+                        .to_string(),
+                );
+            }
+        }
+
         if errs.is_empty() {
             Ok(())
         } else {
@@ -827,6 +843,37 @@ services:
             "version: \"0.1\"\nname: App\nnetwork: wormhole\nservices:\n  db: { image: ./db.tar }\n",
         );
         assert!(bad.is_err(), "未知 network 模式應解析失敗");
+    }
+
+    // ---------- console ----------
+
+    #[test]
+    fn console_defaults_to_auto() {
+        let app = parse_raw("version: \"0.1\"\nname: App\nservices:\n  db: { image: ./db.tar }\n");
+        assert_eq!(app.console, crate::ConsoleMode::Auto);
+    }
+
+    #[test]
+    fn console_hidden_rejected_when_no_interface() {
+        // 全 none + console: hidden → 無從停止 → 拒絕。
+        let e = validate_err(
+            "version: \"0.1\"\nname: App\nconsole: hidden\nservices:\n  db: { image: ./db.tar }\n",
+        );
+        assert!(e.contains("console: hidden"), "{e}");
+    }
+
+    #[test]
+    fn console_hidden_ok_with_gui_or_terminal() {
+        for mode in ["gui", "terminal", "both"] {
+            let app = parse_raw(&format!(
+                "version: \"0.1\"\nname: App\nconsole: hidden\nservices:\n  ui: {{ image: ./u.tar, interface_mode: {mode} }}\n"
+            ));
+            assert!(
+                app.validate().is_ok(),
+                "console: hidden + {mode} 應通過：{:?}",
+                app.validate()
+            );
+        }
     }
 
     // ---------- 錯誤彙整 ----------

@@ -27,6 +27,16 @@ fn network_label(n: chefer_bundle::NetworkMode) -> &'static str {
     }
 }
 
+/// 共用主控台顯示策略的人類可讀標籤。
+fn console_label(c: chefer_bundle::ConsoleMode) -> &'static str {
+    use chefer_bundle::ConsoleMode::*;
+    match c {
+        Auto => "auto（gui-only 隱藏；有終端或無介面時顯示）",
+        Shown => "shown（一律顯示共用主控台）",
+        Hidden => "hidden（隱藏共用主控台）",
+    }
+}
+
 /// 解壓輸出總量上限：bundle 佈局中 manifest.json 之前只有 agents/（數 MB）
 /// 與 appcipe.yml，256 MiB 足以涵蓋並讀到 manifest，遠低於 OOM 門檻。
 /// 套在 tar 之前以擋下長檔名/pax 標頭撐爆 read_to_end 的解壓炸彈。
@@ -175,6 +185,10 @@ fn render_manifest_summary(m: &chefer_bundle::Manifest) {
         Cell::new("Network").fg(Color::Cyan),
         Cell::new(network_label(m.app.network)).fg(Color::Yellow),
     ]);
+    t.add_row(vec![
+        Cell::new("Console").fg(Color::Cyan),
+        Cell::new(console_label(m.app.console)).fg(Color::Yellow),
+    ]);
     if let Some(d) = &m.app.data_dir_override {
         t.add_row(vec![
             Cell::new("Data Dir Override").fg(Color::Cyan),
@@ -298,6 +312,7 @@ mod tests {
                 data_dir_override: None,
                 crash: CrashPolicy::FailFast,
                 network: NetworkMode::Shared,
+                console: chefer_bundle::ConsoleMode::Auto,
                 generated_at_utc: "2026-01-01T00:00:00Z".into(),
                 builder_version: "1.2.3".into(),
             },

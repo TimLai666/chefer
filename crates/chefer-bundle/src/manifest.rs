@@ -35,6 +35,9 @@ pub struct AppMeta {
     /// app 網路模式（見 docs/DESIGN.md「網路隔離」節）。舊 bundle 無此欄位 → 預設 `shared`。
     #[serde(default)]
     pub network: NetworkMode,
+    /// 共用主控台顯示策略（runtime 依此 + 介面模式決定是否隱藏 Windows console）。
+    #[serde(default)]
+    pub console: ConsoleMode,
     pub generated_at_utc: String,
     /// 打包此 app 的 chefer 版本（`chefer build` 寫入；供 `chefer inspect` 與
     /// runtime 顯示「這是哪一版 chefer 包的」）。舊 bundle 無此欄位 → 反序列化為空字串。
@@ -132,6 +135,22 @@ pub enum NetworkMode {
     /// 同 Internal 再加 pasta 出網 NAT（Docker 預設 bridge 等價）。
     #[default]
     Bridge,
+}
+
+/// app 共用主控台顯示策略（runtime 端解讀；見 docs/DESIGN.md「主控台顯示」節）。
+///
+/// 舊 bundle 無此欄位 → 反序列化套用預設 `Auto`。runtime 依此 + 聚合介面模式決定是否
+/// 隱藏 Windows console（其他平台不受影響）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleMode {
+    /// 依介面模式自動：有 terminal/both → 顯示；只有 gui → 隱藏；全 none → 顯示。
+    #[default]
+    Auto,
+    /// 一律顯示共用主控台。
+    Shown,
+    /// 隱藏共用主控台（建置期已驗證 app 另有 gui 或 terminal 可關閉）。
+    Hidden,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,6 +316,7 @@ mod tests {
                 data_dir_override: None,
                 crash: CrashPolicy::FailFast,
                 network: NetworkMode::Shared,
+                console: ConsoleMode::Auto,
                 generated_at_utc: "2026-01-01T00:00:00Z".into(),
                 builder_version: "9.9.9".into(),
             },

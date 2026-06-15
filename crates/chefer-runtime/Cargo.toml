@@ -17,3 +17,10 @@ sha2 = "0.11.0"
 ctrlc = "3.5.2"
 chefer-bundle = { version = "0.1.0", path = "../chefer-bundle" }
 vmm-backend = { version = "0.1.0", path = "../vmm-backend" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_UI_WindowsAndMessaging",
+] }

@@ -17,6 +17,11 @@ network: bridge                     # 選填：網路模式（預設 bridge）�
                                     #   shared   — 共用 host 網路；未宣告的 port 也能從 host 連到（不隔離；舊行為）
                                     #   注意：省略此欄＝bridge＝隔離。要回到「未宣告 port 也可從 host 連到」請顯式寫 shared。
                                     #   bridge 出網需 kit 內含 pasta（官方 release kit 已附）；缺 pasta 時自動退化為 internal。
+console: auto                       # 選填：共用主控台（彙整日誌 + Ctrl+C 的終端視窗）顯示策略（預設 auto）。三選一：
+                                    #   auto   — 有 terminal/both 服務→顯示；只有 gui→隱藏（Windows 雙擊時）；全無介面→顯示（保留停止介面）；預設
+                                    #   shown  — 一律顯示共用主控台
+                                    #   hidden — 隱藏共用主控台（限 app 另有 gui 或 terminal/both 可關閉；全無介面用 hidden 會驗證失敗）
+                                    #   隱藏只在 Windows 雙擊啟動時生效（且僅當該 console 由本程式獨佔）；從既有終端啟動或其他平台不受影響。
 
 # === 服務定義 ===
 services:

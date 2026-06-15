@@ -5,6 +5,7 @@
 //! data dir 解析與 old_names 遷移 → 啟動埠代理 → vmm_backend::run_app →
 //! 透傳 exit code → 清理暫存。
 
+mod console;
 mod extract;
 mod proxy;
 mod run;

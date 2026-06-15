@@ -73,6 +73,8 @@ bundle/
     "old_names": ["Studio"],
     "data_dir_override": "D:/Apps/StudioPro",
     "crash": "fail_fast",
+    "network": "bridge",
+    "console": "auto",
     "generated_at_utc": "2026-06-11T00:00:00Z",
     "builder_version": "0.1.0"
   },
@@ -112,6 +114,8 @@ bundle/
   - 有效命令 = `entrypoint + (cmd_override 或 image_config.cmd)`；兩者皆空 → 啟動失敗並報錯。
 - `env` 合併順序：image_config.env（基底）→ appcipe env 覆蓋。`PATH` 若最終為空，guest-agent 補預設 `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`。
 - `interface_mode`: `"gui" | "terminal" | "both" | "none"`。
+- `app.network`: `"shared" | "internal" | "bridge"`（預設 `bridge`；見「網路隔離」節）。舊 bundle 無此欄位 → 反序列化為預設。
+- `app.console`: `"auto" | "shown" | "hidden"`（預設 `auto`；見「主控台顯示」節）。舊 bundle 無此欄位 → 反序列化為 `auto`。
 
 ## 4. Footer v1（單檔尾端 80 bytes）
 
@@ -283,7 +287,7 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
     - 任一服務 exit ≠ 0 → 終止其餘全部（SIGTERM → 等 5s → SIGKILL，對中繼 pgid 與 pid-ns init 雙送）→ 回傳該 exit code。
     - **介面服務（interface_mode 含 gui/terminal/both）即使 exit 0 也視為「整個 app 結束」**（使用者關掉視窗/終端 = app 該收掉）→ 終止其餘、回 0。否則 GUI app 關窗後背景服務（如 db）會殘留、佔住埠、無法重啟。
     - 非介面（none）服務 exit 0 → 屬背景/一次性任務，其餘繼續跑；全部結束 → 0。
-  - `interface_mode=terminal/both`：該服務 stdio 直通（v1：所有服務 stdout/stderr 都加 `[svc]` 前綴轉發；terminal 服務 stdin 直通——僅允許一個服務宣告 terminal/both，多個→驗證期報錯）。
+  - `interface_mode=terminal/both`：該服務 stdio 直通（v1：所有服務 stdout/stderr 都加 `[svc]` 前綴轉發；terminal 服務 stdin 直通——僅允許一個服務宣告 terminal/both，多個→驗證期報錯）。彙整輸出的去向（那個「共用主控台」要不要顯示）由 app 級 `console` 控制，見下方「主控台顯示」。
 - musl 靜態建置：`cargo build -p guest-agent --target x86_64-unknown-linux-musl --release` 必須可行（避免依賴需要 cc 的 crate；zstd 解壓用純 Rust 的 ruzstd）。musl 目標的 linker 統一為 rust-lld（`.cargo/config.toml` 已設定，跨 host 一致）。
 
 ### 網路隔離（per-app netns）— 設計
@@ -310,6 +314,24 @@ AppCipe 新增 app 級欄位 **`network`**（appcipe-spec enum，serde rename �
 > **inbound relay 的 fd 來源（重要實作細節）**:rootless 下 supervisor 在 init user ns、無 `CAP_SYS_ADMIN`，**不能** `setns(NEWNET)` 進 app netns（且執行緒不能 `setns(NEWUSER)`）。故由**已在 netns+userns 內為 root 的 holder 行程當 socket factory**:supervisor 經 SEQPACKET socketpair 送 `(proto,port)`，holder 在 netns 內建立連到 `127.0.0.1:guest` 的 socket，以 **SCM_RIGHTS** 傳回 fd，bidir 搬運留在 parent netns。holder 建 netns 時須**先單獨 `unshare(NEWUSER)`、在 unshare 前先取得真實 uid/gid 寫單行 map**（unshare 後 `getuid()` 會回 overflow id），再 `unshare(NEWNET)`。
 >
 > **bridge 出網（pasta）與 root 後端**:`pasta` 是 rootless-only——以 root 執行會自我停用、降權到 nobody 後又開不了 root 擁有的 ns。故 holder 與 pasta **一律以非特權 uid 執行**（rootless=呼叫者；WSL2 / VM / native-root 後端=**nobody**），netns 由該非特權 user ns 擁有，pasta 以 `--userns` 進入。root 後端 holder 降權時須在 `setuid` 後 `prctl(PR_SET_DUMPABLE,1)`，否則 `/proc/self/{setgroups,uid_map}` 變 root 擁有而寫不了。服務不受影響:root 後端服務仍以**真實 root** 只 `setns` 進 netns（不加入該 user ns）→ chown/gosu 照常。pasta 另須 `-t none -u none -T none -U none` 關閉預設的雙向 port 轉發（否則會在 netns 內搶占服務要綁的 port）。已於原生 Linux（CI）與實機 WSL2 驗證 `internal` 隔離與 `bridge` 出網。
+
+### 主控台顯示（app 級 `console`）— 設計
+
+stdio 模型不變：**全 app 最多一個互動終端**（唯一的 `terminal`/`both` 服務直通 stdin/stdout），其餘服務的 stdout/stderr 以 `[svc]` 前綴**彙整到同一個「共用主控台」**（即 chefer-runtime 自己的終端）。本節只決定「那個共用主控台要不要顯示」——主要影響 **Windows 雙擊啟動**時系統為 console-subsystem 執行檔新配的 console 視窗。
+
+AppCipe 新增 app 級欄位 **`console`**（appcipe-spec enum `ConsoleMode`，serde 小寫；寫進 manifest `app.console`）：
+
+- **`auto`（預設）**：依**聚合介面模式**決定——
+  - 有 `terminal`/`both` 服務 → **顯示**（互動終端本來就需要那個視窗）。
+  - 只有 `gui`（無終端）→ **隱藏**（乾淨的 GUI 體驗；關視窗即停 app）。
+  - 全 `none`（無任何介面）→ **顯示**（共用主控台是唯一的停止介面）。
+- **`shown`**：一律顯示。
+- **`hidden`**：隱藏共用主控台。**驗證限制**：app 必須另有 `gui` 或 `terminal`/`both` 服務（否則啟動後無從停止）→ 全 `none` + `hidden` 在 `appcipe-spec` 驗證期報錯。
+
+**runtime 行為**（`chefer-runtime`，啟動時、起服務前）：
+- **全 `none` app**：一律保留共用主控台，並印一行提示（「此 app 沒有圖形或終端介面；在此視窗按 Ctrl+C 可停止」）——不論 `console` 設定，runtime 都不隱藏（防止舊/手刻 bundle 把唯一停止介面藏掉）。
+- 其餘情況依上表決定是否隱藏。**隱藏只在 Windows 生效**（其他平台沒有「雙擊配 console」概念，終端由父行程繼承，不主動隱藏）。
+- Windows 隱藏採 `ShowWindow(GetConsoleWindow(), SW_HIDE)`，但**僅當本行程是 console 的唯一擁有者**（`GetConsoleProcessList()==1`，即雙擊啟動才新配 console）；從既有 shell 啟動時 process list > 1，隱藏會連帶藏掉使用者自己的終端，故跳過。
 
 ### chefer-cli（bin）
 - 子命令：
