@@ -31,12 +31,12 @@ pub(crate) fn pull_image(reference: &str, platform: &str, tmp: &Path) -> Result<
     let (want_os, want_arch) = split_platform(platform)?;
     let parsed: Reference = reference
         .parse()
-        .with_context(|| format!("無法解析 image reference：{reference}"))?;
+        .with_context(|| format!("could not parse image reference: {reference}"))?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .context("建立 tokio runtime 失敗")?;
+        .context("failed to create tokio runtime")?;
 
     // 多架構索引時，resolver 順便記錄「實際可用的平台清單」，供找不到對應平台時給出可行動訊息。
     let available: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -83,18 +83,20 @@ pub(crate) fn pull_image(reference: &str, platform: &str, tmp: &Path) -> Result<
     })?;
 
     if image.layers.is_empty() {
-        bail!("registry 回傳的 image 沒有任何 layer；reference 或平台可能有誤");
+        bail!(
+            "the image returned by the registry has no layers; the reference or platform may be wrong"
+        );
     }
 
-    let config: ImageConfigJson =
-        serde_json::from_slice(&image.config.data).context("解析 registry image config 失敗")?;
+    let config: ImageConfigJson = serde_json::from_slice(&image.config.data)
+        .context("failed to parse registry image config")?;
     // 防呆：確認拉到的就是要的平台（單架構 image 沒有 index、resolver 不生效，這裡再核對一次）。
     if let (Some(os), Some(arch)) = (config.os.as_deref(), config.architecture.as_deref())
         && (os != want_os || arch != want_arch)
     {
         bail!(
-            "registry image 平台為 {os}/{arch}，與要求的 {platform} 不符；\
-             該 reference 可能不是多架構、或不含此平台，請改用對應平台的 image 或調整 image.platform"
+            "registry image platform is {os}/{arch}, which does not match the requested {platform}; \
+             the reference may not be multi-arch, or may not include this platform; use an image for the matching platform or adjust image.platform"
         );
     }
 
@@ -102,7 +104,7 @@ pub(crate) fn pull_image(reference: &str, platform: &str, tmp: &Path) -> Result<
     for (idx, layer) in image.layers.iter().enumerate() {
         let p = tmp.join(format!("layer-{idx}.blob"));
         std::fs::write(&p, &layer.data)
-            .with_context(|| format!("寫入第 {idx} 層 blob 失敗：{}", p.display()))?;
+            .with_context(|| format!("failed to write layer {idx} blob: {}", p.display()))?;
         layers.push(p);
     }
     // oci-client 以 buffer_unordered 平行下載 → 回傳的 layers **順序非 manifest 序**；
@@ -126,7 +128,7 @@ fn order_layers_by_diff_ids(
     }
     if want.len() != layers.len() {
         bail!(
-            "registry image 層數（{}）與 config diff_ids（{}）不一致；image 可能不完整",
+            "registry image layer count ({}) does not match config diff_ids ({}); the image may be incomplete",
             layers.len(),
             want.len()
         );
@@ -140,7 +142,9 @@ fn order_layers_by_diff_ids(
     let mut ordered = Vec::with_capacity(want.len());
     for w in want {
         let Some(pos) = pairs.iter().position(|(d, _)| d == w) else {
-            bail!("拉到的層找不到對應 diff_id：{w}（registry 回應可能不完整）");
+            bail!(
+                "no downloaded layer matches diff_id: {w} (the registry response may be incomplete)"
+            );
         };
         ordered.push(pairs.remove(pos).1);
     }
@@ -218,7 +222,7 @@ fn pull_error(
 
 fn split_platform(p: &str) -> Result<(String, String)> {
     let Some((os, arch)) = p.split_once('/') else {
-        bail!("platform 格式錯誤（應為 os/arch，例如 linux/amd64）：{p}");
+        bail!("invalid platform format (expected os/arch, e.g. linux/amd64): {p}");
     };
     Ok((os.to_string(), arch.to_string()))
 }

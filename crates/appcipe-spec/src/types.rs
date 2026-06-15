@@ -196,7 +196,7 @@ fn opt_duration(
 pub fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
     let t = s.trim();
     if t.is_empty() {
-        return Err("時間長度不可為空".to_string());
+        return Err("duration must not be empty".to_string());
     }
     let (num, unit_ms): (&str, u64) = if let Some(n) = t.strip_suffix("ms") {
         (n, 1)
@@ -208,13 +208,15 @@ pub fn parse_duration(s: &str) -> Result<std::time::Duration, String> {
         (t, 1000) // 裸數字 = 秒
     };
     let num = num.trim();
-    let value: u64 = num
-        .parse()
-        .map_err(|_| format!("無法解析時間長度 `{s}`（接受 <n>ms/<n>s/<n>m 或裸整數秒）"))?;
+    let value: u64 = num.parse().map_err(|_| {
+        format!(
+            "cannot parse duration `{s}` (accepts <n>ms/<n>s/<n>m or a bare integer in seconds)"
+        )
+    })?;
     value
         .checked_mul(unit_ms)
         .map(std::time::Duration::from_millis)
-        .ok_or_else(|| format!("時間長度 `{s}` 溢位"))
+        .ok_or_else(|| format!("duration `{s}` overflows"))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

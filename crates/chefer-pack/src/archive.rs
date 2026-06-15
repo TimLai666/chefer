@@ -40,7 +40,7 @@ struct PendingLink {
 /// 將 `tar_path` 的內容安全解壓到 `dest_root`。
 pub(crate) fn extract_tar_to_dir(tar_path: &Path, dest_root: &Path) -> Result<()> {
     let file = fs::File::open(tar_path)
-        .with_context(|| format!("開啟 image tar 失敗：{}", tar_path.display()))?;
+        .with_context(|| format!("failed to open image tar: {}", tar_path.display()))?;
     extract_tar_reader(file, dest_root)
 }
 
@@ -51,15 +51,15 @@ pub(crate) fn extract_tar_reader<R: Read>(reader: R, dest_root: &Path) -> Result
     let mut links: Vec<PendingLink> = Vec::new();
     for entry in ar
         .entries()
-        .context("讀取 tar 內容失敗（檔案可能不是 tar 格式）")?
+        .context("failed to read tar contents (file may not be in tar format)")?
     {
-        let mut entry = entry.context("讀取 tar entry 失敗")?;
+        let mut entry = entry.context("failed to read tar entry")?;
         let raw = entry
             .path()
-            .context("tar entry 的路徑無法解析")?
+            .context("could not parse tar entry path")?
             .into_owned();
         let rel = sanitize_rel_path(&raw)
-            .with_context(|| format!("tar 內含不安全路徑：{}", raw.display()))?;
+            .with_context(|| format!("tar contains an unsafe path: {}", raw.display()))?;
         if rel.as_os_str().is_empty() {
             // 根目錄項（"./"），略過。
             continue;
@@ -73,8 +73,10 @@ pub(crate) fn extract_tar_reader<R: Read>(reader: R, dest_root: &Path) -> Result
             ty @ (EntryType::Symlink | EntryType::Link) => {
                 let target = entry
                     .link_name()
-                    .context("讀取連結目標失敗")?
-                    .ok_or_else(|| anyhow::anyhow!("連結 entry 缺少目標：{}", rel.display()))?
+                    .context("failed to read link target")?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("link entry is missing a target: {}", rel.display())
+                    })?
                     .into_owned();
                 links.push(PendingLink {
                     rel,
@@ -87,9 +89,9 @@ pub(crate) fn extract_tar_reader<R: Read>(reader: R, dest_root: &Path) -> Result
                     fs::create_dir_all(parent)?;
                 }
                 let mut out = fs::File::create(&dest)
-                    .with_context(|| format!("建立檔案失敗：{}", dest.display()))?;
+                    .with_context(|| format!("failed to create file: {}", dest.display()))?;
                 io::copy(&mut entry, &mut out)
-                    .with_context(|| format!("寫入檔案失敗：{}", dest.display()))?;
+                    .with_context(|| format!("failed to write file: {}", dest.display()))?;
             }
             // fifo / char / block device 等特殊節點不該出現在 image archive 頂層，直接略過。
             _ => continue,
@@ -101,7 +103,7 @@ pub(crate) fn extract_tar_reader<R: Read>(reader: R, dest_root: &Path) -> Result
         let resolved =
             resolve_link_target(&link.rel, &link.target, link.is_symlink).with_context(|| {
                 format!(
-                    "連結目標不安全：{} -> {}",
+                    "unsafe link target: {} -> {}",
                     link.rel.display(),
                     link.target.display()
                 )
@@ -109,7 +111,7 @@ pub(crate) fn extract_tar_reader<R: Read>(reader: R, dest_root: &Path) -> Result
         let src = dest_root.join(&resolved);
         if !src.is_file() {
             bail!(
-                "連結目標不存在或非一般檔案（image archive 可能損毀）：{} -> {}",
+                "link target does not exist or is not a regular file (image archive may be corrupt): {} -> {}",
                 link.rel.display(),
                 resolved.display()
             );
@@ -119,7 +121,11 @@ pub(crate) fn extract_tar_reader<R: Read>(reader: R, dest_root: &Path) -> Result
             fs::create_dir_all(parent)?;
         }
         fs::copy(&src, &dest).with_context(|| {
-            format!("複製連結目標失敗：{} -> {}", src.display(), dest.display())
+            format!(
+                "failed to copy link target: {} -> {}",
+                src.display(),
+                dest.display()
+            )
         })?;
     }
     Ok(())
@@ -145,24 +151,33 @@ fn resolve_link_target(link_rel: &Path, target: &Path, is_symlink: bool) -> Resu
     for comp in combined.components() {
         match comp {
             Component::Prefix(_) | Component::RootDir => {
-                bail!("連結目標為絕對路徑：{}", target.display());
+                bail!("link target is an absolute path: {}", target.display());
             }
             Component::CurDir => {}
             Component::ParentDir => {
                 if stack.pop().is_none() {
-                    bail!("連結目標越界（`..` 超出解壓根）：{}", target.display());
+                    bail!(
+                        "link target escapes the extraction root (`..` beyond the root): {}",
+                        target.display()
+                    );
                 }
             }
             Component::Normal(seg) => {
                 if seg.to_string_lossy().contains('\\') {
-                    bail!("連結目標片段含非法字元（`\\`）：{}", target.display());
+                    bail!(
+                        "link target segment contains an illegal character (`\\`): {}",
+                        target.display()
+                    );
                 }
                 stack.push(seg.to_os_string());
             }
         }
     }
     if stack.is_empty() {
-        bail!("連結目標為空或指向解壓根本身：{}", target.display());
+        bail!(
+            "link target is empty or points at the extraction root itself: {}",
+            target.display()
+        );
     }
     Ok(stack.iter().collect())
 }
@@ -174,16 +189,19 @@ pub(crate) fn sanitize_rel_path(p: &Path) -> Result<PathBuf> {
     for comp in p.components() {
         match comp {
             Component::Prefix(_) | Component::RootDir => {
-                bail!("拒絕絕對路徑或 Windows 磁碟前綴：{}", p.display());
+                bail!(
+                    "rejecting absolute path or Windows drive prefix: {}",
+                    p.display()
+                );
             }
             Component::CurDir => {}
             Component::ParentDir => {
-                bail!("拒絕含 `..` 的路徑：{}", p.display());
+                bail!("rejecting path containing `..`: {}", p.display());
             }
             Component::Normal(seg) => {
                 let s = seg.to_string_lossy();
                 if s.contains(':') || s.contains('\\') {
-                    bail!("路徑片段含非法字元（`:` 或 `\\`）：{s}");
+                    bail!("path segment contains an illegal character (`:` or `\\`): {s}");
                 }
                 buf.push(seg);
             }
@@ -241,7 +259,7 @@ mod tests {
         let bytes = tar_with_entry(b"d", EntryType::Symlink, Some(b"."));
         let tmp = tempfile::tempdir().unwrap();
         let err = extract_tar_reader(bytes.as_slice(), tmp.path()).unwrap_err();
-        assert!(format!("{err:#}").contains("連結目標"), "{err:#}");
+        assert!(format!("{err:#}").contains("link target"), "{err:#}");
         assert!(tmp.path().join("d").symlink_metadata().is_err());
     }
 
@@ -251,7 +269,10 @@ mod tests {
         let bytes = tar_with_entry(b"sub/h", EntryType::Symlink, Some(b"../../../etc/passwd"));
         let tmp = tempfile::tempdir().unwrap();
         let err = extract_tar_reader(bytes.as_slice(), tmp.path()).unwrap_err();
-        assert!(format!("{err:#}").contains("越界"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("escapes the extraction root"),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -260,7 +281,10 @@ mod tests {
         let bytes = tar_with_entry(b"h", EntryType::Link, Some(b"../../etc/passwd"));
         let tmp = tempfile::tempdir().unwrap();
         let err = extract_tar_reader(bytes.as_slice(), tmp.path()).unwrap_err();
-        assert!(format!("{err:#}").contains("越界"), "{err:#}");
+        assert!(
+            format!("{err:#}").contains("escapes the extraction root"),
+            "{err:#}"
+        );
         assert!(!tmp.path().join("h").exists());
     }
 
@@ -343,7 +367,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let err = extract_tar_reader(bytes.as_slice(), tmp.path()).unwrap_err();
-        assert!(format!("{err:#}").contains("不安全路徑"), "{err:#}");
+        assert!(format!("{err:#}").contains("unsafe path"), "{err:#}");
         assert!(!tmp.path().parent().unwrap().join("evil.txt").exists());
     }
 }

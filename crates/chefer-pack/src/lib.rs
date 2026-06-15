@@ -63,11 +63,15 @@ pub fn pack(app: &AppCipe, opts: &PackOptions) -> Result<PackResult> {
     let bundle_dir = opts.out_dir.join(&app.name).join("bundle");
     if bundle_dir.exists() {
         if opts.clean {
-            fs::remove_dir_all(&bundle_dir)
-                .with_context(|| format!("清除既有 bundle 目錄失敗：{}", bundle_dir.display()))?;
+            fs::remove_dir_all(&bundle_dir).with_context(|| {
+                format!(
+                    "failed to remove existing bundle directory: {}",
+                    bundle_dir.display()
+                )
+            })?;
         } else if fs::read_dir(&bundle_dir)?.next().is_some() {
             bail!(
-                "輸出目錄已存在且非空：{}；請啟用 clean 選項或先手動刪除，以免殘留舊的層檔",
+                "output directory already exists and is not empty: {}; enable the clean option or delete it manually first to avoid leftover layer files",
                 bundle_dir.display()
             );
         }
@@ -87,7 +91,7 @@ pub fn pack(app: &AppCipe, opts: &PackOptions) -> Result<PackResult> {
     for name in &names {
         let svc = &app.services[*name];
         let entry = pack_service(&bundle_dir, name, svc, opts)
-            .with_context(|| format!("打包 service `{name}` 失敗"))?;
+            .with_context(|| format!("failed to pack service `{name}`"))?;
         services.push(entry);
     }
 
@@ -110,7 +114,7 @@ pub fn pack(app: &AppCipe, opts: &PackOptions) -> Result<PackResult> {
     manifest.save(&layout::manifest_path(&bundle_dir))?;
 
     if opts.write_original_yml {
-        let yml = serde_yaml::to_string(app).context("序列化 appcipe.yml 失敗")?;
+        let yml = serde_yaml::to_string(app).context("failed to serialize appcipe.yml")?;
         fs::write(layout::appcipe_out_path(&bundle_dir), yml)?;
     }
 
@@ -127,10 +131,10 @@ pub fn pack(app: &AppCipe, opts: &PackOptions) -> Result<PackResult> {
 fn validate_mounts(name: &str, svc: &Service) -> Result<()> {
     for m in &svc.mounts {
         let spec = MountSpec::parse(m)
-            .with_context(|| format!("service `{name}` 的 mounts 設定錯誤：{m}"))?;
+            .with_context(|| format!("invalid mounts setting for service `{name}`: {m}"))?;
         if !Path::new(&spec.host).exists() {
             bail!(
-                "service `{name}` 的掛載 host 路徑不存在：{}；請先建立該路徑，或修正 appcipe.yml 的 mounts",
+                "mount host path does not exist for service `{name}`: {}; create the path first, or fix the mounts in appcipe.yml",
                 spec.host
             );
         }
@@ -151,7 +155,7 @@ fn pack_service(
     let tmp = tempfile::Builder::new()
         .prefix("chefer-pack-")
         .tempdir()
-        .context("建立暫存目錄失敗")?;
+        .context("failed to create temp directory")?;
 
     // 取得 config + 各層 blob 路徑——本機 tar 與 registry 兩條來源都收斂成同一個 ResolvedImage。
     let resolved = match convert::image_src(name, svc)? {
@@ -159,19 +163,19 @@ fn pack_service(
             let tar_path = Path::new(tar_path_str);
             if !tar_path.is_file() {
                 bail!(
-                    "image tar 不存在：{}；請確認 appcipe.yml 的 image 路徑，或先以 `docker save -o <file> <image>` 匯出（或改用 source: image 直接從 registry 拉取）",
+                    "image tar not found: {}; check the image path in appcipe.yml, or export it first with `docker save -o <file> <image>` (or use source: image to pull directly from a registry)",
                     tar_path.display()
                 );
             }
             archive::extract_tar_to_dir(tar_path, tmp.path())
-                .with_context(|| format!("解開 image tar 失敗：{}", tar_path.display()))?;
+                .with_context(|| format!("failed to extract image tar: {}", tar_path.display()))?;
             image::resolve_image(tmp.path(), &platform)
-                .with_context(|| format!("解析 image archive 失敗：{}", tar_path.display()))?
+                .with_context(|| format!("failed to parse image archive: {}", tar_path.display()))?
         }
         convert::ImageSrc::Registry(reference) => {
-            eprintln!("[chefer] 從 registry 拉取 image：{reference}（{platform}）…");
+            eprintln!("[chefer] pulling image from registry: {reference} ({platform})…");
             registry::pull_image(reference, &platform, tmp.path())
-                .with_context(|| format!("從 registry 拉取 image `{reference}` 失敗"))?
+                .with_context(|| format!("failed to pull image `{reference}` from registry"))?
         }
         convert::ImageSrc::Dockerfile {
             dockerfile,
@@ -190,9 +194,9 @@ fn pack_service(
             let extract = tmp.path().join("extract");
             fs::create_dir_all(&extract)?;
             archive::extract_tar_to_dir(&tar, &extract)
-                .with_context(|| format!("解開建置產生的 image tar 失敗：{}", tar.display()))?;
+                .with_context(|| format!("failed to extract built image tar: {}", tar.display()))?;
             image::resolve_image(&extract, &platform)
-                .context("解析建置產生的 image archive 失敗")?
+                .context("failed to parse built image archive")?
         }
     };
 
@@ -204,7 +208,7 @@ fn pack_service(
         .unwrap_or(&[]);
     if diff_ids.len() != resolved.layers.len() {
         bail!(
-            "image config 的 rootfs.diff_ids 數量（{}）與層數（{}）不一致；image archive 可能已損毀，請重新匯出",
+            "image config rootfs.diff_ids count ({}) does not match the number of layers ({}); the image archive may be corrupt, please re-export",
             diff_ids.len(),
             resolved.layers.len()
         );
@@ -216,11 +220,11 @@ fn pack_service(
     let mut layer_refs = Vec::with_capacity(resolved.layers.len());
     for (idx, blob) in resolved.layers.iter().enumerate() {
         let repacked = layers::repack_layer(blob, &layers_dir, idx, opts.zstd_level)
-            .with_context(|| format!("處理第 {idx} 層失敗"))?;
+            .with_context(|| format!("failed to process layer {idx}"))?;
         let expected = &diff_ids[idx];
         if &repacked.diff_id != expected {
             bail!(
-                "第 {idx} 層 diff_id 不符：計算為 {}，config 宣告為 {expected}；image archive 可能已損毀，請重新匯出",
+                "layer {idx} diff_id mismatch: computed {}, config declares {expected}; the image archive may be corrupt, please re-export",
                 repacked.diff_id
             );
         }
@@ -235,12 +239,12 @@ fn pack_service(
     let ports = svc
         .ports
         .iter()
-        .map(|p| PortSpec::parse(p).with_context(|| format!("ports 設定錯誤：{p}")))
+        .map(|p| PortSpec::parse(p).with_context(|| format!("invalid ports setting: {p}")))
         .collect::<Result<Vec<_>>>()?;
     let mounts = svc
         .mounts
         .iter()
-        .map(|m| MountSpec::parse(m).with_context(|| format!("mounts 設定錯誤：{m}")))
+        .map(|m| MountSpec::parse(m).with_context(|| format!("invalid mounts setting: {m}")))
         .collect::<Result<Vec<_>>>()?;
 
     Ok(ServiceEntry {
@@ -314,7 +318,7 @@ fn copy_agents(bundle_dir: &Path, manifest: &Manifest, opts: &PackOptions) -> Re
                 fs::create_dir_all(&agents_dir)?;
                 let dst = agents_dir.join(&agent_name);
                 fs::copy(&src, &dst)
-                    .with_context(|| format!("複製 guest-agent 失敗：{}", src.display()))?;
+                    .with_context(|| format!("failed to copy guest-agent: {}", src.display()))?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
@@ -329,7 +333,7 @@ fn copy_agents(bundle_dir: &Path, manifest: &Manifest, opts: &PackOptions) -> Re
                     bail!("{help}");
                 }
                 eprintln!(
-                    "警告：{help}\n（將不內嵌 guest-agent；Linux 目標可忽略，Windows/macOS 目標的單檔將無法執行）"
+                    "warning: {help}\n(guest-agent will not be embedded; Linux targets can ignore this, but the single-file executable for Windows/macOS targets will not run)"
                 );
             }
         }
@@ -342,7 +346,7 @@ fn copy_agents(bundle_dir: &Path, manifest: &Manifest, opts: &PackOptions) -> Re
                 fs::create_dir_all(&agents_dir)?;
                 let dst = agents_dir.join(&pasta_name);
                 fs::copy(&src, &dst)
-                    .with_context(|| format!("複製 pasta 失敗：{}", src.display()))?;
+                    .with_context(|| format!("failed to copy pasta: {}", src.display()))?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
@@ -353,8 +357,8 @@ fn copy_agents(bundle_dir: &Path, manifest: &Manifest, opts: &PackOptions) -> Re
             }
             None => {
                 eprintln!(
-                    "提示：kit 內找不到 {pasta_name}；以 network: bridge 打包的 app 在執行時\
-                     將退化為 internal（只有 lo、無對外網路）。如需 bridge 出網，請在 kit 附上 pasta-{arch}。"
+                    "note: {pasta_name} not found in the kit; an app packed with network: bridge will \
+                     degrade to internal at runtime (only lo, no outbound network). To enable bridge outbound, add pasta-{arch} to the kit."
                 );
             }
         }
@@ -388,20 +392,23 @@ fn copy_macos_appliances(bundle_dir: &Path, opts: &PackOptions) -> Result<()> {
                 let kernel_dst = vm_dir.join(layout::kernel_name(arch));
                 let initramfs_dst = vm_dir.join(layout::initramfs_name(arch));
                 fs::copy(&kernel, &kernel_dst).with_context(|| {
-                    format!("複製 macOS appliance kernel 失敗：{}", kernel.display())
+                    format!(
+                        "failed to copy macOS appliance kernel: {}",
+                        kernel.display()
+                    )
                 })?;
                 fs::copy(&initramfs, &initramfs_dst).with_context(|| {
                     format!(
-                        "複製 macOS appliance initramfs 失敗：{}",
+                        "failed to copy macOS appliance initramfs: {}",
                         initramfs.display()
                     )
                 })?;
             }
             None => {
                 eprintln!(
-                    "警告：找不到 macOS micro-VM appliance（需要 {} 與 {}）。\
-                     已搜尋 kit 目錄：{}。\
-                     將略過內嵌 vm/；此產物仍可組裝，但在 macOS 上會回報後端不可用。",
+                    "warning: macOS micro-VM appliance not found (need {} and {}). \
+                     Searched kit directories: {}. \
+                     Skipping embedding vm/; this artifact can still be assembled, but will report the backend as unavailable on macOS.",
                     layout::kernel_name(arch),
                     layout::initramfs_name(arch),
                     format_kit_dirs(&kit_dirs),
@@ -422,13 +429,13 @@ fn macos_target_arch(target: &str) -> Option<&'static str> {
 
 fn format_kit_dirs(kit_dirs: &[PathBuf]) -> String {
     if kit_dirs.is_empty() {
-        "（無可搜尋目錄）".to_string()
+        "(no directories to search)".to_string()
     } else {
         kit_dirs
             .iter()
             .map(|p| p.display().to_string())
             .collect::<Vec<_>>()
-            .join("、")
+            .join(", ")
     }
 }
 
