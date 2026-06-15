@@ -17,13 +17,17 @@ use anyhow::{Context, Result};
 #[derive(clap::Parser, Debug)]
 #[command(name = "chefer-runtime", version, about = "Chefer single-file runtime")]
 struct Args {
-    /// Parent directory for the extraction temp directory (defaults to the system temp)
+    /// Extraction parent directory: the bundle cache root by default, or the temp parent with --no-cache/--keep-tmp
     #[arg(long)]
     extract_dir: Option<PathBuf>,
 
-    /// Keep the extracted temp directory (deleted on exit by default)
+    /// Keep the extracted temp directory (deleted on exit by default); implies --no-cache
     #[arg(long)]
     keep_tmp: bool,
+
+    /// Disable the persistent bundle cache; extract to a temp directory each run (deleted on exit)
+    #[arg(long)]
+    no_cache: bool,
 
     /// Print footer info and exit (for debugging)
     #[arg(long)]
@@ -82,14 +86,24 @@ fn real_main(args: &Args) -> Result<i32> {
         return Ok(0);
     }
 
-    let opts = extract::ExtractOptions {
-        extract_parent: args.extract_dir.as_deref(),
-        keep_tmp: args.keep_tmp,
+    // 預設走持久化 bundle 快取（依 payload sha256 跳過重複解壓）；
+    // --no-cache / --keep-tmp 則每次解到暫存目錄。
+    let extracted = if args.no_cache || args.keep_tmp {
+        let opts = extract::ExtractOptions {
+            extract_parent: args.extract_dir.as_deref(),
+            keep_tmp: args.keep_tmp,
+        };
+        extract::extract_bundle(&exe, &ft, &opts)?
+    } else {
+        let cache_root = args
+            .extract_dir
+            .clone()
+            .unwrap_or_else(extract::default_cache_root);
+        extract::extract_bundle_cached(&exe, &ft, &cache_root)?
     };
-    let extracted = extract::extract_bundle(&exe, &ft, &opts)?;
-    tracing::info!("bundle extracted to {}", extracted.bundle_dir.display());
+    tracing::info!("bundle ready at {}", extracted.bundle_dir.display());
 
     let code = run::run(&extracted.bundle_dir, args.keep_tmp)?;
-    // extracted 在此 scope 結束時 drop：未指定 --keep-tmp 時自動刪除暫存目錄。
+    // extracted 在此 scope 結束時 drop：暫存路徑自動刪除；快取路徑保留供下次重用。
     Ok(code)
 }
