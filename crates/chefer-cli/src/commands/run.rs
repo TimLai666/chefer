@@ -12,7 +12,8 @@ use crate::commands::build;
 /// 建置（host target）後執行產物；回傳產物的 exit code。
 pub fn cmd_run(opts: &BuildOpts) -> Result<i32> {
     // 只建置本機 target（targets 留空 → cmd_build 預設 host）。
-    let artifacts = build::cmd_build(opts, &[], false)?;
+    // local_run=true：本機建置後立即在本機執行，故 mount host 路徑檢查維持嚴格（非 VM 後端時）。
+    let artifacts = build::cmd_build(opts, &[], false, true)?;
     let artifact = artifacts
         .first()
         .ok_or_else(|| anyhow!("internal error: build produced no artifacts"))?;

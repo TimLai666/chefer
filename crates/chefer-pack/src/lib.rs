@@ -47,6 +47,11 @@ pub struct PackOptions {
     /// 打包此 app 的 chefer 版本（寫入 manifest 的 `app.builder_version`）。
     /// CLI 傳入自身的 `CARGO_PKG_VERSION`；其他呼叫端可留空字串。
     pub builder_version: String,
+    /// 是否為 `chefer run` 的本機立即執行（打包後馬上在本機跑）。
+    /// 只有此值為 true 且 build 不含 VM（darwin）目標時，缺 mount host 路徑才視為錯誤；
+    /// 其餘（`chefer build` 的散布產物、或含 darwin 目標）降級為警告，交由執行期重新檢查。
+    /// 見 `mount_check_is_lenient`。
+    pub local_run: bool,
 }
 
 /// 打包結果。
@@ -83,8 +88,12 @@ pub fn pack(app: &AppCipe, opts: &PackOptions) -> Result<PackResult> {
     names.sort();
 
     // 先驗證所有 mounts 的 host 路徑存在（fail fast：避免解完大半個 image 才報錯）。
+    // 此檢查假設「打包機 == 執行機」，只在 `chefer run`（本機立即執行）且非 VM 後端時成立；
+    // `chefer build` 的散布產物與 VM 後端的 host 都是別台機器／guest VM，缺路徑只降級為警告，
+    // 交由 guest-agent 執行期在真正的 host 重新檢查（見 DESIGN.md guest-agent 服務啟動節）。
+    let lenient_mounts = mount_check_is_lenient(opts);
     for name in &names {
-        validate_mounts(name, &app.services[*name])?;
+        validate_mounts(name, &app.services[*name], lenient_mounts)?;
     }
 
     let mut services = Vec::with_capacity(names.len());
@@ -127,19 +136,45 @@ pub fn pack(app: &AppCipe, opts: &PackOptions) -> Result<PackResult> {
     })
 }
 
-/// 驗證單一 service 的 mounts：語法可解析且 host 路徑存在。
-fn validate_mounts(name: &str, svc: &Service) -> Result<()> {
+/// 驗證單一 service 的 mounts：語法可解析；host 路徑存在性視 `lenient` 決定嚴格度。
+///
+/// `lenient == true`（打包機 ≠ 執行機：`chefer build` 散布產物或 VM 後端）時，缺路徑只印
+/// 警告而非報錯——交由 guest-agent 於執行期在真正的 host 重新檢查。見 `mount_check_is_lenient`。
+fn validate_mounts(name: &str, svc: &Service, lenient: bool) -> Result<()> {
     for m in &svc.mounts {
         let spec = MountSpec::parse(m)
             .with_context(|| format!("invalid mounts setting for service `{name}`: {m}"))?;
         if !Path::new(&spec.host).exists() {
-            bail!(
-                "mount host path does not exist for service `{name}`: {}; create the path first, or fix the mounts in appcipe.yml",
-                spec.host
-            );
+            if lenient {
+                eprintln!(
+                    "warning: mount host path does not exist on the build machine for service `{name}`: {}. \
+                     The single-file executable runs on a different machine (or inside a VM), so this path is verified at runtime, not now. \
+                     Make sure it will exist on the machine that runs the app.",
+                    spec.host
+                );
+            } else {
+                bail!(
+                    "mount host path does not exist for service `{name}`: {}; create the path first, or fix the mounts in appcipe.yml",
+                    spec.host
+                );
+            }
         }
     }
     Ok(())
+}
+
+/// 打包期 mount host 路徑檢查是否放寬為警告。
+///
+/// 嚴格（回 false，缺路徑報錯）只在「打包機 == 執行機」時成立：即 `chefer run`
+/// （`local_run == true`，本機建置後立即執行）且 build **不含** VM（darwin）目標。
+/// 其餘一律放寬（回 true）——`chefer build` 的產物是要散布到別台機器執行，在打包機檢查
+/// 路徑等於檢查錯的機器；VM 後端（macOS vz／appliance）的 host 是 guest VM，同樣 host≠build-host。
+fn mount_check_is_lenient(opts: &PackOptions) -> bool {
+    let has_vm_target = opts
+        .target_triples
+        .iter()
+        .any(|t| macos_target_arch(t).is_some());
+    !opts.local_run || has_vm_target
 }
 
 /// 打包單一 service：解 image tar → 解析格式 → 逐層重壓 → 組 ServiceEntry。

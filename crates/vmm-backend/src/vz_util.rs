@@ -4,12 +4,18 @@
 //! 全部與作業系統無關，跨平台皆可編譯與測試（實際的 Virtualization.framework
 //! 開機在 `vz.rs`，僅 macOS 編譯、僅能在實體 Mac 驗證）。
 
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 /// guest 內 virtiofs 共享標籤：bundle（唯讀）與 data（讀寫）。
 /// initramfs 的 `/init` 依此標籤掛載。
 pub const SHARE_TAG_BUNDLE: &str = "chefer-bundle";
 pub const SHARE_TAG_DATA: &str = "chefer-data";
+
+/// guest console 標記前綴：appliance `init` 開機收尾時印到序列埠，VM host
+/// （macOS vz / QEMU）解析以取得 guest 的整體結束碼與對外 IPv4。
+pub const GUEST_EXIT_MARKER: &str = "CHEFER_GUEST_EXIT=";
+pub const GUEST_IP_MARKER: &str = "CHEFER_GUEST_IP=";
 
 /// guest 內的掛載點（initramfs 約定）。
 pub const GUEST_BUNDLE_DIR: &str = "/mnt/bundle";
@@ -91,6 +97,53 @@ pub fn kernel_command_line(keep_rootfs: bool) -> String {
     s
 }
 
+/// 從 guest console 文字解析**最後一個** `CHEFER_GUEST_EXIT=<n>`（容忍前綴與多次列印，
+/// 取最後一個為準；與 qemu-e2e 的 `sed` 子字串比對一致）。
+pub fn parse_guest_exit_code(console: &str) -> Option<i32> {
+    console.lines().rev().find_map(|line| {
+        let pos = line.find(GUEST_EXIT_MARKER)?;
+        let rest = &line[pos + GUEST_EXIT_MARKER.len()..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse::<i32>().ok()
+    })
+}
+
+/// 從 guest console 文字解析**最後一個** `CHEFER_GUEST_IP=<ipv4>`（VM host 用以對 guest
+/// 做 host→guest 埠轉發）。
+pub fn parse_guest_ip(console: &str) -> Option<Ipv4Addr> {
+    console.lines().rev().find_map(|line| {
+        let pos = line.find(GUEST_IP_MARKER)?;
+        let rest = &line[pos + GUEST_IP_MARKER.len()..];
+        let token: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
+        token.parse::<Ipv4Addr>().ok()
+    })
+}
+
+/// 一條 host→guest 埠轉發（VM host 端把 `127.0.0.1:host` relay 到 `<guest_ip>:guest`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortForward {
+    pub proto: chefer_bundle::PortProto,
+    pub host: u16,
+    pub guest: u16,
+}
+
+/// 規劃 host→guest 埠轉發清單。VZ 的 NAT 讓 host 可直接連到 guest IP，但**不會**
+/// 自動把 host 埠轉進 guest（NAT 只管 guest 對外）；故所有宣告的 ports（TCP 與 UDP）
+/// 都需在 host 端 relay 到 `<guest_ip>:guest`——與 WSL2 後端對 UDP 的處理同理，VZ 連
+/// TCP 也得自己 relay。
+pub fn forward_ports(manifest: &chefer_bundle::Manifest) -> Vec<PortForward> {
+    manifest
+        .services
+        .iter()
+        .flat_map(|s| &s.ports)
+        .map(|p| PortForward {
+            proto: p.proto,
+            host: p.host,
+            guest: p.guest,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +185,76 @@ mod tests {
         assert!(c.contains(&format!("chefer.data_dir={GUEST_DATA_DIR}")));
         assert!(!c.contains("keep_rootfs"));
         assert!(kernel_command_line(true).contains("chefer.keep_rootfs=1"));
+    }
+
+    #[test]
+    fn parse_exit_marker_takes_last_and_tolerates_prefix() {
+        // 無標記 → None
+        assert_eq!(parse_guest_exit_code("hello\nworld\n"), None);
+        // 基本
+        assert_eq!(parse_guest_exit_code("CHEFER_GUEST_EXIT=0\n"), Some(0));
+        // 行內有前綴（console 噪音）仍以子字串比對
+        assert_eq!(
+            parse_guest_exit_code("[  12.3] CHEFER_GUEST_EXIT=42 trailing"),
+            Some(42)
+        );
+        // 多次列印取最後一個
+        let log = "CHEFER_GUEST_EXIT=1\n...\nCHEFER_GUEST_EXIT=7\n";
+        assert_eq!(parse_guest_exit_code(log), Some(7));
+        // 非數字 → None
+        assert_eq!(parse_guest_exit_code("CHEFER_GUEST_EXIT=oops"), None);
+    }
+
+    #[test]
+    fn parse_ip_marker() {
+        assert_eq!(parse_guest_ip("no marker here"), None);
+        assert_eq!(
+            parse_guest_ip("CHEFER_GUEST_IP=10.0.2.15"),
+            Some(Ipv4Addr::new(10, 0, 2, 15))
+        );
+        // 前綴 + 尾隨內容
+        assert_eq!(
+            parse_guest_ip("[init] CHEFER_GUEST_IP=192.168.64.3 (eth0)"),
+            Some(Ipv4Addr::new(192, 168, 64, 3))
+        );
+        // 取最後一個
+        assert_eq!(
+            parse_guest_ip("CHEFER_GUEST_IP=1.1.1.1\nCHEFER_GUEST_IP=2.2.2.2"),
+            Some(Ipv4Addr::new(2, 2, 2, 2))
+        );
+        // 壞值 → None
+        assert_eq!(parse_guest_ip("CHEFER_GUEST_IP=not-an-ip"), None);
+    }
+
+    #[test]
+    fn forward_ports_collects_all_protos() {
+        use chefer_bundle::PortProto;
+        // 以最小 manifest JSON 反序列化（缺的欄位由 serde default 補；schema 擴張時仍可編）。
+        let manifest: chefer_bundle::Manifest = serde_json::from_str(
+            r#"{
+                "format_version": 1,
+                "app": {"name": "t", "spec_version": "0.1", "generated_at_utc": ""},
+                "services": [
+                    {"name": "web", "platform": "linux/amd64", "layers": [], "image_config": {},
+                     "ports": [
+                        {"host": 8080, "guest": 80, "proto": "tcp"},
+                        {"host": 5353, "guest": 53, "proto": "udp"}
+                     ]}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let fwd = forward_ports(&manifest);
+        assert_eq!(fwd.len(), 2);
+        // TCP 與 UDP 都要轉發（VZ NAT 不自動轉 host→guest）
+        assert!(
+            fwd.iter()
+                .any(|f| f.proto == PortProto::Tcp && f.host == 8080 && f.guest == 80)
+        );
+        assert!(
+            fwd.iter()
+                .any(|f| f.proto == PortProto::Udp && f.host == 5353 && f.guest == 53)
+        );
     }
 
     #[test]

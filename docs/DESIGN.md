@@ -189,7 +189,7 @@ bundle/
 - `pub fn load(path: &Path) -> anyhow::Result<AppCipe>`：讀檔 → 解析 → normalize → validate。CLI 與 pack 一律走這裡。
 
 ### chefer-pack（lib）
-- `pub struct PackOptions { pub out_dir: PathBuf, pub clean: bool, pub write_original_yml: bool, pub kit_dirs: Vec<PathBuf>, pub target_triples: Vec<String>, pub require_agents: bool, pub zstd_level: i32 }`
+- `pub struct PackOptions { pub out_dir: PathBuf, pub clean: bool, pub write_original_yml: bool, pub kit_dirs: Vec<PathBuf>, pub target_triples: Vec<String>, pub require_agents: bool, pub zstd_level: i32, pub builder_version: String, pub local_run: bool }`（`local_run`：是否為 `chefer run` 的本機立即執行，決定 mount host 路徑檢查嚴格度，見下方行為節）
 - `pub struct PackResult { pub bundle_dir: PathBuf, pub manifest: chefer_bundle::Manifest }`
 - `pub fn pack(app: &AppCipe, opts: &PackOptions) -> anyhow::Result<PackResult>`
 - 行為：
@@ -206,6 +206,9 @@ bundle/
   5. 寫 manifest.json（用 chefer-bundle 型別）。
   6. 從 kit 複製 guest-agent 到 `agents/`（依 services 用到的 arch 去重；`require_agents=false` 時缺少僅警告）。
   7. 若 `target_triples` 含 macOS target，從 kit best-effort 複製對應架構的 appliance 到 `vm/`；缺少 `chefer-vmlinuz-<arch>` 或 `chefer-initramfs-<arch>` 時只警告、不阻斷建置，產物在 macOS 執行時由 vz 後端回報明確不可用原因。
+- **mount host 路徑檢查（便利性防呆，非正確性需求）**：打包前對各 service bind mount 的 host 半邊在**打包機**上做存在性檢查。但 manifest 只存該絕對路徑字串，guest-agent 於執行期會在**真正的執行 host** 重新檢查（見 guest-agent 服務啟動節：「bind mounts（host 路徑不存在→啟動前報錯）」），故此 build 期檢查只在 **打包機 == 執行機** 時才有意義。
+  - 真正能確定「打包機 == 執行機」的只有 `chefer run` 在**非 VM 後端**時（本機建置、本機立即執行）。`chefer build` 產出的單檔本來就是要散布到別台機器執行，在打包機檢查路徑等於檢查錯的機器；VM 後端（macOS vz／appliance）的 host 是 guest VM，同樣 host≠build-host（bind 的 host 半邊常是 guest 路徑如 `/mnt/data/...`）。
+  - 因此 `PackOptions.local_run` 區分兩條路：**只有 `local_run == true` 且 build 不含 VM（darwin）目標時，缺路徑為 fail-fast 錯誤**；其餘（`chefer build`、或任何含 darwin 目標的 build）一律降級為**警告**，交由執行期在真正的 host 重新檢查。CLI：`chefer run` 設 `local_run=true`、`chefer build` 設 `false`。`scripts/qemu-e2e.sh` 走 `chefer build`（已是寬鬆），故不需在 runner 上預建 guest 路徑。
 - tar 讀取一律串流，不把整層讀進記憶體。
 
 ### chefer-assembler（lib + bin）
@@ -263,8 +266,13 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
     - `vm/chefer-vmlinuz-<arch>`：預編 Linux kernel（含 virtio-blk/virtiofs/virtio-net/overlayfs）。
     - `vm/chefer-initramfs-<arch>`：最小 initramfs，其 `/init` 掛載 virtiofs 共享的 bundle 與 data 後，`exec` 內附的 guest-agent `run --bundle /mnt/bundle --data /mnt/data`。
     - arch 對應同 `layout::platform_to_arch`（x86_64 / aarch64）；Apple Silicon 上以 arm64 guest 為主。
-  - **VM 組態（VZVirtualMachineConfiguration）**：`VZLinuxBootLoader(kernelURL = vmlinuz, initialRamdiskURL = initramfs, commandLine = "console=hvc0 quiet ip=dhcp panic=-1 ...")`；CPU/記憶體取預設（CPU = min(host, 4)、RAM = 1–2GiB，可由 env 覆寫）；storage/share 用 `VZVirtioFileSystemDeviceConfiguration`（virtiofs）把 bundle（唯讀）與 data dir（讀寫）掛進 guest；`VZVirtioConsoleDeviceConfiguration` 接 guest 的 hvc0 做 stdio 直通與 exit code 回傳（initramfs 在 console 印出 `CHEFER_GUEST_EXIT=<code>` 後關機）。
-  - **網路 / 埠映射**：`VZNATNetworkDeviceAttachment` 給 guest NAT IP；host→guest 不自動轉送，故 runtime 沿用既有埠代理（如同 WSL2），對 guest IP 做 TCP relay。UDP 沿用與 wsl2 相同機制：vz 後端取得 guest IP 後於 host 端 relay `127.0.0.1:host → <guest_ip>:guest`，並以 `--udp-bridge` 叫 guest-agent 在 VM 內補橋（appliance init 已帶此旗標，guest 側就緒；**macOS host 端 relay 與 vz 開機 shim 同屬待實機驗證項**）。
+  - **VM 組態（VZVirtualMachineConfiguration）**：`VZLinuxBootLoader(kernelURL = vmlinuz, initialRamdiskURL = initramfs, commandLine = "console=hvc0 quiet ip=dhcp panic=-1 ...")`；CPU/記憶體取預設（CPU = min(host, 4)、RAM = 1–2GiB，可由 env 覆寫）；storage/share 用 `VZVirtioFileSystemDeviceConfiguration`（virtiofs）把 bundle（唯讀）與 data dir（讀寫）掛進 guest；`VZVirtioConsoleDeviceConfiguration` 接 guest 的 hvc0 做 stdio 直通與 exit code 回傳。
+  - **Console 標記契約（host 解析 guest 狀態的唯一管道）**：appliance `init` 在 hvc0 印出兩個標記，host 端以子字串比對解析（`vz_util::parse_guest_exit_code` / `parse_guest_ip`，取最後一個、容忍前綴）：
+    - `CHEFER_GUEST_EXIT=<code>`：guest-agent 結束後印出，隨即關機 → host 以此作為整個 app 的 exit code。
+    - `CHEFER_GUEST_IP=<ipv4>`：開機掛載後、跑 app 前印出 guest eth0 的對外 IPv4，供 host 規劃 host→guest 埠轉發。
+  - **網路 / 埠映射**：`VZNATNetworkDeviceAttachment` 給 guest NAT IP（host 在同一 NAT 子網可直接連到 guest）；但 host→guest **不自動轉送**，故所有宣告的 ports（TCP 與 UDP）都由 vz 後端在 host 端 relay `127.0.0.1:host → <guest_ip>:guest`（`guest_ip` 取自上面的 console 標記；轉發清單由 `vz_util::forward_ports` 規劃）。UDP 另以 `--udp-bridge` 叫 guest-agent 在 VM 內補 eth0→loopback 橋接（appliance init 已帶此旗標，guest 側就緒；**macOS host 端 relay 與 vz 開機 shim 同屬待實機驗證項**）。
+  - **程式碼簽章 / entitlement**：呼叫 Virtualization.framework 的執行檔（即 `chefer-runtime`）在 macOS 上**必須**以 `com.apple.security.virtualization` entitlement 簽章，否則建立 VM 會在執行期失敗。release 的 macOS 產物需帶此 entitlement 簽章；自行於 Mac 測試時可用 `codesign --entitlements ... -s -` ad-hoc 簽。
+  - **實驗性開關（誠實回報）**：在實體 Mac 驗證通過前，`availability()` 預設維持 `Unavailable`；提供 `CHEFER_VZ_EXPERIMENTAL=1` 讓使用者在自己的 Mac 上明確選擇啟用 vz 後端做驗證（訊息會說明這是未驗證路徑）。驗證通過後才移除此 gate、預設可用。
   - **純邏輯（跨平台可測，`vz_util.rs` 內）**：appliance 檔在 bundle 內的查找（`layout::vm_dir` / `kernel_name` / `initramfs_name`）、kernel command line 組裝、VM 資源（CPU/RAM）計算、guest 路徑映射、錯誤訊息——皆為純函式並有單元測試（在 Windows/Linux 上即可跑）。
   - **macOS 專屬層（`#[cfg(target_os = "macos")]`）**：以 objc2-virtualization 驅動上述組態並開機；此層只能在實體 Mac 驗證（GHA macOS runner 為巢狀虛擬化、開不了 VZ guest，僅能 compile-check）。
   - **Appliance 建置**：`vm/chefer-vmlinuz-*` 與 `vm/chefer-initramfs-*` 由獨立的 Linux 建置流程產生，並可在 **Linux + QEMU**（同樣 virtio 開機）上做 E2E 驗證，與 macOS 無關——這是讓 vz 後端可信的關鍵前置，且不需 Mac。

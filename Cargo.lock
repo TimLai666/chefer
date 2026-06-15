@@ -2694,6 +2694,7 @@ dependencies = [
  "anyhow",
  "chefer-bundle",
  "guest-agent",
+ "serde_json",
  "sha2 0.11.0",
  "tar",
  "tempfile",
