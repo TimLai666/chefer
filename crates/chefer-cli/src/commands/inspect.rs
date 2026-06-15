@@ -21,9 +21,9 @@ const MAX_MANIFEST_BYTES: u64 = 64 * 1024 * 1024;
 fn network_label(n: chefer_bundle::NetworkMode) -> &'static str {
     use chefer_bundle::NetworkMode::*;
     match n {
-        Shared => "shared（共用 host 網路，未宣告的 port 也可達）",
-        Internal => "internal（隔離；只開宣告的 port，無對外網路）",
-        Bridge => "bridge（隔離；只開宣告的 port，可出網）",
+        Shared => "shared (shares host network; even undeclared ports reachable)",
+        Internal => "internal (isolated; only declared ports, no outbound)",
+        Bridge => "bridge (isolated; only declared ports, outbound allowed)",
     }
 }
 
@@ -31,9 +31,9 @@ fn network_label(n: chefer_bundle::NetworkMode) -> &'static str {
 fn console_label(c: chefer_bundle::ConsoleMode) -> &'static str {
     use chefer_bundle::ConsoleMode::*;
     match c {
-        Auto => "auto（gui-only 隱藏；有終端或無介面時顯示）",
-        Shown => "shown（一律顯示共用主控台）",
-        Hidden => "hidden（隱藏共用主控台）",
+        Auto => "auto (hidden for gui-only; shown with a terminal or no interface)",
+        Shown => "shown (always show shared console)",
+        Hidden => "hidden (hide shared console)",
     }
 }
 
@@ -45,7 +45,7 @@ const MAX_INSPECT_INFLATE_BYTES: u64 = 256 * 1024 * 1024;
 pub fn cmd_inspect(file: &Path) -> Result<()> {
     let footer = chefer_bundle::Footer::read_from_file(file)?;
     let file_size = std::fs::metadata(file)
-        .with_context(|| format!("讀取檔案中繼資料失敗：{}", file.display()))?
+        .with_context(|| format!("failed to read file metadata: {}", file.display()))?
         .len();
 
     println!(
@@ -106,28 +106,28 @@ fn read_embedded_manifest(
 ) -> Result<chefer_bundle::Manifest> {
     if !footer.is_zstd() {
         bail!(
-            "不支援的 payload 格式（flags={:#04x}）：本版僅支援 zstd 壓縮的 tar payload",
+            "unsupported payload format (flags={:#04x}): this version only supports zstd-compressed tar payloads",
             footer.flags
         );
     }
 
-    let mut f =
-        std::fs::File::open(path).with_context(|| format!("開啟檔案失敗：{}", path.display()))?;
+    let mut f = std::fs::File::open(path)
+        .with_context(|| format!("failed to open file: {}", path.display()))?;
     f.seek(SeekFrom::Start(footer.offset))
-        .context("移動到 payload 起點失敗")?;
+        .context("failed to seek to payload start")?;
     let limited = BufReader::new(f).take(footer.length);
     let decoder = zstd::stream::read::Decoder::new(limited)
-        .context("建立 zstd 解碼器失敗（payload 可能損毀）")?;
+        .context("failed to create zstd decoder (payload may be corrupted)")?;
     // 在 tar 之前限制解壓「輸出」總量：擋下長檔名/pax 標頭撐爆 read_to_end 的炸彈，
     // 以及把 manifest 排在超大 entry 之後的 DoS。take(footer.length) 只限壓縮輸入，無法防此。
     let guarded = chefer_bundle::LimitedReader::new(decoder, MAX_INSPECT_INFLATE_BYTES);
     let mut archive = tar::Archive::new(guarded);
 
-    for entry in archive.entries().context("讀取 payload tar 失敗")? {
-        let mut entry = entry.context("讀取 payload tar entry 失敗")?;
+    for entry in archive.entries().context("failed to read payload tar")? {
+        let mut entry = entry.context("failed to read payload tar entry")?;
         let entry_path = entry
             .path()
-            .context("讀取 tar entry 路徑失敗")?
+            .context("failed to read tar entry path")?
             .to_string_lossy()
             .replace('\\', "/");
         if entry_path != "bundle/manifest.json" {
@@ -135,7 +135,7 @@ fn read_embedded_manifest(
         }
         if entry.size() > MAX_MANIFEST_BYTES {
             bail!(
-                "manifest.json 過大（{} bytes，上限 {} bytes）；檔案可能已損毀",
+                "manifest.json too large ({} bytes, limit {} bytes); file may be corrupted",
                 entry.size(),
                 MAX_MANIFEST_BYTES
             );
@@ -143,19 +143,21 @@ fn read_embedded_manifest(
         let mut s = String::new();
         entry
             .read_to_string(&mut s)
-            .context("讀取 manifest.json 內容失敗")?;
+            .context("failed to read manifest.json contents")?;
         let m: chefer_bundle::Manifest =
-            serde_json::from_str(&s).context("解析內嵌 manifest.json 失敗")?;
+            serde_json::from_str(&s).context("failed to parse embedded manifest.json")?;
         if m.format_version != chefer_bundle::MANIFEST_FORMAT_VERSION {
             bail!(
-                "不支援的 manifest 格式版本 {}（本版支援 {}）；請以相同版本的 chefer 重新打包",
+                "unsupported manifest format version {} (this version supports {}); repack with a matching chefer version",
                 m.format_version,
                 chefer_bundle::MANIFEST_FORMAT_VERSION
             );
         }
         return Ok(m);
     }
-    bail!("payload 內找不到 bundle/manifest.json；檔案可能不是 Chefer 單檔或已損毀");
+    bail!(
+        "bundle/manifest.json not found in payload; file may not be a Chefer single-file or is corrupted"
+    );
 }
 
 /// 列印 manifest 的 app 與 services 摘要表格。

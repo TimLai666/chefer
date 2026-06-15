@@ -42,7 +42,10 @@ pub fn cmd_build(
     ui::render_summary_table(&app);
 
     if dry_run {
-        println!("{}", "（dry-run）僅前置檢查完成，未實際打包。".dimmed());
+        println!(
+            "{}",
+            "(dry-run) Pre-checks complete; nothing was built.".dimmed()
+        );
         return Ok(Vec::new());
     }
 
@@ -71,7 +74,7 @@ pub fn cmd_build(
         zstd_level: opts.zstd_level,
         builder_version: env!("CARGO_PKG_VERSION").to_string(),
     };
-    let pack_res = chefer_pack::pack(&app, &pack_opts).context("打包 bundle 失敗")?;
+    let pack_res = chefer_pack::pack(&app, &pack_opts).context("failed to pack bundle")?;
     println!("📦 Bundle: {}", pack_res.bundle_dir.display());
 
     // 2) 對每個 target：找 runtime → assemble 單一執行檔。
@@ -101,7 +104,7 @@ pub fn cmd_build(
                 zstd_level: opts.zstd_level,
             },
         )
-        .with_context(|| format!("組裝單一執行檔失敗（target: {target}）"))?;
+        .with_context(|| format!("failed to assemble single-file executable (target: {target})"))?;
 
         artifacts.push(BuiltArtifact {
             target: target.clone(),

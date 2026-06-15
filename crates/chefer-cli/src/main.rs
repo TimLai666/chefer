@@ -35,55 +35,55 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
-    /// 在指定目錄產生 appcipe.yml 範本（不覆蓋既有檔案）
+    /// Generate an appcipe.yml template in the given directory (won't overwrite existing files)
     Init {
-        /// 目標目錄；預設為目前目錄
+        /// Target directory; defaults to the current directory
         #[arg(value_name = "DIR")]
         dir: Option<PathBuf>,
     },
 
-    /// 讀取並驗證 appcipe.yml，依格式輸出摘要
+    /// Read and validate appcipe.yml, then print a summary in the chosen format
     Check {
-        /// appcipe.yml 路徑或所在目錄，預設 appcipe.yml
+        /// Path to appcipe.yml or its directory; defaults to appcipe.yml
         #[arg(value_name = "PATH")]
         file: Option<String>,
 
-        /// 輸出格式：pretty/json/yaml
+        /// Output format: pretty/json/yaml
         #[arg(long, short, value_enum, default_value_t = PrintFmt::Pretty)]
         format: PrintFmt,
     },
 
-    /// 打包：appcipe.yml → bundle → 單一執行檔
+    /// Build: appcipe.yml → bundle → single executable
     Build {
         #[command(flatten)]
         opts: BuildOpts,
 
-        /// 目標 target triple（可重複；預設為本機 target）
+        /// Target triple (repeatable; defaults to the host target)
         #[arg(long = "target", value_name = "TRIPLE")]
         targets: Vec<String>,
 
-        /// 只做檢查與前置摘要，不實際打包
+        /// Only run checks and print a pre-build summary; don't actually build
         #[arg(long)]
         dry_run: bool,
     },
 
-    /// 建置本機 target 的單一執行檔後直接執行（stdio 直通、透傳 exit code）
+    /// Build the single executable for the host target, then run it directly (stdio passthrough, propagates exit code)
     Run {
         #[command(flatten)]
         opts: BuildOpts,
     },
 
-    /// 檢視 Chefer 單一執行檔的 footer 與內嵌 manifest 摘要（不執行、不解壓）
+    /// Inspect a Chefer single executable's footer and embedded manifest summary (no run, no extraction)
     Inspect {
-        /// Chefer 單一執行檔路徑
+        /// Path to the Chefer single executable
         #[arg(value_name = "FILE")]
         file: PathBuf,
     },
 
-    /// 顯示 Chefer 與環境版本資訊
+    /// Show Chefer and environment version information
     Version,
 
-    /// 自動更新到最新版（不依賴 cargo）
+    /// Auto-update to the latest version (no cargo required)
     Upgrade {
         #[arg(long, default_value = "stable")]
         channel: String,
@@ -95,10 +95,10 @@ enum Cmd {
         check_only: bool,
     },
 
-    /// 移除 chefer 本身（CLI 執行檔 + kit）；不會動到你打包好的 app 或其資料
+    /// Remove chefer itself (CLI executable + kit); won't touch your packed apps or their data
     #[command(name = "selfrm")]
     Selfrm {
-        /// 不詢問直接移除
+        /// Remove without prompting for confirmation
         #[arg(long, short = 'y')]
         yes: bool,
     },
@@ -107,23 +107,23 @@ enum Cmd {
 /// build / run 共用的參數（run 固定使用本機 target，故 --target 不在此）。
 #[derive(Args, Debug, Clone)]
 pub(crate) struct BuildOpts {
-    /// appcipe.yml 路徑或所在目錄，預設 appcipe.yml
+    /// Path to appcipe.yml or its directory; defaults to appcipe.yml
     #[arg(value_name = "PATH")]
     pub file: Option<String>,
 
-    /// 輸出根目錄（bundle 與單檔都會放在 <out>/<name>/ 之下）
+    /// Output root directory (both the bundle and the single file go under <out>/<name>/)
     #[arg(long, default_value = "dist", value_name = "DIR")]
     pub out: PathBuf,
 
-    /// 額外的 kit 搜尋目錄（最優先；可重複指定）
+    /// Additional kit search directory (highest priority; repeatable)
     #[arg(long = "kit-dir", value_name = "DIR")]
     pub kit_dirs: Vec<PathBuf>,
 
-    /// zstd 壓縮等級（1..=22；預設 3）
+    /// zstd compression level (1..=22; defaults to 3)
     #[arg(long, default_value_t = 3, value_name = "N")]
     pub zstd_level: i32,
 
-    /// 不在 bundle 內回寫原始 appcipe.yml
+    /// Don't embed the original appcipe.yml back into the bundle
     #[arg(long)]
     pub no_embed_original: bool,
 }

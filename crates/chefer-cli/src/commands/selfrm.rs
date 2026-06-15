@@ -16,10 +16,15 @@ use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
 
 pub fn cmd_selfrm(yes: bool) -> Result<()> {
-    let exe = std::env::current_exe().context("取得 chefer 執行檔路徑失敗")?;
+    let exe = std::env::current_exe().context("failed to determine the chefer executable path")?;
     let install_dir = exe
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("無法判定 chefer 安裝目錄：{}", exe.display()))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "could not determine the chefer install directory: {}",
+                exe.display()
+            )
+        })?
         .to_path_buf();
 
     // 同層的 kit：只有「看起來像 chefer kit」才移除（含 chefer-runtime-* 或 guest-agent-*），
@@ -27,26 +32,30 @@ pub fn cmd_selfrm(yes: bool) -> Result<()> {
     let kit = install_dir.join("kit");
     let kit_is_chefer = looks_like_chefer_kit(&kit);
 
-    println!("{}", "將移除 chefer 本身：".bold());
-    println!("  - 執行檔：{}", exe.display());
+    println!("{}", "This will remove chefer itself:".bold());
+    println!("  - executable: {}", exe.display());
     if kit_is_chefer {
-        println!("  - kit：   {}", kit.display());
+        println!("  - kit:        {}", kit.display());
     }
     println!(
         "{}",
-        "不會移除：你打包出的 app 單檔、app 的持久化資料、WSL distro。".dimmed()
+        "Will NOT remove: the single-file apps you packed, their persisted data, or the WSL distro.".dimmed()
     );
 
-    if !yes && !confirm("確定要移除 chefer 嗎？[y/N] ")? {
-        println!("已取消。");
+    if !yes && !confirm("Remove chefer? [y/N] ")? {
+        println!("Cancelled.");
         return Ok(());
     }
 
     // 1) 先移除 kit（自身執行檔最後刪，避免中途失敗留下半套）
     if kit_is_chefer {
-        fs::remove_dir_all(&kit)
-            .with_context(|| format!("移除 kit 失敗：{}（可手動刪除）", kit.display()))?;
-        println!("{} {}", "已移除".green(), kit.display());
+        fs::remove_dir_all(&kit).with_context(|| {
+            format!(
+                "failed to remove kit: {} (you can delete it manually)",
+                kit.display()
+            )
+        })?;
+        println!("{} {}", "Removed".green(), kit.display());
     }
 
     // 2) 盡力清掉安裝腳本加進 PATH 的設定（找不到就只提示，不視為失敗）
@@ -55,26 +64,31 @@ pub fn cmd_selfrm(yes: bool) -> Result<()> {
     // 3) 最後刪掉自身執行檔
     //    - Unix：unlink 後本行程仍以已開啟的 inode 繼續跑到結束。
     //    - Windows：排程於行程結束後刪除（執行中無法直接刪）。
-    self_replace::self_delete()
-        .with_context(|| format!("移除 chefer 執行檔失敗：{}；可手動刪除該檔", exe.display()))?;
-    println!("{} {}", "已移除".green(), exe.display());
+    self_replace::self_delete().with_context(|| {
+        format!(
+            "failed to remove the chefer executable: {}; you can delete it manually",
+            exe.display()
+        )
+    })?;
+    println!("{} {}", "Removed".green(), exe.display());
 
     println!();
-    println!("{}", "✔ chefer 已移除。".green().bold());
+    println!("{}", "✔ chefer has been removed.".green().bold());
     println!(
         "{}",
-        "提示：若 `chefer` 仍可呼叫，請開新終端機（PATH 變更需重載）。".dimmed()
+        "Note: if `chefer` is still callable, open a new terminal (PATH changes need a reload)."
+            .dimmed()
     );
     #[cfg(windows)]
     println!(
         "{}",
-        "提示：chefer 在 Windows 建立的 WSL distro 名為 chefer-rt-*；\
-         要一併清除可執行 `wsl --unregister <name>`（不清也不影響系統）。"
+        "Note: the WSL distro chefer creates on Windows is named chefer-rt-*; \
+         to remove it too, run `wsl --unregister <name>` (leaving it does not affect the system)."
             .dimmed()
     );
     println!(
         "{}",
-        "提示：你打包的 app 寫的資料未被移除（屬於 app，不屬於 chefer）。".dimmed()
+        "Note: data written by the apps you packed is not removed (it belongs to the app, not to chefer).".dimmed()
     );
     Ok(())
 }
@@ -101,7 +115,7 @@ fn confirm(prompt: &str) -> Result<bool> {
     let mut line = String::new();
     let n = io::stdin()
         .read_line(&mut line)
-        .context("讀取確認輸入失敗")?;
+        .context("failed to read the confirmation input")?;
     if n == 0 {
         return Ok(false); // EOF / 非互動
     }
@@ -126,15 +140,15 @@ fn clean_path_entries(install_dir: &Path) {
         match status {
             Ok(s) if s.success() => {
                 println!(
-                    "{} 使用者 PATH 中的 {} 條目",
-                    "已清除".green(),
+                    "{} the {} entry from the user PATH",
+                    "Removed".green(),
                     install_dir.display()
                 )
             }
             _ => println!(
                 "{}",
                 format!(
-                    "提示：請自行從使用者 PATH 移除 {}（自動清除未成功）。",
+                    "Note: please remove {} from the user PATH yourself (automatic cleanup did not succeed).",
                     install_dir.display()
                 )
                 .dimmed()
@@ -182,7 +196,7 @@ fn clean_path_entries(install_dir: &Path) {
                     }
                     if fs::write(&path, new_content).is_ok() {
                         cleaned_any = true;
-                        println!("{} {}", "已清除 PATH 設定".green(), path.display());
+                        println!("{} {}", "Removed PATH setting from".green(), path.display());
                     }
                 }
             }
@@ -191,7 +205,7 @@ fn clean_path_entries(install_dir: &Path) {
             println!(
                 "{}",
                 format!(
-                    "提示：若有手動把 {} 加進 PATH，請自行移除。",
+                    "Note: if you added {} to PATH manually, please remove it yourself.",
                     install_dir.display()
                 )
                 .dimmed()

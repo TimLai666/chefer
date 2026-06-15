@@ -55,10 +55,10 @@ pub fn cmd_upgrade(channel: &str, to: Option<&str>, check_only: bool) -> Result<
         return Ok(());
     }
 
-    let exe = std::env::current_exe().context("取得目前 chefer 執行檔路徑失敗")?;
+    let exe = std::env::current_exe().context("failed to get current chefer executable path")?;
     let install_dir = exe.parent().ok_or_else(|| {
         anyhow::anyhow!(
-            "無法判定 chefer 安裝目錄：{}；請手動下載 release kit 後覆蓋安裝目錄",
+            "cannot determine chefer install directory: {}; please download the release kit manually and overwrite the install directory",
             exe.display()
         )
     })?;
@@ -66,7 +66,12 @@ pub fn cmd_upgrade(channel: &str, to: Option<&str>, check_only: bool) -> Result<
     let work = tempfile::Builder::new()
         .prefix("chefer-upgrade-")
         .tempdir_in(install_dir)
-        .with_context(|| format!("在安裝目錄建立暫存資料夾失敗：{}", install_dir.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to create temp folder in install directory: {}",
+                install_dir.display()
+            )
+        })?;
     let archive_path = work.path().join(&archive.name);
     let checksum_path = work.path().join(&checksum.name);
 
@@ -77,26 +82,34 @@ pub fn cmd_upgrade(channel: &str, to: Option<&str>, check_only: bool) -> Result<
         archive.name
     );
     download_asset(&archive, &archive_path)
-        .with_context(|| format!("下載 release kit 失敗：{}", archive.name))?;
+        .with_context(|| format!("failed to download release kit: {}", archive.name))?;
     download_asset(&checksum, &checksum_path)
-        .with_context(|| format!("下載 checksum 失敗：{}", checksum.name))?;
+        .with_context(|| format!("failed to download checksum: {}", checksum.name))?;
 
     let expected = parse_sha256_file(&checksum_path)
-        .with_context(|| format!("解析 checksum 檔失敗：{}", checksum.name))?;
-    let got = file_sha256_hex(&archive_path)
-        .with_context(|| format!("計算 release kit SHA-256 失敗：{}", archive_path.display()))?;
+        .with_context(|| format!("failed to parse checksum file: {}", checksum.name))?;
+    let got = file_sha256_hex(&archive_path).with_context(|| {
+        format!(
+            "failed to compute release kit SHA-256: {}",
+            archive_path.display()
+        )
+    })?;
     if got != expected {
         bail!(
-            "release kit SHA-256 不符：\n  expected: {expected}\n  actual:   {got}\n\
-             已停止更新；請重新執行 upgrade，或手動下載 release kit 與 .sha256 比對"
+            "release kit SHA-256 mismatch:\n  expected: {expected}\n  actual:   {got}\n\
+             update aborted; please re-run upgrade, or download the release kit manually and compare against .sha256"
         );
     }
 
     let extract_dir = work.path().join("extract");
-    fs::create_dir_all(&extract_dir)
-        .with_context(|| format!("建立解壓目錄失敗：{}", extract_dir.display()))?;
+    fs::create_dir_all(&extract_dir).with_context(|| {
+        format!(
+            "failed to create extract directory: {}",
+            extract_dir.display()
+        )
+    })?;
     extract_kit_archive(&archive_path, &extract_dir)
-        .with_context(|| format!("解壓 release kit 失敗：{}", archive.name))?;
+        .with_context(|| format!("failed to extract release kit: {}", archive.name))?;
 
     let root = validate_extracted_kit(&extract_dir, &archive.name, HOST_TARGET)?;
     let new_exe = root.join(host_bin_name(HOST_TARGET));
@@ -105,7 +118,7 @@ pub fn cmd_upgrade(channel: &str, to: Option<&str>, check_only: bool) -> Result<
     println!("{}", "Installing".yellow().bold());
     self_replace::self_replace(&new_exe).with_context(|| {
         format!(
-            "替換目前 chefer 執行檔失敗；可手動解壓 {} 後將 {} 複製到 {}",
+            "failed to replace current chefer executable; you can extract {} manually and copy {} to {}",
             archive.name,
             new_exe.display(),
             exe.display()
@@ -113,7 +126,7 @@ pub fn cmd_upgrade(channel: &str, to: Option<&str>, check_only: bool) -> Result<
     })?;
     replace_kit_dir(install_dir, &new_kit).with_context(|| {
         format!(
-            "替換 kit/ 失敗；chefer binary 可能已更新。請手動解壓 {} 後覆蓋 {}",
+            "failed to replace kit/; the chefer binary may already be updated. Please extract {} manually and overwrite {}",
             archive.name,
             install_dir.join("kit").display()
         )
@@ -127,7 +140,7 @@ pub fn cmd_upgrade(channel: &str, to: Option<&str>, check_only: bool) -> Result<
     );
     println!(
         "{}",
-        "註：已比對 Release 隨附的 .sha256；尚未驗證維護者簽章。".dimmed()
+        "Note: verified against the .sha256 shipped with the Release; the maintainer signature has not been verified yet.".dimmed()
     );
     Ok(())
 }
@@ -147,16 +160,16 @@ fn fetch_release(channel: &str, to: Option<&str>) -> Result<Release> {
     if let Some(ver) = to {
         return updater
             .get_release_version(ver)
-            .with_context(|| format!("查詢 GitHub Release tag `{ver}` 失敗"));
+            .with_context(|| format!("failed to look up GitHub Release tag `{ver}`"));
     }
     if channel != "stable" {
         return updater
             .get_release_version(channel)
-            .with_context(|| format!("查詢 GitHub Release tag `{channel}` 失敗"));
+            .with_context(|| format!("failed to look up GitHub Release tag `{channel}`"));
     }
     updater
         .get_latest_release()
-        .context("查詢最新版 GitHub Release 失敗")
+        .context("failed to look up the latest GitHub Release")
 }
 
 fn select_kit_asset(release: &Release, target: &str) -> Result<ReleaseAsset> {
@@ -176,12 +189,16 @@ fn select_kit_asset(release: &Release, target: &str) -> Result<ReleaseAsset> {
     match matches.as_slice() {
         [asset] => Ok(asset.clone()),
         [] => bail!(
-            "Release `{}` 找不到目前平台 `{target}` 的 kit 壓縮包（期望檔名結尾 {suffix}）；\
-             請確認 release workflow 已成功上傳六目標 kit",
+            "No kit archive for this platform `{target}` in release `{}` \
+             (expected a file name ending in `{suffix}`).\n\
+             If this release was just published, its assets may still be uploading — \
+             please wait a few minutes and try again. \
+             If it persists, check that the release workflow uploaded kits for all targets.",
             release.version
         ),
         many => bail!(
-            "Release `{}` 有多個符合 `{target}` 的 kit 壓縮包，無法安全選擇：{}",
+            "Release `{}` has multiple kit archives matching `{target}`; \
+             cannot choose safely: {}",
             release.version,
             many.iter()
                 .map(|a| a.name.as_str())
@@ -200,8 +217,8 @@ fn select_checksum_asset(release: &Release, archive_name: &str) -> Result<Releas
         .cloned()
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "Release `{}` 找不到 checksum 檔 `{checksum_name}`；\
-                 upgrade 必須先比對 .sha256 才能解壓安裝",
+                "Release `{}` has no checksum file `{checksum_name}`; \
+                 upgrade must verify against .sha256 before extracting and installing",
                 release.version
             )
         })
@@ -240,48 +257,50 @@ fn download_asset(asset: &ReleaseAsset, dest: &Path) -> Result<()> {
     let client = reqwest::blocking::ClientBuilder::new()
         .use_rustls_tls()
         .build()
-        .context("建立 HTTPS client 失敗")?;
+        .context("failed to build HTTPS client")?;
     let mut resp = client
         .get(&asset.download_url)
         .header(header::USER_AGENT, "chefer-upgrade")
         .header(header::ACCEPT, "application/octet-stream")
         .send()
-        .with_context(|| format!("送出下載請求失敗：{}", asset.download_url))?;
+        .with_context(|| format!("failed to send download request: {}", asset.download_url))?;
     if !resp.status().is_success() {
         bail!(
-            "下載 `{}` 失敗（HTTP {}）：{}",
+            "failed to download `{}` (HTTP {}): {}",
             asset.name,
             resp.status(),
             asset.download_url
         );
     }
-    let mut out =
-        File::create(dest).with_context(|| format!("建立下載檔失敗：{}", dest.display()))?;
-    io::copy(&mut resp, &mut out).with_context(|| format!("寫入下載檔失敗：{}", dest.display()))?;
+    let mut out = File::create(dest)
+        .with_context(|| format!("failed to create download file: {}", dest.display()))?;
+    io::copy(&mut resp, &mut out)
+        .with_context(|| format!("failed to write download file: {}", dest.display()))?;
     Ok(())
 }
 
 fn parse_sha256_file(path: &Path) -> Result<String> {
     let text = fs::read_to_string(path)
-        .with_context(|| format!("讀取 checksum 檔失敗：{}", path.display()))?;
+        .with_context(|| format!("failed to read checksum file: {}", path.display()))?;
     let first = text
         .split_whitespace()
         .next()
-        .ok_or_else(|| anyhow::anyhow!("checksum 檔是空的"))?;
+        .ok_or_else(|| anyhow::anyhow!("checksum file is empty"))?;
     if first.len() != 64 || !first.bytes().all(|b| b.is_ascii_hexdigit()) {
-        bail!("checksum 第一欄不是 64 位十六進位 SHA-256：{first}");
+        bail!("first checksum field is not a 64-digit hex SHA-256: {first}");
     }
     Ok(first.to_ascii_lowercase())
 }
 
 fn file_sha256_hex(path: &Path) -> Result<String> {
-    let mut f = File::open(path).with_context(|| format!("開啟檔案失敗：{}", path.display()))?;
+    let mut f =
+        File::open(path).with_context(|| format!("failed to open file: {}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = f
             .read(&mut buf)
-            .with_context(|| format!("讀取檔案失敗：{}", path.display()))?;
+            .with_context(|| format!("failed to read file: {}", path.display()))?;
         if n == 0 {
             break;
         }
@@ -309,34 +328,41 @@ fn extract_kit_archive(archive: &Path, dest: &Path) -> Result<()> {
     } else if name.ends_with(".tar.gz") {
         extract_tar_gz(archive, dest)
     } else {
-        bail!("不支援的 release kit 壓縮格式：{}", archive.display())
+        bail!(
+            "unsupported release kit archive format: {}",
+            archive.display()
+        )
     }
 }
 
 fn extract_tar_gz(archive: &Path, dest: &Path) -> Result<()> {
-    let f =
-        File::open(archive).with_context(|| format!("開啟 tar.gz 失敗：{}", archive.display()))?;
+    let f = File::open(archive)
+        .with_context(|| format!("failed to open tar.gz: {}", archive.display()))?;
     let gz = GzDecoder::new(f);
     let mut ar = tar::Archive::new(gz);
-    for entry in ar.entries().context("讀取 tar.gz 內容失敗")? {
-        let mut entry = entry.context("讀取 tar entry 失敗")?;
-        let raw = entry.path().context("tar entry 路徑無法解析")?.into_owned();
+    for entry in ar.entries().context("failed to read tar.gz contents")? {
+        let mut entry = entry.context("failed to read tar entry")?;
+        let raw = entry
+            .path()
+            .context("failed to parse tar entry path")?
+            .into_owned();
         let rel = sanitize_archive_path(&raw)?;
         let out = dest.join(&rel);
         match entry.header().entry_type() {
             tar::EntryType::Directory => {
                 fs::create_dir_all(&out)
-                    .with_context(|| format!("建立目錄失敗：{}", out.display()))?;
+                    .with_context(|| format!("failed to create directory: {}", out.display()))?;
             }
             tar::EntryType::Regular | tar::EntryType::Continuous => {
                 if let Some(parent) = out.parent() {
-                    fs::create_dir_all(parent)
-                        .with_context(|| format!("建立目錄失敗：{}", parent.display()))?;
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!("failed to create directory: {}", parent.display())
+                    })?;
                 }
                 let mut file = File::create(&out)
-                    .with_context(|| format!("建立檔案失敗：{}", out.display()))?;
+                    .with_context(|| format!("failed to create file: {}", out.display()))?;
                 io::copy(&mut entry, &mut file)
-                    .with_context(|| format!("寫入檔案失敗：{}", out.display()))?;
+                    .with_context(|| format!("failed to write file: {}", out.display()))?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
@@ -346,7 +372,7 @@ fn extract_tar_gz(archive: &Path, dest: &Path) -> Result<()> {
                 }
             }
             other => bail!(
-                "release kit tar 內含不支援的項目類型 {:?}：{}",
+                "release kit tar contains an unsupported entry type {:?}: {}",
                 other,
                 raw.display()
             ),
@@ -356,36 +382,41 @@ fn extract_tar_gz(archive: &Path, dest: &Path) -> Result<()> {
 }
 
 fn extract_zip(archive: &Path, dest: &Path) -> Result<()> {
-    let f = File::open(archive).with_context(|| format!("開啟 zip 失敗：{}", archive.display()))?;
-    let mut zip = zip::ZipArchive::new(f).context("讀取 zip 內容失敗")?;
+    let f = File::open(archive)
+        .with_context(|| format!("failed to open zip: {}", archive.display()))?;
+    let mut zip = zip::ZipArchive::new(f).context("failed to read zip contents")?;
     for i in 0..zip.len() {
-        let mut entry = zip.by_index(i).context("讀取 zip entry 失敗")?;
+        let mut entry = zip.by_index(i).context("failed to read zip entry")?;
         let rel = sanitize_archive_name(entry.name())?;
         let out = dest.join(&rel);
         if entry.is_dir() {
-            fs::create_dir_all(&out).with_context(|| format!("建立目錄失敗：{}", out.display()))?;
+            fs::create_dir_all(&out)
+                .with_context(|| format!("failed to create directory: {}", out.display()))?;
             continue;
         }
         if entry.is_symlink() {
-            bail!("release kit zip 內含不支援的 symlink：{}", entry.name());
+            bail!(
+                "release kit zip contains an unsupported symlink: {}",
+                entry.name()
+            );
         }
         if let Some(mode) = entry.unix_mode() {
             let kind = mode & 0o170000;
             if kind != 0 && kind != 0o100000 {
                 bail!(
-                    "release kit zip 內含不支援的項目 mode {mode:o}：{}",
+                    "release kit zip contains an unsupported entry mode {mode:o}: {}",
                     entry.name()
                 );
             }
         }
         if let Some(parent) = out.parent() {
             fs::create_dir_all(parent)
-                .with_context(|| format!("建立目錄失敗：{}", parent.display()))?;
+                .with_context(|| format!("failed to create directory: {}", parent.display()))?;
         }
-        let mut file =
-            File::create(&out).with_context(|| format!("建立檔案失敗：{}", out.display()))?;
+        let mut file = File::create(&out)
+            .with_context(|| format!("failed to create file: {}", out.display()))?;
         io::copy(&mut entry, &mut file)
-            .with_context(|| format!("寫入檔案失敗：{}", out.display()))?;
+            .with_context(|| format!("failed to write file: {}", out.display()))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -399,7 +430,7 @@ fn extract_zip(archive: &Path, dest: &Path) -> Result<()> {
 
 fn sanitize_archive_name(raw: &str) -> Result<PathBuf> {
     if raw.is_empty() || raw.contains('\\') {
-        bail!("release kit archive 內含不安全路徑：{raw}");
+        bail!("release kit archive contains an unsafe path: {raw}");
     }
     sanitize_archive_path(Path::new(raw))
 }
@@ -409,55 +440,70 @@ fn sanitize_archive_path(path: &Path) -> Result<PathBuf> {
     for comp in path.components() {
         match comp {
             Component::Prefix(_) | Component::RootDir | Component::ParentDir => {
-                bail!("release kit archive 內含不安全路徑：{}", path.display());
+                bail!(
+                    "release kit archive contains an unsafe path: {}",
+                    path.display()
+                );
             }
             Component::CurDir => {}
             Component::Normal(seg) => {
                 let s = seg.to_string_lossy();
                 if s.contains(':') || s.contains('\\') {
-                    bail!("release kit archive 路徑片段含非法字元：{s}");
+                    bail!("release kit archive path segment contains an illegal character: {s}");
                 }
                 out.push(seg);
             }
         }
     }
     if out.as_os_str().is_empty() {
-        bail!("release kit archive 內含空路徑");
+        bail!("release kit archive contains an empty path");
     }
     Ok(out)
 }
 
 fn validate_extracted_kit(extract_dir: &Path, archive_name: &str, target: &str) -> Result<PathBuf> {
     let root_name = archive_root_name(archive_name)?;
-    for entry in fs::read_dir(extract_dir)
-        .with_context(|| format!("讀取解壓目錄失敗：{}", extract_dir.display()))?
-    {
-        let entry =
-            entry.with_context(|| format!("讀取解壓目錄項目失敗：{}", extract_dir.display()))?;
+    for entry in fs::read_dir(extract_dir).with_context(|| {
+        format!(
+            "failed to read extract directory: {}",
+            extract_dir.display()
+        )
+    })? {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to read extract directory entry: {}",
+                extract_dir.display()
+            )
+        })?;
         if entry.file_name() != OsStr::new(&root_name) {
             bail!(
-                "release kit 解壓後含非預期的頂層項目 `{}`；\
-                 壓縮包必須只包含 `{root_name}/` 根目錄",
+                "release kit extracted to an unexpected top-level entry `{}`; \
+                 the archive must contain only the `{root_name}/` root directory",
                 entry.file_name().to_string_lossy()
             );
         }
     }
     let root = extract_dir.join(&root_name);
     if !root.is_dir() {
-        bail!("release kit 解壓後找不到根目錄 `{root_name}`；請確認壓縮包由 release workflow 產生");
+        bail!(
+            "could not find root directory `{root_name}` after extracting the release kit; make sure the archive was produced by the release workflow"
+        );
     }
     let bin = root.join(host_bin_name(target));
     if !bin.is_file() {
-        bail!("release kit 缺少 host CLI：{}", bin.display());
+        bail!("release kit is missing the host CLI: {}", bin.display());
     }
     let kit = root.join("kit");
     if !kit.is_dir() {
-        bail!("release kit 缺少 kit/ 目錄：{}", kit.display());
+        bail!(
+            "release kit is missing the kit/ directory: {}",
+            kit.display()
+        );
     }
     for name in required_kit_files() {
         let path = kit.join(name);
         if !path.is_file() {
-            bail!("release kit 缺少必要檔案：{}", path.display());
+            bail!("release kit is missing a required file: {}", path.display());
         }
     }
     Ok(root)
@@ -470,7 +516,7 @@ fn archive_root_name(archive_name: &str) -> Result<String> {
     if let Some(s) = archive_name.strip_suffix(".zip") {
         return Ok(s.to_string());
     }
-    bail!("無法由壓縮包檔名推導根目錄：{archive_name}")
+    bail!("cannot derive root directory from archive file name: {archive_name}")
 }
 
 fn required_kit_files() -> &'static [&'static str] {
@@ -491,12 +537,12 @@ fn replace_kit_dir(install_dir: &Path, new_kit: &Path) -> Result<()> {
     let backup = install_dir.join(format!("kit.previous-{}", std::process::id()));
     if backup.exists() {
         fs::remove_dir_all(&backup)
-            .with_context(|| format!("清除舊備份 kit 失敗：{}", backup.display()))?;
+            .with_context(|| format!("failed to clear old kit backup: {}", backup.display()))?;
     }
     if target.exists() {
         fs::rename(&target, &backup).with_context(|| {
             format!(
-                "備份既有 kit 失敗：{} → {}",
+                "failed to back up existing kit: {} → {}",
                 target.display(),
                 backup.display()
             )
@@ -515,7 +561,7 @@ fn replace_kit_dir(install_dir: &Path, new_kit: &Path) -> Result<()> {
             }
             Err(err).with_context(|| {
                 format!(
-                    "安裝新 kit 失敗：{} → {}",
+                    "failed to install new kit: {} → {}",
                     new_kit.display(),
                     target.display()
                 )

@@ -17,7 +17,7 @@ pub fn run(bundle_dir: &Path, keep_tmp: bool) -> Result<i32> {
     let manifest_path = chefer_bundle::layout::manifest_path(bundle_dir);
     let manifest = Manifest::load(&manifest_path)?;
     tracing::info!(
-        "app：{}{}{}",
+        "app: {}{}{}",
         manifest.app.name,
         manifest
             .app
@@ -28,7 +28,7 @@ pub fn run(bundle_dir: &Path, keep_tmp: bool) -> Result<i32> {
         if manifest.app.builder_version.is_empty() {
             String::new()
         } else {
-            format!("（由 chefer {} 打包）", manifest.app.builder_version)
+            format!(" (packed by chefer {})", manifest.app.builder_version)
         }
     );
 
@@ -39,8 +39,8 @@ pub fn run(bundle_dir: &Path, keep_tmp: bool) -> Result<i32> {
     let data_dir = resolve_data_dir(&manifest.app)?;
     migrate_old_names(&data_dir, &manifest.app.old_names)?;
     fs_err::create_dir_all(&data_dir)
-        .with_context(|| format!("建立資料目錄失敗：{}", data_dir.display()))?;
-    tracing::info!("資料目錄：{}", data_dir.display());
+        .with_context(|| format!("failed to create data directory: {}", data_dir.display()))?;
+    tracing::info!("data directory: {}", data_dir.display());
 
     // 埠代理（host != guest 才代理；bind 失敗會在啟動服務前整體報錯）。
     proxy::start_port_proxies(&manifest)?;
@@ -51,17 +51,17 @@ pub fn run(bundle_dir: &Path, keep_tmp: bool) -> Result<i32> {
     {
         let finished = Arc::clone(&finished);
         ctrlc::set_handler(move || {
-            tracing::info!("收到中斷訊號（Ctrl-C），正在等待服務結束…");
+            tracing::info!("Received interrupt (Ctrl-C); waiting for services to stop…");
             for _ in 0..50 {
                 if finished.load(Ordering::SeqCst) {
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            tracing::warn!("服務在 5 秒內未結束，強制退出（exit code 130）");
+            tracing::warn!("services did not stop within 5 seconds; forcing exit (exit code 130)");
             std::process::exit(130);
         })
-        .context("註冊 Ctrl-C 處理器失敗")?;
+        .context("failed to register Ctrl-C handler")?;
     }
 
     let ctx = AppRunContext {
@@ -74,7 +74,7 @@ pub fn run(bundle_dir: &Path, keep_tmp: bool) -> Result<i32> {
     finished.store(true, Ordering::SeqCst);
 
     let code = result?;
-    tracing::info!("app 結束，exit code = {code}");
+    tracing::info!("app finished, exit code = {code}");
     Ok(code)
 }
 
@@ -97,8 +97,8 @@ fn platform_data_root() -> Result<PathBuf> {
             .filter(|v| !v.is_empty())
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "環境變數 LOCALAPPDATA 未設定，無法決定資料目錄；\
-                     請設定 LOCALAPPDATA，或在 appcipe.yml 以 data_dir 指定後重新打包"
+                    "environment variable LOCALAPPDATA is not set, cannot determine the data directory; \
+                     set LOCALAPPDATA, or specify data_dir in appcipe.yml and repack"
                 )
             })?;
         Ok(PathBuf::from(base))
@@ -109,8 +109,8 @@ fn platform_data_root() -> Result<PathBuf> {
             .filter(|v| !v.is_empty())
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "環境變數 HOME 未設定，無法決定資料目錄；\
-                     請設定 HOME，或在 appcipe.yml 以 data_dir 指定後重新打包"
+                    "environment variable HOME is not set, cannot determine the data directory; \
+                     set HOME, or specify data_dir in appcipe.yml and repack"
                 )
             })?;
         Ok(PathBuf::from(home)
@@ -126,8 +126,8 @@ fn platform_data_root() -> Result<PathBuf> {
             .filter(|v| !v.is_empty())
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "環境變數 XDG_DATA_HOME 與 HOME 皆未設定，無法決定資料目錄；\
-                     請設定其一，或在 appcipe.yml 以 data_dir 指定後重新打包"
+                    "neither XDG_DATA_HOME nor HOME is set, cannot determine the data directory; \
+                     set one of them, or specify data_dir in appcipe.yml and repack"
                 )
             })?;
         Ok(PathBuf::from(home).join(".local").join("share"))
@@ -135,7 +135,7 @@ fn platform_data_root() -> Result<PathBuf> {
     #[cfg(not(any(target_os = "windows", unix)))]
     {
         anyhow::bail!(
-            "不支援的平台（{}）：無法決定預設資料目錄；請在 appcipe.yml 以 data_dir 指定",
+            "unsupported platform ({}): cannot determine the default data directory; specify data_dir in appcipe.yml",
             std::env::consts::OS
         )
     }
@@ -156,21 +156,21 @@ pub(crate) fn migrate_old_names(data_dir: &Path, old_names: &[String]) -> Result
         // 拒絕含路徑分隔、`..`、絕對路徑或磁碟前綴者，確保 parent.join(old)
         // 必落在 parent 之下，杜絕任意 host 目錄改名（見 docs/DESIGN.md §0）。
         if !is_single_path_segment(old) {
-            tracing::warn!("略過不安全的 old_names 項目（非單一目錄名）：{old}");
+            tracing::warn!("skipping unsafe old_names entry (not a single directory name): {old}");
             continue;
         }
         let old_path = parent.join(old);
         if old_path.is_dir() {
             fs_err::rename(&old_path, data_dir).with_context(|| {
                 format!(
-                    "遷移舊資料目錄失敗：{} → {}；\
-                     請確認目錄未被其他程式使用後重試",
+                    "failed to migrate old data directory: {} → {}; \
+                     make sure the directory is not in use by another program and retry",
                     old_path.display(),
                     data_dir.display()
                 )
             })?;
             tracing::info!(
-                "已將舊資料目錄 {} 遷移為 {}",
+                "migrated old data directory {} to {}",
                 old_path.display(),
                 data_dir.display()
             );
