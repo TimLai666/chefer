@@ -813,6 +813,47 @@ YAML
   note "Healthcheck negative E2E passed: unhealthy service tore the app down (exit=${bad_code}, ${elapsed}s)"
 }
 
+# source: dockerfile —— chefer 直接從 Dockerfile build（偵測 host docker），免手動 docker save。
+run_dockerfile_e2e() {
+  local work="$1" output_target="$2" image_platform="$3" cli="$4" kit="$5" base_image="$6"
+
+  note "Dockerfile build E2E: chefer builds the image straight from a Dockerfile (no docker save)"
+  mkdir -p "$work/df/ctx"
+  cat >"$work/df/ctx/Dockerfile" <<DOCKER
+FROM ${base_image}
+CMD ["sh", "-lc", "echo CHEFER_DOCKERFILE_OK"]
+DOCKER
+  cat >"$work/df/appcipe.yml" <<YAML
+version: "0.1"
+name: LinuxDockerfile
+app_version: "e2e"
+data_dir: "$work/df-data"
+crash: fail_fast
+network: shared
+services:
+  app:
+    image:
+      source: dockerfile
+      file: "$work/df/ctx/Dockerfile"
+      platform: ${image_platform}
+    interface_mode: none
+YAML
+  "$cli" build "$work/df/appcipe.yml" --out "$work/out-df" --kit-dir "$kit" --target "$output_target"
+  local df_app="$work/out-df/LinuxDockerfile/LinuxDockerfile_${output_target}"
+  [[ -f "$df_app" ]] || die "missing built dockerfile app: $df_app"
+  chmod +x "$df_app"
+  local df_log="$work/df.log"
+  set +e
+  "$df_app" >"$df_log" 2>&1
+  local df_code=$?
+  set -e
+  if [[ "$df_code" -ne 0 ]] || ! grep -q "CHEFER_DOCKERFILE_OK" "$df_log"; then
+    cat "$df_log" >&2 || true
+    die "Dockerfile build E2E failed: exit=${df_code}, expected CHEFER_DOCKERFILE_OK"
+  fi
+  note "Dockerfile build E2E passed: Dockerfile -> chefer build (host docker) -> single-file run"
+}
+
 main() {
   [[ "$(uname -s)" == "Linux" ]] || die "Linux E2E must run on Linux"
   ! is_wsl || die "Linux E2E requires a native Linux host, not WSL"
@@ -981,6 +1022,9 @@ main() {
 
   note "Checking depends_on healthcheck (wait-until-ready + fail_fast)"
   run_healthcheck_e2e "$work" "$output_target" "$image_platform" "$cli" "$kit" "$image_tar"
+
+  note "Checking Dockerfile build (source: dockerfile)"
+  run_dockerfile_e2e "$work" "$output_target" "$image_platform" "$cli" "$kit" "$base_image"
 
   if [[ "${CHEFER_E2E_GUI:-0}" == "1" ]]; then
     run_gui_e2e "$work" "$output_target" "$image_platform" "$cli" "$kit"

@@ -37,19 +37,32 @@ pub fn normalize(app: &mut AppCipe, base: &Path) -> anyhow::Result<()> {
                 file: reference,
                 format: ImageFormat::Auto,
                 platform: ImagePlatform::LinuxAmd64,
+                context: None,
+                build_args: Default::default(),
             };
         }
 
-        // image.file（Host 路徑；僅 source=tar 或 TarPath 簡寫）
+        // image.file（Host 路徑：source=tar 的 tar、TarPath 簡寫、dockerfile 的 Dockerfile）；
+        // dockerfile 另絕對化 context（省略時不在此補預設，交給 pack 以 Dockerfile 所在目錄為準）。
         match &mut svc.image {
             ImageSourceOrPath::TarPath(p) => {
                 *p = to_abs(base, p);
             }
-            ImageSourceOrPath::Full { source, file, .. } => {
-                if matches!(source, ImageSourceType::Tar) {
+            ImageSourceOrPath::Full {
+                source,
+                file,
+                context,
+                ..
+            } => match source {
+                ImageSourceType::Tar => *file = to_abs(base, file),
+                ImageSourceType::Dockerfile => {
                     *file = to_abs(base, file);
+                    if let Some(c) = context {
+                        *c = to_abs(base, c);
+                    }
                 }
-            }
+                ImageSourceType::Image => {}
+            },
         }
 
         // mounts：只轉左半邊（Host 路徑）。用 rsplitn(2, ':') 以相容 Windows 的 "C:\"
@@ -233,8 +246,8 @@ services:
     }
 
     #[test]
-    fn normalize_skips_non_tar_image_sources() {
-        // dockerfile 來源的 file 不是 tar host 路徑語意，不做絕對化
+    fn normalize_dockerfile_absolutizes_file_and_context() {
+        // dockerfile 來源的 file（Dockerfile）與 context 都是 host 路徑 → 絕對化。
         let base = abs_base();
         let mut app = parse_raw(
             r#"
@@ -244,12 +257,46 @@ services:
   db:
     image:
       source: dockerfile
-      file: ./Dockerfile
+      file: Dockerfile
+      context: build/ctx
 "#,
         );
         normalize(&mut app, &base).unwrap();
         match &app.services["db"].image {
-            ImageSourceOrPath::Full { file, .. } => assert_eq!(file, "./Dockerfile"),
+            ImageSourceOrPath::Full { file, context, .. } => {
+                assert_eq!(file, &base.join("Dockerfile").to_string_lossy().to_string());
+                assert_eq!(
+                    context.as_deref(),
+                    Some(
+                        base.join("build/ctx")
+                            .to_string_lossy()
+                            .to_string()
+                            .as_str()
+                    )
+                );
+            }
+            other => panic!("非預期的 image 形式：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn normalize_skips_registry_ref() {
+        // source: image 的 file 是 registry ref，不是 host 路徑 → 不絕對化。
+        let base = abs_base();
+        let mut app = parse_raw(
+            r#"
+version: "0.1"
+name: App
+services:
+  db:
+    image:
+      source: image
+      file: redis:7.2-alpine
+"#,
+        );
+        normalize(&mut app, &base).unwrap();
+        match &app.services["db"].image {
+            ImageSourceOrPath::Full { file, .. } => assert_eq!(file, "redis:7.2-alpine"),
             other => panic!("非預期的 image 形式：{other:?}"),
         }
     }

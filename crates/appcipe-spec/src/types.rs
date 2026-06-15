@@ -230,6 +230,14 @@ pub enum ImageSourceOrPath {
 
         #[serde(default)]
         platform: ImagePlatform,
+
+        /// 僅 `source: dockerfile` 使用：build context 目錄；省略 → Dockerfile 所在目錄。
+        #[serde(default)]
+        context: Option<String>,
+
+        /// 僅 `source: dockerfile` 使用：傳給 builder 的 `--build-arg`。
+        #[serde(default)]
+        build_args: HashMap<String, String>,
     },
 }
 
