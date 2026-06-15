@@ -39,16 +39,8 @@ pub(crate) struct RepackedLayer {
     pub size: u64,
 }
 
-/// 將單一層 blob 串流解壓、計算 diff_id、zstd 重壓寫入 `layers_dir`。
-///
-/// 先寫到暫存檔名，算出 diff_id 後再改名為正式檔名
-/// （`chefer_bundle::layout::layer_file_name`）。
-pub(crate) fn repack_layer(
-    blob: &Path,
-    layers_dir: &Path,
-    idx: usize,
-    zstd_level: i32,
-) -> Result<RepackedLayer> {
+/// 開啟層 blob 並依 magic bytes 包上對應的解壓器，回傳「未壓縮 tar」的讀取串流。
+fn open_decoded(blob: &Path) -> Result<Box<dyn Read>> {
     let mut input =
         fs::File::open(blob).with_context(|| format!("開啟層 blob 失敗：{}", blob.display()))?;
 
@@ -65,13 +57,44 @@ pub(crate) fn repack_layer(
     let head = Cursor::new(magic[..filled].to_vec());
     let chained = head.chain(input);
 
-    let mut decoded: Box<dyn Read> = match detect_compression(&magic[..filled]) {
+    Ok(match detect_compression(&magic[..filled]) {
         Compression::Gzip => Box::new(GzDecoder::new(chained)),
         Compression::Zstd => {
             Box::new(zstd::stream::read::Decoder::new(chained).context("初始化 zstd 解壓器失敗")?)
         }
         Compression::Plain => Box::new(chained),
-    };
+    })
+}
+
+/// 計算層 blob 的 diff_id（解壓後 sha256），不重壓、不寫檔。
+/// 供 registry 拉取後依 config 的 diff_ids 順序重排各層用（oci-client 回傳順序非 manifest 序）。
+pub(crate) fn compute_diff_id(blob: &Path) -> Result<String> {
+    let mut decoded = open_decoded(blob)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 128 * 1024];
+    loop {
+        let n = decoded
+            .read(&mut buf)
+            .with_context(|| format!("解壓層 blob 失敗：{}", blob.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("sha256:{}", to_hex(&hasher.finalize())))
+}
+
+/// 將單一層 blob 串流解壓、計算 diff_id、zstd 重壓寫入 `layers_dir`。
+///
+/// 先寫到暫存檔名，算出 diff_id 後再改名為正式檔名
+/// （`chefer_bundle::layout::layer_file_name`）。
+pub(crate) fn repack_layer(
+    blob: &Path,
+    layers_dir: &Path,
+    idx: usize,
+    zstd_level: i32,
+) -> Result<RepackedLayer> {
+    let mut decoded = open_decoded(blob)?;
 
     // 先寫暫存檔（檔名需要 diff_id，必須讀完整層才知道）。
     let tmp_path = layers_dir.join(format!(".tmp-{idx:04}.tar.zst"));
