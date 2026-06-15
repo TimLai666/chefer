@@ -1,20 +1,20 @@
-# Chefer demo：應用 + 資料庫，示範內部網路、資料持久化、db 不對外暴露。
+# Chefer demo：應用 + 資料庫，示範 registry 拉取、內部網路、資料持久化、db 不對外暴露。
 #
-# 打包前先用 scripts/build-images.sh（或 .ps1）產生 images/app.tar 與 images/db.tar，
-# 再 `chefer build examples/demo/appcipe.yml`。
+# db 直接從 registry 拉（免 docker save）；只需先用 scripts/build-images.sh（或 .ps1）
+# 產生 images/app.tar，再 `chefer build examples/demo/appcipe.yml`。
 version: "0.1"
 name: CheferDemo
 app_version: "1.0.0"
 
 services:
-  # 資料庫：redis，AOF 持久化到 /data。
-  # 沒有 ports → chefer 不會建立 host→guest 代理。app 透過共享網路的
-  # localhost:6379 連到它（內部網路）。
-  # 注意（v1 已知缺口）：服務共享同一 network namespace，且 WSL2 會自動把
-  # loopback 埠鏡射到 Windows，故 6379 目前仍可從 host 連到——真正的「內部專用」
-  # 需逐 app netns 隔離。詳見 README.md。
+  # 資料庫：官方 redis，**直接從 registry 拉取**（免 docker save）。釘 tag 以可重現。
+  # 沒有 ports → 不會被橋接出去；預設 network: bridge 讓本 app 有專屬 netns，
+  # 故 db 從 host 真正連不到（內部專用）。app 以 127.0.0.1:6379 連它（同 app 服務共享 netns）。
+  # 注意：官方 redis 的 entrypoint 會 chown/gosu 到 redis uid 999——WSL2 / macOS VM /
+  # 原生 Linux 以 root 執行時可行；原生 Linux rootless 下單 uid 映射會讓它失敗（見 Roadmap）。
   db:
-    image: ./images/db.tar         # 自建 alpine+redis（CMD 已含 redis-server 參數）
+    image: redis:7.2-alpine        # 從 registry 拉（pin tag，禁 latest）；無需先 docker save
+    cmd: ["redis-server", "--bind", "127.0.0.1", "--appendonly", "yes", "--dir", "/data"]
     persist_path: /data            # redis 的 AOF 落在此，App 重啟後資料保留
     interface_mode: none
 
