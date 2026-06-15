@@ -8,8 +8,23 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, bail};
 use sha2::{Digest, Sha256};
 
-/// rootfs 快取完成標記檔名（位於 rootfs 目錄內）。
+/// rootfs 快取完成標記檔名後綴。**置於 rootfs 目錄外（同層 sibling）**：標記檔
+/// 必須 NOT 落在會成為容器 `/` 的目錄裡，否則合併/overlay 兩條路都會讓容器根目錄
+/// 多出一個 `/.complete`（overlay 的 lowerdir 內容會原樣透出、合併 rootfs 被 bind
+/// 成 `/`）。故標記寫成 `<dir>.complete`。
 pub const COMPLETE_MARKER: &str = ".complete";
+
+/// rootfs/層目錄的完成標記路徑：同層 sibling `<dir>.complete`（不在 `dir` 內）。
+pub fn complete_marker_path(dir: &Path) -> PathBuf {
+    let mut s = dir.as_os_str().to_os_string();
+    s.push(COMPLETE_MARKER);
+    PathBuf::from(s)
+}
+
+/// 寫入完成標記（sibling 空檔）。
+pub fn mark_rootfs_complete(dir: &Path) -> std::io::Result<()> {
+    std::fs::write(complete_marker_path(dir), b"")
+}
 
 /// 預設 rootfs 快取根目錄：`<data_dir>/.rootfs-cache`。
 pub fn default_cache_root(data_dir: &Path) -> PathBuf {
@@ -38,9 +53,9 @@ pub fn service_rootfs_dir(cache_root: &Path, svc: &chefer_bundle::ServiceEntry) 
     cache_root.join(rootfs_dir_name(&svc.name, &diff_ids))
 }
 
-/// 快取是否已完成（目錄存在且含 `.complete` 標記）。
+/// 快取是否已完成（目錄存在且 sibling `<dir>.complete` 標記存在）。
 pub fn is_rootfs_complete(dir: &Path) -> bool {
-    dir.is_dir() && dir.join(COMPLETE_MARKER).is_file()
+    dir.is_dir() && complete_marker_path(dir).is_file()
 }
 
 /// tar entry 路徑（rootfs 內容）的安全檢查與正規化。
@@ -92,7 +107,10 @@ mod linux {
 
     use anyhow::{Context, Result, bail};
 
-    use super::{COMPLETE_MARKER, is_rootfs_complete, sanitize_rel_path, service_rootfs_dir};
+    use super::{
+        complete_marker_path, is_rootfs_complete, mark_rootfs_complete, sanitize_rel_path,
+        service_rootfs_dir,
+    };
     use crate::whiteout::{WhiteoutAction, parse_whiteout};
 
     /// 已組裝完成的 rootfs 租約：在 run 期間持有共享 flock，
@@ -125,6 +143,8 @@ mod linux {
             // 亦即沒有別的 instance 持有 SH → 可安全刪除。
             if flock(&self.lock, libc::LOCK_EX | libc::LOCK_NB).is_ok() {
                 let _ = fs::remove_dir_all(&self.dir);
+                // 連同 sibling 完成標記一起清，避免遺留空檔。
+                let _ = fs::remove_file(complete_marker_path(&self.dir));
                 true
             } else {
                 false
@@ -228,9 +248,9 @@ mod linux {
                 return Err(e);
             }
 
-            fs::write(target.join(COMPLETE_MARKER), b"").with_context(|| {
+            mark_rootfs_complete(&target).with_context(|| {
                 format!(
-                    "failed to write {COMPLETE_MARKER} marker: {}",
+                    "failed to write completion marker for: {}",
                     target.display()
                 )
             })?;
@@ -661,8 +681,9 @@ mod linux {
                     format!("failed to extract overlay layer: {}", layer_path.display())
                 });
             }
-            fs::write(dir.join(COMPLETE_MARKER), b"")
-                .with_context(|| format!("failed to write layer .complete: {}", dir.display()))?;
+            mark_rootfs_complete(&dir).with_context(|| {
+                format!("failed to write layer completion marker: {}", dir.display())
+            })?;
         }
         flock(&lock, libc::LOCK_SH).ok();
         Ok(dir)
@@ -1032,14 +1053,23 @@ mod tests {
 
         // 不存在 → 未完成
         assert!(!is_rootfs_complete(&dir));
-        // 存在但無 .complete → 未完成
+        // 存在但無標記 → 未完成
         std::fs::create_dir_all(&dir).unwrap();
         assert!(!is_rootfs_complete(&dir));
-        // 寫入 .complete → 完成
-        std::fs::write(dir.join(COMPLETE_MARKER), b"").unwrap();
+        // 寫入 sibling 標記 → 完成；且標記不得落在 dir 內（否則會洩漏成容器的 /.complete）
+        mark_rootfs_complete(&dir).unwrap();
         assert!(is_rootfs_complete(&dir));
+        assert!(
+            complete_marker_path(&dir).is_file(),
+            "標記應為 sibling <dir>.complete"
+        );
+        assert!(
+            !dir.join(COMPLETE_MARKER).exists(),
+            "標記不可落在 rootfs 目錄內（會洩漏成容器根目錄的 /.complete）"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_file(complete_marker_path(&dir));
     }
 
     #[test]

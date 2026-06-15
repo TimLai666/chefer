@@ -285,9 +285,9 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
   `pub fn run_bundle(cfg: &RunConfig) -> anyhow::Result<i32>`（非 Linux 回傳明確錯誤）。`udp_bridge=true`（VM 後端：wsl2/vz）時，於啟動服務前 spawn 一條寬限執行緒在 VM 內補起 `<vm_ip>:guest → 127.0.0.1:guest` 的 UDP 橋接（見埠代理節）；namespaces 後端傳 false（原生 Linux 直接共享 netns，不得綁 LAN IP）。
 - bin：`guest-agent run --bundle <dir> --data <dir> [--cache <dir>] [--keep-rootfs] [--udp-bridge]`；`guest-agent vmip`（印出 VM 對外 IPv4，供後端查詢，無則非 0 退出）；另提供 `guest-agent assemble-rootfs`（除錯）。
 - rootfs 組裝：
-  - 目的地：`cache_dir`（預設 `<data_dir>/.rootfs-cache`）`/<svc>-<chain_hash12>/`，chain_hash = sha256(diff_id 以 `\n` 串接)。已存在且含 `.complete` 標記 → 直接重用。
+  - 目的地：`cache_dir`（預設 `<data_dir>/.rootfs-cache`）`/<svc>-<chain_hash12>/`，chain_hash = sha256(diff_id 以 `\n` 串接)。已存在且 sibling 標記 `<svc>-<chain_hash12>.complete` 存在 → 直接重用。
   - 依序解每層 zstd tar：**whiteout 處理**——`.wh.<name>` → 刪除對應項；`.wh..wh..opq` → 清空該目錄既有內容；其餘正常解（保留 symlink/hardlink/權限；路徑安全檢查同 §0）。**解壓平行化**：多層時以 worker pool 提前平行解壓（純 Rust `ruzstd` 解壓吃 CPU），主執行緒仍**嚴格依序套用**（保住 overlay/whiteout 語意），背壓視窗限制暫存量。
-  - 解完寫 `.complete`。
+  - 解完寫完成標記。**標記檔置於 rootfs/層目錄外（同層 sibling `<dir>.complete`）**，不可落在會成為容器 `/` 的目錄裡——否則合併路徑（rootfs 被 bind 成 `/`）與 overlay 路徑（lowerdir 內容原樣透出）都會讓容器根目錄多出一個 `/.complete`。overlay 各 lowerdir（`<cache>/layers/<diff_id>`）同理寫 sibling `<diff_id>.complete`。
   - **overlayfs / lazy rootfs（僅 root 後端）**：真 root（WSL2 / macOS VM / native-root）且 kernel 支援 overlay（以子行程實測掛載確認）時，改走 overlay——各層解到**以 diff_id 命名的獨立唯讀 lowerdir**（`<cache>/layers/<diff_id>`，內容定址 → 跨服務/跨 image 共用去重、持久），OCI whiteout 轉成 overlay whiteout（`.wh.x` → 字元裝置 0:0；`.wh..wh..opq` → `trusted.overlay.opaque` xattr，皆需真 root）。exec 時於服務 mount ns 內掛 `overlay`（lowerdir=各層 top-first、upperdir/workdir=每次執行的可寫層）到 merged 掛載點再 pivot_root——免合併複製、掛載瞬間完成。**rootless 不能 mknod whiteout 裝置 → 退回上面的合併路徑**。可寫層 ephemeral（系統 temp 下 `chefer-overlay/<pid>/<svc>/`，結束清除）；lowerdir 持久共用。**upperdir 須放 temp（通常 /tmp）而非 data_dir**——overlay upperdir 對 fs 有要求（d_type/xattr），而 data_dir 在 VM 後端常是 virtiofs（缺這些 → mount EINVAL）；`overlay_supported()` 的實測掛載即用同一 temp，順帶驗證該處可當 upper。
 - 服務啟動（Linux）：
   - 依 `topo_sort` 順序啟動（v1：先後順序即依賴語意，無健康檢查；文件註明）。
