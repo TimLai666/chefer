@@ -100,6 +100,7 @@ pub fn pack(app: &AppCipe, opts: &PackOptions) -> Result<PackResult> {
             data_dir_override: app.data_dir.clone(),
             crash: CrashPolicy::FailFast,
             network: map_network(app.network),
+            console: map_console(app.console),
             generated_at_utc: now_utc_rfc3339(),
             builder_version: opts.builder_version.clone(),
         },
@@ -385,6 +386,15 @@ fn format_kit_dirs(kit_dirs: &[PathBuf]) -> String {
 /// 目前 UTC 時間的 RFC3339 字串（秒以下截斷，輸出穩定）。
 /// 把 appcipe-spec 的網路模式映射到 bundle manifest 的網路模式。
 /// 兩個 enum 故意各自獨立（spec 跟 appcipe.yml 格式走、manifest 跟協定走）。
+fn map_console(c: appcipe_spec::ConsoleMode) -> chefer_bundle::ConsoleMode {
+    use chefer_bundle::ConsoleMode as B;
+    match c {
+        appcipe_spec::ConsoleMode::Auto => B::Auto,
+        appcipe_spec::ConsoleMode::Shown => B::Shown,
+        appcipe_spec::ConsoleMode::Hidden => B::Hidden,
+    }
+}
+
 fn map_network(n: appcipe_spec::NetworkMode) -> NetworkMode {
     match n {
         appcipe_spec::NetworkMode::Shared => NetworkMode::Shared,

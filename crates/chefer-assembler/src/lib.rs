@@ -408,6 +408,7 @@ mod tests {
                 data_dir_override: None,
                 crash: CrashPolicy::FailFast,
                 network: NetworkMode::Shared,
+                console: chefer_bundle::ConsoleMode::Auto,
                 generated_at_utc: "2026-01-01T00:00:00Z".into(),
                 builder_version: String::new(),
             },

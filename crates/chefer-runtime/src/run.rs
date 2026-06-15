@@ -32,6 +32,9 @@ pub fn run(bundle_dir: &Path, keep_tmp: bool) -> Result<i32> {
         }
     );
 
+    // 主控台顯示策略：gui-only 隱藏共用 console（Windows 雙擊時），無介面 app 印 Ctrl+C 提示。
+    crate::console::apply(&manifest);
+
     // data dir：override 優先，否則平台預設；遷移檢查必須在 create_dir_all 之前。
     let data_dir = resolve_data_dir(&manifest.app)?;
     migrate_old_names(&data_dir, &manifest.app.old_names)?;
@@ -205,6 +208,7 @@ mod tests {
             data_dir_override: override_dir,
             crash: CrashPolicy::FailFast,
             network: NetworkMode::Shared,
+            console: chefer_bundle::ConsoleMode::Auto,
             generated_at_utc: "2026-01-01T00:00:00Z".into(),
             builder_version: String::new(),
         }

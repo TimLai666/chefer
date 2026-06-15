@@ -27,7 +27,27 @@ pub struct AppCipe {
     /// app 的網路模式（見 docs/DESIGN.md「網路隔離」節）。
     #[serde(default)]
     pub network: NetworkMode,
+
+    /// app 共用主控台（彙整日誌 + Ctrl+C 的終端視窗）的顯示策略。
+    #[serde(default)]
+    pub console: ConsoleMode,
     pub services: HashMap<String, Service>,
+}
+
+/// app 共用主控台的顯示策略（主要影響 Windows 雙擊啟動時那個 console 視窗）。
+///
+/// 不影響 stdio 模型本身：互動終端仍最多一個（terminal/both 服務），其餘服務輸出仍以
+/// `[svc]` 前綴彙整到共用主控台。此設定只決定那個共用主控台「要不要顯示」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsoleMode {
+    /// 依介面模式自動：有 terminal/both → 顯示；只有 gui → 隱藏（關窗即停）；全 none → 顯示（保留停止介面）。
+    #[default]
+    Auto,
+    /// 一律顯示共用主控台。
+    Shown,
+    /// 隱藏共用主控台（**僅當 app 另有 gui 或 terminal/both 可關閉時允許**——否則 app 將無從停止）。
+    Hidden,
 }
 
 /// app 級網路模式。

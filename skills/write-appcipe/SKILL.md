@@ -46,6 +46,8 @@ services:
 | `old_names` | | 字串清單，每項須是**單一目錄名**（同 name 規則，不可含 `/ \ : ..` 或絕對路徑）。data dir 不存在時，依序找舊名目錄自動改名遷移。 |
 | `data_dir` | | 覆蓋持久化資料的父目錄；未設用平台預設（Win `%LOCALAPPDATA%\{name}`、mac `~/Library/Application Support/{name}`、Linux `$XDG_DATA_HOME` 或 `~/.local/share/{name}`）。 |
 | `crash` | | 目前僅 `fail_fast`（任一服務非 0 退出→整個 app 以該碼退出）。舊欄位名 `crash_policy` 仍接受。 |
+| `network` | | `bridge`（預設）｜`internal`｜`shared`。`bridge`=app 專屬網路、只開宣告的 ports、可出網；`internal`=同 bridge 但無對外網路；`shared`=共用 host 網路（不隔離、舊行為）。見下方「內部網路」。 |
+| `console` | | `auto`（預設）｜`shown`｜`hidden`。共用主控台（彙整日誌 + Ctrl+C 的終端視窗）顯示策略。`auto`=有 terminal/both→顯示、只有 gui→隱藏、全無介面→顯示。`hidden` 僅當 app 另有 gui 或 terminal/both 可關閉才允許（全無介面用 hidden 會驗證失敗）。隱藏只在 Windows 雙擊啟動且獨佔該 console 時生效。 |
 | `services` | ✓ | 服務字典，見下。 |
 
 ## services.<name> 欄位
@@ -75,12 +77,14 @@ service 名規則：`[a-z][a-z0-9_]*`，≤32。
 
 ## 內部網路與「不對外暴露」（重要、實測過）
 
-- Chefer v1 的所有服務**共享同一個網路 namespace**。服務間互連就用 `127.0.0.1:<port>`
+- **整個 app 跑在自己的 network namespace**（預設 `network: bridge`）。服務間互連用 `127.0.0.1:<port>`
   （例：app 連 db 設 `env: { DB_HOST: "127.0.0.1", DB_PORT: "6379" }`）。
-- 不在某服務列 `ports:` → chefer 不替它建 host 代理。
-- ⚠️ **但 v1 沒有逐 app 網路隔離**，且 **WSL2 會自動把 VM 內 loopback 埠鏡射到 Windows**。
-  因此「不列 ports 的 db」目前**仍可能從 host 連到**（尤其 WSL2）。需要「真正內部專用」時，
-  這是已知缺口（待逐 app netns 隔離）。先別向使用者保證 db 完全不可達。
+- 只有列在某服務 `ports:` 的埠才會被代理到 host；**未宣告的埠在 `bridge`/`internal` 下真正不對外**
+  （服務只在 app netns 的 `lo` 監聽 → host 連不到、WSL2 wslrelay 也看不到）。所以「不列 ports 的 db」
+  在預設 `bridge` 下確實內部專用。已於原生 Linux 與實機 WSL2 驗證。
+- 想讓服務**能出網**（裝套件、call 外部 API）用預設 `bridge`；**只要服務間互通、不需出網**用 `internal`。
+- ⚠️ 只有顯式寫 `network: shared` 才回到舊的「共享 host 網路、未宣告埠也可從 host 連到」行為——
+  這時才**不要**向使用者保證 db 不可達。
 
 ## 真實映像的陷阱（實測過）
 
