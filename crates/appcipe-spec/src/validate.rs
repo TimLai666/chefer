@@ -24,7 +24,7 @@ impl AppCipe {
         // --- version ---
         if self.version != SUPPORTED_VERSION {
             errs.push(format!(
-                "不支援的 version：`{}`（目前僅支援 \"{SUPPORTED_VERSION}\"，請將 version 改為 \"{SUPPORTED_VERSION}\"）",
+                "unsupported version: `{}` (only \"{SUPPORTED_VERSION}\" is supported; please change version to \"{SUPPORTED_VERSION}\")",
                 self.version
             ));
         }
@@ -39,7 +39,7 @@ impl AppCipe {
             && d.trim().is_empty()
         {
             errs.push(
-                "data_dir 不可為空字串；請移除該欄位以用平台預設，或填一個有效路徑".to_string(),
+                "data_dir must not be an empty string; remove the field to use the platform default, or provide a valid path".to_string(),
             );
         }
 
@@ -50,8 +50,8 @@ impl AppCipe {
         for old in &self.old_names {
             if let Err(e) = check_app_name(old) {
                 errs.push(format!(
-                    "old_names `{old}` 無效：必須是單一目錄名（與 name 同規則，\
-                     不可含路徑分隔、`..` 或絕對路徑）；底層原因：{e}"
+                    "old_names `{old}` is invalid: must be a single directory name (same rules as name, \
+                     no path separators, `..`, or absolute paths); underlying cause: {e}"
                 ));
             }
         }
@@ -78,7 +78,7 @@ impl AppCipe {
                 ImageSourceOrPath::TarPath(p) => {
                     if p.trim().is_empty() {
                         errs.push(format!(
-                            "service `{name}`：image 路徑不可為空（請填入 image tar 檔路徑）"
+                            "service `{name}`: image path must not be empty (provide the path to the image tar file)"
                         ));
                     }
                 }
@@ -86,20 +86,22 @@ impl AppCipe {
                     ImageSourceType::Tar => {
                         if file.trim().is_empty() {
                             errs.push(format!(
-                                "service `{name}`：image.file 不可為空（請填入 image tar 檔路徑）"
+                                "service `{name}`: image.file must not be empty (provide the path to the image tar file)"
                             ));
                         }
                     }
                     ImageSourceType::Dockerfile => {
                         if file.trim().is_empty() {
                             errs.push(format!(
-                                "service `{name}`：image.file 不可為空（請填入 Dockerfile 路徑）"
+                                "service `{name}`: image.file must not be empty (provide the path to the Dockerfile)"
                             ));
                         }
                     }
                     ImageSourceType::Image => {
                         if let Err(e) = check_image_reference(file) {
-                            errs.push(format!("service `{name}` 的 image ref `{file}` 無效：{e}"));
+                            errs.push(format!(
+                                "service `{name}` image ref `{file}` is invalid: {e}"
+                            ));
                         }
                     }
                 },
@@ -111,22 +113,22 @@ impl AppCipe {
                     Ok(spec) => {
                         if let Some(prev) = host_ports.get(&spec.host) {
                             errs.push(format!(
-                                "service `{name}` 的 ports \"{p}\"：host 埠 {} 與 {prev} 重複\
-                                 （同一 app 內 host 埠不得重複，請改用其他 host 埠）",
+                                "service `{name}` ports \"{p}\": host port {} duplicates {prev} \
+                                 (host ports must be unique within an app; use a different host port)",
                                 spec.host
                             ));
                         } else {
-                            host_ports.insert(spec.host, format!("service `{name}` 的 \"{p}\""));
+                            host_ports.insert(spec.host, format!("service `{name}` \"{p}\""));
                         }
                     }
-                    Err(e) => errs.push(format!("service `{name}` 的 ports \"{p}\" 無效：{e}")),
+                    Err(e) => errs.push(format!("service `{name}` ports \"{p}\" is invalid: {e}")),
                 }
             }
 
             // --- mounts ---
             for m in &svc.mounts {
                 if let Err(e) = MountSpec::parse(m) {
-                    errs.push(format!("service `{name}` 的 mounts \"{m}\" 無效：{e}"));
+                    errs.push(format!("service `{name}` mounts \"{m}\" is invalid: {e}"));
                 }
             }
 
@@ -135,7 +137,7 @@ impl AppCipe {
                 && !pp.starts_with('/')
             {
                 errs.push(format!(
-                    "service `{name}` 的 persist_path `{pp}` 無效：必須以 '/' 開頭（容器內絕對路徑）"
+                    "service `{name}` persist_path `{pp}` is invalid: must start with '/' (absolute path inside the container)"
                 ));
             }
 
@@ -144,7 +146,7 @@ impl AppCipe {
                 && !wd.starts_with('/')
             {
                 errs.push(format!(
-                    "service `{name}` 的 workdir `{wd}` 無效：必須以 '/' 開頭（容器內絕對路徑）"
+                    "service `{name}` workdir `{wd}` is invalid: must start with '/' (absolute path inside the container)"
                 ));
             }
 
@@ -154,8 +156,8 @@ impl AppCipe {
             for k in keys {
                 if !is_valid_env_key(k) {
                     errs.push(format!(
-                        "service `{name}` 的環境變數名稱 `{k}` 無效：必須符合 [A-Za-z_][A-Za-z0-9_]*\
-                         （以英文字母或底線開頭，僅含英數與底線）"
+                        "service `{name}` env variable name `{k}` is invalid: must match [A-Za-z_][A-Za-z0-9_]* \
+                         (start with a letter or underscore, contain only letters, digits, and underscores)"
                     ));
                 }
             }
@@ -163,10 +165,12 @@ impl AppCipe {
             // --- depends_on：必須存在、不得自指 ---
             for d in &svc.depends_on {
                 if d == name {
-                    errs.push(format!("service `{name}` 的 depends_on 不可指向自己"));
+                    errs.push(format!(
+                        "service `{name}` depends_on must not depend on itself"
+                    ));
                 } else if !self.services.contains_key(d) {
                     errs.push(format!(
-                        "service `{name}` 依賴不存在的 service `{d}`（請確認 services 中已定義該名稱）"
+                        "service `{name}` depends on a non-existent service `{d}` (make sure that name is defined under services)"
                     ));
                 }
             }
@@ -175,28 +179,28 @@ impl AppCipe {
             if let Some(hc) = &svc.healthcheck {
                 if hc.test.to_cmd().is_none() {
                     errs.push(format!(
-                        "service `{name}` 的 healthcheck.test 不可為空（請給命令字串或 [\"CMD\", ...]/[\"CMD-SHELL\", \"...\"]）"
+                        "service `{name}` healthcheck.test must not be empty (provide a command string or [\"CMD\", ...]/[\"CMD-SHELL\", \"...\"])"
                     ));
                 }
                 match hc.interval() {
                     Ok(d) if d.is_zero() => {
-                        errs.push(format!("service `{name}` 的 healthcheck.interval 必須 > 0"));
+                        errs.push(format!("service `{name}` healthcheck.interval must be > 0"));
                     }
-                    Err(e) => errs.push(format!("service `{name}` 的 healthcheck.interval {e}")),
+                    Err(e) => errs.push(format!("service `{name}` healthcheck.interval {e}")),
                     _ => {}
                 }
                 match hc.timeout() {
                     Ok(d) if d.is_zero() => {
-                        errs.push(format!("service `{name}` 的 healthcheck.timeout 必須 > 0"));
+                        errs.push(format!("service `{name}` healthcheck.timeout must be > 0"));
                     }
-                    Err(e) => errs.push(format!("service `{name}` 的 healthcheck.timeout {e}")),
+                    Err(e) => errs.push(format!("service `{name}` healthcheck.timeout {e}")),
                     _ => {}
                 }
                 if let Err(e) = hc.start_period() {
-                    errs.push(format!("service `{name}` 的 healthcheck.start_period {e}"));
+                    errs.push(format!("service `{name}` healthcheck.start_period {e}"));
                 }
                 if hc.retries == Some(0) {
-                    errs.push(format!("service `{name}` 的 healthcheck.retries 必須 >= 1"));
+                    errs.push(format!("service `{name}` healthcheck.retries must be >= 1"));
                 }
             }
 
@@ -212,15 +216,15 @@ impl AppCipe {
         // --- depends_on：不得有循環（缺失/自指邊已各自報錯，這裡忽略它們）---
         if let Some(stuck) = find_cycle(&self.services) {
             errs.push(format!(
-                "depends_on 存在循環依賴，無法決定啟動順序：{stuck}（請移除循環中的某條依賴）"
+                "depends_on has a dependency cycle, so the startup order cannot be determined: {stuck} (remove one of the dependencies in the cycle)"
             ));
         }
 
         // --- terminal/both 全 app 最多一個 ---
         if terminal_svcs.len() > 1 {
             errs.push(format!(
-                "interface_mode 為 terminal/both 的服務全 app 最多只能有一個，目前有 {} 個：{}\
-                 （請將其餘改為 gui 或 none）",
+                "an app may have at most one service with interface_mode terminal/both, but there are {}: {} \
+                 (change the rest to gui or none)",
                 terminal_svcs.len(),
                 terminal_svcs.join(", ")
             ));
@@ -235,8 +239,8 @@ impl AppCipe {
             let has_terminal = !terminal_svcs.is_empty(); // terminal 或 both
             if !has_gui && !has_terminal {
                 errs.push(
-                    "console: hidden 需要至少一個 gui 或 terminal/both 服務（否則 app 啟動後\
-                     無從停止——共用主控台是唯一的停止介面）；請改用 auto/shown，或加上有介面的服務"
+                    "console: hidden requires at least one gui or terminal/both service (otherwise, once the app starts \
+                     there is no way to stop it—the shared console is the only stop interface); use auto/shown instead, or add a service with an interface"
                         .to_string(),
                 );
             }
@@ -261,14 +265,14 @@ fn check_app_name(name: &str) -> Result<(), String> {
     let rest_ok = chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
     if !first_ok || !rest_ok {
         return Err(format!(
-            "name `{name}` 無效：必須符合 [A-Za-z][A-Za-z0-9_-]*\
-             （以英文字母開頭，僅含英數、底線、連字號，不可有空格）"
+            "name `{name}` is invalid: must match [A-Za-z][A-Za-z0-9_-]* \
+             (start with a letter; contain only letters, digits, underscores, and hyphens; no spaces)"
         ));
     }
     let len = name.chars().count();
     if len > MAX_APP_NAME_LEN {
         return Err(format!(
-            "name `{name}` 過長：最多 {MAX_APP_NAME_LEN} 字元（目前 {len} 字元）"
+            "name `{name}` is too long: at most {MAX_APP_NAME_LEN} characters (currently {len})"
         ));
     }
     Ok(())
@@ -281,14 +285,14 @@ fn check_service_name(name: &str) -> Result<(), String> {
     let rest_ok = chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
     if !first_ok || !rest_ok {
         return Err(format!(
-            "service 名稱 `{name}` 無效：必須符合 [a-z][a-z0-9_]*\
-             （以小寫英文字母開頭，僅含小寫英數與底線）"
+            "service name `{name}` is invalid: must match [a-z][a-z0-9_]* \
+             (start with a lowercase letter; contain only lowercase letters, digits, and underscores)"
         ));
     }
     let len = name.chars().count();
     if len > MAX_SERVICE_NAME_LEN {
         return Err(format!(
-            "service 名稱 `{name}` 過長：最多 {MAX_SERVICE_NAME_LEN} 字元（目前 {len} 字元）"
+            "service name `{name}` is too long: at most {MAX_SERVICE_NAME_LEN} characters (currently {len})"
         ));
     }
     Ok(())
@@ -301,21 +305,21 @@ fn check_service_name(name: &str) -> Result<(), String> {
 fn check_image_reference(r: &str) -> Result<(), String> {
     let r = r.trim();
     if r.is_empty() {
-        return Err("不可為空".into());
+        return Err("must not be empty".into());
     }
     // digest 形式：<name>@<algo>:<hex> —— 釘到內容，最可重現，直接接受。
     if let Some((name, digest)) = r.split_once('@') {
         if name.is_empty() {
-            return Err("`@` 前的 image 名稱不可為空".into());
+            return Err("the image name before `@` must not be empty".into());
         }
         let Some((algo, hex)) = digest.split_once(':') else {
             return Err(format!(
-                "digest `{digest}` 格式錯誤（應為 <algo>:<hex>，如 sha256:…）"
+                "digest `{digest}` is malformed (expected <algo>:<hex>, e.g. sha256:…)"
             ));
         };
         if algo.is_empty() || hex.len() < 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(format!(
-                "digest `{digest}` 格式錯誤（hex 過短或含非十六進位字元）"
+                "digest `{digest}` is malformed (hex too short or contains non-hexadecimal characters)"
             ));
         }
         return Ok(());
@@ -325,21 +329,21 @@ fn check_image_reference(r: &str) -> Result<(), String> {
     match last_segment.rsplit_once(':') {
         Some((name, tag)) => {
             if name.is_empty() {
-                return Err("image 名稱不可為空".into());
+                return Err("image name must not be empty".into());
             }
             if tag.is_empty() {
-                return Err("tag 不可為空".into());
+                return Err("tag must not be empty".into());
             }
             if tag == "latest" {
                 return Err(
-                    "不接受 `latest`：為了可重現，請指定明確版本（如 redis:7.2-alpine）或 @sha256 digest"
+                    "`latest` is not accepted: for reproducibility, specify an explicit version (e.g. redis:7.2-alpine) or an @sha256 digest"
                         .into(),
                 );
             }
             Ok(())
         }
         None => Err(
-            "未指定 tag（會被當成 latest）：為了可重現，請指定明確版本（如 redis:7.2-alpine）或 @sha256 digest"
+            "no tag specified (would be treated as latest): for reproducibility, specify an explicit version (e.g. redis:7.2-alpine) or an @sha256 digest"
                 .into(),
         ),
     }
@@ -490,7 +494,7 @@ services:
   db: { image: ./db.tar }
 "#,
         );
-        assert!(e.contains("不支援的 version"), "{e}");
+        assert!(e.contains("unsupported version"), "{e}");
     }
 
     // ---------- app name ----------
@@ -525,7 +529,7 @@ services:
         let e = validate_err(&format!(
             "version: \"0.1\"\nname: {too_long}\nservices:\n  db: {{ image: ./db.tar }}\n"
         ));
-        assert!(e.contains("過長"), "{e}");
+        assert!(e.contains("is too long"), "{e}");
     }
 
     // ---------- service 名稱 ----------
@@ -544,7 +548,7 @@ services:
             let e = validate_err(&format!(
                 "version: \"0.1\"\nname: App\nservices:\n  \"{n}\": {{ image: ./db.tar }}\n"
             ));
-            assert!(e.contains("service 名稱"), "service `{n}` 應被拒：{e}");
+            assert!(e.contains("service name"), "service `{n}` 應被拒：{e}");
         }
     }
 
@@ -560,7 +564,7 @@ services:
         let e = validate_err(&format!(
             "version: \"0.1\"\nname: App\nservices:\n  {too_long}: {{ image: ./db.tar }}\n"
         ));
-        assert!(e.contains("過長"), "{e}");
+        assert!(e.contains("is too long"), "{e}");
     }
 
     // ---------- ports ----------
@@ -597,7 +601,10 @@ services:
     ports: ["8080:80"]
 "#,
         );
-        assert!(e.contains("host 埠 8080") && e.contains("重複"), "{e}");
+        assert!(
+            e.contains("host port 8080") && e.contains("duplicates"),
+            "{e}"
+        );
     }
 
     #[test]
@@ -612,7 +619,7 @@ services:
     ports: ["8080:80", "8080:81"]
 "#,
         );
-        assert!(e.contains("host 埠 8080"), "{e}");
+        assert!(e.contains("host port 8080"), "{e}");
     }
 
     // ---------- mounts ----------
@@ -672,7 +679,7 @@ services:
     depends_on: [nope]
 "#,
         );
-        assert!(e.contains("不存在的 service `nope`"), "{e}");
+        assert!(e.contains("non-existent service `nope`"), "{e}");
     }
 
     #[test]
@@ -687,7 +694,7 @@ services:
     depends_on: [db]
 "#,
         );
-        assert!(e.contains("不可指向自己"), "{e}");
+        assert!(e.contains("must not depend on itself"), "{e}");
     }
 
     #[test]
@@ -708,7 +715,7 @@ services:
     depends_on: [a]
 "#,
         );
-        assert!(e.contains("循環依賴"), "{e}");
+        assert!(e.contains("dependency cycle"), "{e}");
     }
 
     // ---------- env key ----------
@@ -837,7 +844,7 @@ services:
     image: ""
 "#,
         );
-        assert!(e.contains("不可為空"), "{e}");
+        assert!(e.contains("must not be empty"), "{e}");
     }
 
     // ---------- interface_mode ----------
@@ -857,7 +864,7 @@ services:
     interface_mode: both
 "#,
         );
-        assert!(e.contains("最多只能有一個"), "{e}");
+        assert!(e.contains("at most one"), "{e}");
         assert!(e.contains("a, b"), "{e}");
     }
 
@@ -1071,9 +1078,9 @@ services:
     persist_path: not/absolute
 "#,
         );
-        assert!(e.contains("不支援的 version"), "{e}");
+        assert!(e.contains("unsupported version"), "{e}");
         assert!(e.contains("name"), "{e}");
-        assert!(e.contains("service 名稱"), "{e}");
+        assert!(e.contains("service name"), "{e}");
         assert!(e.contains("ports"), "{e}");
         assert!(e.contains("persist_path"), "{e}");
         assert!(e.lines().count() >= 5, "應收集所有錯誤：{e}");

@@ -488,7 +488,7 @@ services:
         .unwrap();
         let err = load(&yml).unwrap_err().to_string();
         assert!(err.contains("validation failed"), "{err}");
-        assert!(err.contains("不支援的 version"), "{err}");
+        assert!(err.contains("unsupported version"), "{err}");
         assert!(err.contains("persist_path"), "{err}");
     }
 

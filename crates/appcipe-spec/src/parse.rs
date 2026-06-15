@@ -12,17 +12,21 @@ use crate::types::AppCipe;
 /// 讀取檔案並解析 appcipe.yml，隨後立即執行 `validate()`。
 pub fn from_file<P: AsRef<Path>>(path: P) -> anyhow::Result<AppCipe> {
     let path = path.as_ref();
-    let s = std::fs::read_to_string(path)
-        .with_context(|| format!("無法讀取設定檔 {}（請確認檔案存在且可讀）", path.display()))?;
+    let s = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "cannot read config file {} (make sure the file exists and is readable)",
+            path.display()
+        )
+    })?;
     from_str(&s)
 }
 
 /// 解析 appcipe.yml 字串，隨後立即執行 `validate()`。
 pub fn from_str(yaml: &str) -> anyhow::Result<AppCipe> {
-    let app: AppCipe =
-        serde_yaml::from_str(yaml).context("appcipe.yml 解析失敗（YAML 格式或欄位型別錯誤）")?;
+    let app: AppCipe = serde_yaml::from_str(yaml)
+        .context("failed to parse appcipe.yml (invalid YAML syntax or wrong field type)")?;
     app.validate()
-        .map_err(|e| anyhow::anyhow!("appcipe.yml 驗證失敗：\n{e}"))?;
+        .map_err(|e| anyhow::anyhow!("appcipe.yml validation failed:\n{e}"))?;
     Ok(app)
 }
 
@@ -100,7 +104,7 @@ services:
 "#,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("驗證失敗"));
+        assert!(err.to_string().contains("validation failed"));
     }
 
     #[test]
@@ -119,6 +123,6 @@ services:
     #[test]
     fn from_file_missing_file_gives_actionable_error() {
         let err = crate::from_file("Z:/definitely/not/here/appcipe.yml").unwrap_err();
-        assert!(err.to_string().contains("無法讀取設定檔"));
+        assert!(err.to_string().contains("cannot read config file"));
     }
 }

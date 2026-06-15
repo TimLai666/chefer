@@ -41,8 +41,8 @@ pub(crate) struct RepackedLayer {
 
 /// 開啟層 blob 並依 magic bytes 包上對應的解壓器，回傳「未壓縮 tar」的讀取串流。
 fn open_decoded(blob: &Path) -> Result<Box<dyn Read>> {
-    let mut input =
-        fs::File::open(blob).with_context(|| format!("開啟層 blob 失敗：{}", blob.display()))?;
+    let mut input = fs::File::open(blob)
+        .with_context(|| format!("failed to open layer blob: {}", blob.display()))?;
 
     // 讀 magic bytes 偵測壓縮格式，之後把已讀的位元組接回串流前端。
     let mut magic = [0u8; 4];
@@ -59,9 +59,10 @@ fn open_decoded(blob: &Path) -> Result<Box<dyn Read>> {
 
     Ok(match detect_compression(&magic[..filled]) {
         Compression::Gzip => Box::new(GzDecoder::new(chained)),
-        Compression::Zstd => {
-            Box::new(zstd::stream::read::Decoder::new(chained).context("初始化 zstd 解壓器失敗")?)
-        }
+        Compression::Zstd => Box::new(
+            zstd::stream::read::Decoder::new(chained)
+                .context("failed to initialize zstd decoder")?,
+        ),
         Compression::Plain => Box::new(chained),
     })
 }
@@ -75,7 +76,7 @@ pub(crate) fn compute_diff_id(blob: &Path) -> Result<String> {
     loop {
         let n = decoded
             .read(&mut buf)
-            .with_context(|| format!("解壓層 blob 失敗：{}", blob.display()))?;
+            .with_context(|| format!("failed to decompress layer blob: {}", blob.display()))?;
         if n == 0 {
             break;
         }
@@ -99,23 +100,25 @@ pub(crate) fn repack_layer(
     // 先寫暫存檔（檔名需要 diff_id，必須讀完整層才知道）。
     let tmp_path = layers_dir.join(format!(".tmp-{idx:04}.tar.zst"));
     let out = fs::File::create(&tmp_path)
-        .with_context(|| format!("建立層輸出檔失敗：{}", tmp_path.display()))?;
+        .with_context(|| format!("failed to create layer output file: {}", tmp_path.display()))?;
     let mut encoder = zstd::stream::write::Encoder::new(BufWriter::new(out), zstd_level)
-        .context("初始化 zstd 壓縮器失敗")?;
+        .context("failed to initialize zstd encoder")?;
 
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 128 * 1024];
     loop {
         let n = decoded
             .read(&mut buf)
-            .with_context(|| format!("解壓層 blob 失敗：{}", blob.display()))?;
+            .with_context(|| format!("failed to decompress layer blob: {}", blob.display()))?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
         encoder.write_all(&buf[..n])?;
     }
-    let mut writer = encoder.finish().context("結束 zstd 壓縮失敗")?;
+    let mut writer = encoder
+        .finish()
+        .context("failed to finish zstd compression")?;
     writer.flush()?;
     drop(writer);
 

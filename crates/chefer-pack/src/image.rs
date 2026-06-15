@@ -70,28 +70,28 @@ pub(crate) fn resolve_image(extracted_root: &Path, platform: &str) -> Result<Res
         return resolve_docker(extracted_root, platform);
     }
     bail!(
-        "不是有效的 image archive：找不到 index.json + blobs/（OCI layout）也找不到 manifest.json（docker-archive）；\
-         請以 `docker save -o <file> <image>` 或 `podman save --format oci-archive` 重新匯出"
+        "not a valid image archive: found neither index.json + blobs/ (OCI layout) nor manifest.json (docker-archive); \
+         re-export with `docker save -o <file> <image>` or `podman save --format oci-archive`"
     )
 }
 
 fn split_platform(p: &str) -> Result<(&str, &str)> {
     let Some((os, arch)) = p.split_once('/') else {
-        bail!("platform 格式錯誤（應為 os/arch，例如 linux/amd64）：{p}");
+        bail!("invalid platform format (expected os/arch, e.g. linux/amd64): {p}");
     };
     Ok((os, arch))
 }
 
 fn no_platform_help(platform: &str, available: &BTreeSet<String>) -> String {
     let list = if available.is_empty() {
-        "（無）".to_string()
+        "(none)".to_string()
     } else {
-        available.iter().cloned().collect::<Vec<_>>().join("、")
+        available.iter().cloned().collect::<Vec<_>>().join(", ")
     };
     format!(
-        "image archive 中找不到平台 {platform} 的 image；可用平台：{list}。\
-         請改用 `docker save --platform {platform}` 或 `docker buildx build --platform {platform}` 匯出含該平台的 image，\
-         或修改 appcipe.yml 的 image.platform"
+        "no image for platform {platform} found in the image archive; available platforms: {list}. \
+         Re-export an image including that platform with `docker save --platform {platform}` or `docker buildx build --platform {platform}`, \
+         or change image.platform in appcipe.yml"
     )
 }
 
@@ -130,18 +130,20 @@ struct OciManifest {
 fn blob_path(root: &Path, digest: &str) -> Result<PathBuf> {
     if digest.is_empty() {
         bail!(
-            "image archive 的 index/manifest descriptor 缺少 digest 欄位；archive 可能損毀或非標準，請重新匯出"
+            "image archive index/manifest descriptor is missing the digest field; the archive may be corrupt or non-standard, please re-export"
         );
     }
     let Some(hex) = digest.strip_prefix("sha256:") else {
-        bail!("不支援的 digest 演算法（僅支援 sha256）：{digest}");
+        bail!("unsupported digest algorithm (only sha256 is supported): {digest}");
     };
     if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        bail!("digest 格式錯誤（應為 sha256: 加 64 位十六進位）：{digest}");
+        bail!("invalid digest format (expected sha256: followed by 64 hex digits): {digest}");
     }
     let p = root.join("blobs").join("sha256").join(hex);
     if !p.is_file() {
-        bail!("image archive 缺少 blob：blobs/sha256/{hex}；archive 可能不完整，請重新匯出");
+        bail!(
+            "image archive is missing a blob: blobs/sha256/{hex}; the archive may be incomplete, please re-export"
+        );
     }
     Ok(p)
 }
@@ -158,14 +160,14 @@ fn collect_manifest_descriptors(
     depth: usize,
 ) -> Result<()> {
     if depth > 4 {
-        bail!("OCI index 巢狀層級過深（>4）；image archive 可能已損毀");
+        bail!("OCI index nesting is too deep (>4); the image archive may be corrupt");
     }
     for d in descs {
         if is_index_media_type(d.media_type.as_deref()) {
             let p = blob_path(root, &d.digest)?;
             let bytes = fs::read(&p)?;
             let nested: OciIndex = serde_json::from_slice(&bytes)
-                .with_context(|| format!("解析巢狀 index blob 失敗：{}", d.digest))?;
+                .with_context(|| format!("failed to parse nested index blob: {}", d.digest))?;
             collect_manifest_descriptors(root, &nested.manifests, out, depth + 1)?;
         } else {
             out.push(d.clone());
@@ -178,25 +180,27 @@ fn load_oci_manifest(root: &Path, digest: &str) -> Result<OciManifest> {
     let p = blob_path(root, digest)?;
     let bytes = fs::read(&p)?;
     serde_json::from_slice(&bytes)
-        .with_context(|| format!("解析 image manifest blob 失敗：{digest}"))
+        .with_context(|| format!("failed to parse image manifest blob: {digest}"))
 }
 
 fn load_image_config(root: &Path, digest: &str) -> Result<ImageConfigJson> {
     let p = blob_path(root, digest)?;
     let bytes = fs::read(&p)?;
-    serde_json::from_slice(&bytes).with_context(|| format!("解析 image config blob 失敗：{digest}"))
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse image config blob: {digest}"))
 }
 
 fn resolve_oci(root: &Path, platform: &str) -> Result<ResolvedImage> {
     let (want_os, want_arch) = split_platform(platform)?;
 
     let index_bytes = fs::read(root.join("index.json"))?;
-    let index: OciIndex = serde_json::from_slice(&index_bytes).context("解析 index.json 失敗")?;
+    let index: OciIndex =
+        serde_json::from_slice(&index_bytes).context("failed to parse index.json")?;
 
     let mut manifests = Vec::new();
     collect_manifest_descriptors(root, &index.manifests, &mut manifests, 0)?;
     if manifests.is_empty() {
-        bail!("index.json 中沒有任何 image manifest；image archive 可能已損毀");
+        bail!("index.json contains no image manifest; the image archive may be corrupt");
     }
 
     let mut available: BTreeSet<String> = BTreeSet::new();
@@ -257,10 +261,12 @@ struct DockerManifestEntry {
 /// 將 manifest.json 內的相對路徑安全地映射到解壓根目錄。
 fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
     let r = sanitize_rel_path(Path::new(rel))
-        .with_context(|| format!("docker-archive manifest 內含不安全路徑：{rel}"))?;
+        .with_context(|| format!("docker-archive manifest contains an unsafe path: {rel}"))?;
     let p = root.join(r);
     if !p.is_file() {
-        bail!("image archive 缺少檔案：{rel}；archive 可能不完整，請重新匯出");
+        bail!(
+            "image archive is missing a file: {rel}; the archive may be incomplete, please re-export"
+        );
     }
     Ok(p)
 }
@@ -270,9 +276,9 @@ fn resolve_docker(root: &Path, platform: &str) -> Result<ResolvedImage> {
 
     let bytes = fs::read(root.join("manifest.json"))?;
     let entries: Vec<DockerManifestEntry> = serde_json::from_slice(&bytes)
-        .context("解析 docker-archive 的 manifest.json 失敗（應為 JSON 陣列）")?;
+        .context("failed to parse docker-archive manifest.json (expected a JSON array)")?;
     if entries.is_empty() {
-        bail!("docker-archive 的 manifest.json 是空陣列；image archive 可能已損毀");
+        bail!("docker-archive manifest.json is an empty array; the image archive may be corrupt");
     }
 
     let mut available: BTreeSet<String> = BTreeSet::new();
@@ -280,7 +286,7 @@ fn resolve_docker(root: &Path, platform: &str) -> Result<ResolvedImage> {
         let cfg_path = safe_join(root, &entry.config)?;
         let cfg_bytes = fs::read(&cfg_path)?;
         let cfg: ImageConfigJson = serde_json::from_slice(&cfg_bytes)
-            .with_context(|| format!("解析 image config 失敗：{}", entry.config))?;
+            .with_context(|| format!("failed to parse image config: {}", entry.config))?;
         let os = cfg.os.clone().unwrap_or_default();
         let arch = cfg.architecture.clone().unwrap_or_default();
         if os == want_os && arch == want_arch {
@@ -332,6 +338,6 @@ mod tests {
     fn invalid_archive_root_is_rejected() {
         let tmp = tempfile::tempdir().unwrap();
         let err = resolve_image(tmp.path(), "linux/amd64").unwrap_err();
-        assert!(format!("{err:#}").contains("不是有效的 image archive"));
+        assert!(format!("{err:#}").contains("not a valid image archive"));
     }
 }

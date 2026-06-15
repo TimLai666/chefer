@@ -350,7 +350,7 @@ fn pack_rejects_platform_mismatch() {
     let out = tmp.path().join("out");
     let err = pack(&app, &default_opts(&out)).unwrap_err();
     let msg = format!("{err:#}");
-    assert!(msg.contains("找不到平台 linux/amd64"), "{msg}");
+    assert!(msg.contains("no image for platform linux/amd64"), "{msg}");
     assert!(msg.contains("linux/arm64"), "應列出可用平台：{msg}");
 }
 
@@ -367,7 +367,7 @@ fn pack_rejects_diff_id_mismatch() {
     let out = tmp.path().join("out");
     let err = pack(&app, &default_opts(&out)).unwrap_err();
     let msg = format!("{err:#}");
-    assert!(msg.contains("diff_id 不符"), "{msg}");
+    assert!(msg.contains("diff_id mismatch"), "{msg}");
 }
 
 #[test]
@@ -384,7 +384,7 @@ fn pack_rejects_invalid_archive() {
     let app = make_app("NotImage", vec![("web", svc)]);
     let out = tmp.path().join("out");
     let err = pack(&app, &default_opts(&out)).unwrap_err();
-    assert!(format!("{err:#}").contains("不是有效的 image archive"));
+    assert!(format!("{err:#}").contains("not a valid image archive"));
 }
 
 #[test]
@@ -401,7 +401,7 @@ fn pack_rejects_missing_mount_host_path() {
     let app = make_app("BadMount", vec![("web", svc)]);
     let out = tmp.path().join("out");
     let err = pack(&app, &default_opts(&out)).unwrap_err();
-    assert!(format!("{err:#}").contains("掛載 host 路徑不存在"));
+    assert!(format!("{err:#}").contains("mount host path does not exist"));
 }
 
 #[test]
@@ -557,7 +557,7 @@ fn pack_refuses_dirty_output_without_clean() {
     let mut opts = default_opts(&out);
     opts.clean = false;
     let err = pack(&app, &opts).unwrap_err();
-    assert!(format!("{err:#}").contains("已存在且非空"));
+    assert!(format!("{err:#}").contains("already exists and is not empty"));
 
     // clean=true 則成功且殘留檔被清掉
     opts.clean = true;
