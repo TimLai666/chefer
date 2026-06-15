@@ -9,13 +9,12 @@
 
 > GUI 映像含整套 Qt，**較大**（打包出的單檔約數百 MB），屬正常。
 
-> ⚠️ **db 沒對外、但 v1 仍非真正隔離**：`db` 沒有 `ports:`，但 v1 所有服務共用同一
-> network namespace、且 Windows 的 WSL2 `wslrelay` 會把 VM 內監聽埠自動鏡射到
-> Windows localhost——實測執行此 app 時，從 Windows `127.0.0.1:6379` 仍連得到
-> redis（回 `+PONG`）。要真正「不對外」需逐 app netns 隔離（Roadmap）。詳見專案
-> README 的 Known Limitations。
+> ✅ **db 真正不對外（預設 `bridge`）**：`db` 沒有 `ports:`，本 app 有專屬 network namespace，
+> 故 redis 從 host **連不到**（含 Windows：wslrelay 只鏡射有 relay 的宣告埠）。
+> 〔舊版「服務共用 netns、6379 仍可從 host 連到」的缺口已由 bridge 預設關閉。〕
+> db 直接由 chefer 從 registry 拉官方 `redis:7.2-alpine`（免 docker save）。
 
-## 一、產生 image tar（需要 Docker）
+## 一、產生 GUI image tar（需要 Docker）
 
 ```bash
 # Linux / macOS
@@ -24,7 +23,7 @@ bash examples/pyside-redis/scripts/build-images.sh
 examples\pyside-redis\scripts\build-images.ps1
 ```
 
-產生 `images/db.tar`（官方 redis:alpine）與 `images/gui.tar`（python-slim + PySide6）。
+只產生 `images/gui.tar`（python-slim + PySide6）；**db 不必先建**，`chefer build` 會自動從 registry 拉 redis。
 
 ## 二、打包成單檔
 
