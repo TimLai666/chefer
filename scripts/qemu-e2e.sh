@@ -552,6 +552,10 @@ main() {
   curl -fsS "http://127.0.0.1:${host_port}/write?value=qemu-first-run" >/dev/null
   curl -fsS "http://127.0.0.1:${host_port}/shutdown" >/dev/null || true
   wait_qemu_exit_code 0 "$first_log" "first run"
+  # appliance 內 guest-agent 以 root 執行 + kernel 啟用 OVERLAY_FS → rootfs 應走 overlay 路徑
+  #（而非合併 fallback）。確認真的走到 overlay，避免靜默退化讓此測試失去意義。
+  grep -q "rootfs via overlayfs" "$first_log" \
+    || die "expected the overlay rootfs path (root backend) but guest-agent did not report it; see ${first_log}"
 
   local second_log="$work/qemu-second.console.log"
   start_qemu "$arch" "$kernel" "$initramfs" "$bundle" "$work/vm-data" "$host_port" "$guest_port" "$second_log" "$virtiofsd" "second"
