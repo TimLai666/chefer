@@ -137,6 +137,8 @@ required_kit_files=(
   "chefer-initramfs-x86_64"
   "chefer-vmlinuz-aarch64"
   "chefer-initramfs-aarch64"
+  "chefer-vz-helper-x86_64"
+  "chefer-vz-helper-aarch64"
 )
 
 for file in "${required_kit_files[@]}"; do

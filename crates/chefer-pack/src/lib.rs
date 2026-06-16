@@ -450,6 +450,35 @@ fn copy_macos_appliances(bundle_dir: &Path, opts: &PackOptions) -> Result<()> {
                 );
             }
         }
+
+        // vz 開機 helper（host macho，已於 release 以 virtualization entitlement 簽章）→ agents/。
+        // best-effort：缺少時警告但不阻斷（執行期 vz 後端會回報 helper 缺失，或可用 CHEFER_VZ_HELPER）。
+        let helper_name = layout::vz_helper_name(arch);
+        match kit::find_vz_helper(&kit_dirs, arch) {
+            Some(src) => {
+                let agents_dir = layout::agents_dir(bundle_dir);
+                fs::create_dir_all(&agents_dir)?;
+                let dst = agents_dir.join(&helper_name);
+                fs::copy(&src, &dst).with_context(|| {
+                    format!("failed to copy macOS vz helper: {}", src.display())
+                })?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perm = std::fs::metadata(&dst)?.permissions();
+                    perm.set_mode(0o755);
+                    std::fs::set_permissions(&dst, perm)?;
+                }
+            }
+            None => {
+                eprintln!(
+                    "warning: macOS vz helper not found (need {}). Searched kit directories: {}. \
+                     Skipping embedding it; the macOS vz backend will be unavailable unless CHEFER_VZ_HELPER points to a locally built helper.",
+                    helper_name,
+                    format_kit_dirs(&kit_dirs),
+                );
+            }
+        }
     }
     Ok(())
 }

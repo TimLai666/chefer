@@ -66,6 +66,12 @@ pub fn find_appliance(kit_dirs: &[PathBuf], arch: &str) -> Option<(PathBuf, Path
     Some((kernel, initramfs))
 }
 
+/// 尋找 macOS vz 開機 helper（`chefer-vz-helper-<arch>`，host macho）。
+/// 供 chefer-pack 在打包 macOS 目標時內嵌進 bundle 的 `agents/`。
+pub fn find_vz_helper(kit_dirs: &[PathBuf], arch: &str) -> Option<PathBuf> {
+    find_first(kit_dirs, &[crate::layout::vz_helper_name(arch)])
+}
+
 fn find_first<S: AsRef<str>>(dirs: &[PathBuf], names: &[S]) -> Option<PathBuf> {
     for d in dirs {
         for n in names {

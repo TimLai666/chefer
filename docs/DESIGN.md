@@ -57,7 +57,7 @@ bundle/
 
 - 層檔名：`{序號:04}-{diff_id去掉"sha256:"後取前12碼}.tar.zst`。
 - `agents/` 規則：建置 Windows / macOS 目標的單檔時**必須**內嵌對應 guest 架構的 agent（缺少時 build 報錯並說明如何取得 kit）；Linux 目標可省略（Linux 後端 in-process 執行）。
-- `vm/` 規則：建置 macOS 目標的單檔時內嵌 Linux appliance（kernel+initramfs）；appliance 尚未進入 kit 前，build 以警告略過（產物仍可組裝，僅 macOS 執行不可用），不阻斷建置。
+- `vm/` 規則：建置 macOS 目標的單檔時內嵌 Linux appliance（kernel+initramfs）到 `vm/`，並把 vz 開機 helper（`chefer-vz-helper-<arch>`）內嵌到 `agents/`；兩者皆 best-effort——kit 缺少時 build 以警告略過（產物仍可組裝，僅 macOS 執行時 vz 後端回報不可用，或可用 `CHEFER_VZ_HELPER` 指向自建 helper），不阻斷建置。release kit 兩種 darwin 架構的 appliance 與 helper 皆出貨（helper 以 virtualization entitlement ad-hoc 簽章；正式對外散布尚需 Developer ID 簽章 + notarization）。
 
 ## 3. manifest.json schema（chefer-bundle::Manifest）
 

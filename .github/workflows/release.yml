@@ -131,6 +131,16 @@ jobs:
             cp "target/$T/release/guest-agent" "stage/guest-agent-$ARCH"
           fi
 
+      # macOS 目標：編 + 簽（virtualization entitlement）vz 開機 helper（host macho）。
+      # swiftc 可在 arm64 runner 上交叉編到 x86_64，故兩個 darwin 目標各自產對應架構的 helper。
+      # 註：此處為 ad-hoc 簽章；正式對外散布尚需 Developer ID 簽章 + notarization（待 secrets 接上）。
+      - name: Build + sign vz helper (macOS targets)
+        if: contains(matrix.target, 'apple-darwin')
+        shell: bash
+        run: |
+          ARCH="${{ matrix.target }}"; ARCH="${ARCH%%-*}"   # x86_64 / aarch64
+          bash scripts/build-vz-helper.sh --arch "$ARCH" stage
+
       - uses: actions/upload-artifact@v7
         with:
           name: bin-${{ matrix.target }}
@@ -249,6 +259,8 @@ jobs:
           cp all/pasta-x86_64 all/pasta-aarch64 "out/$PKG/kit/"
           # macOS VZ 後端使用的 Linux micro-VM appliance（所有 host kit 都附，方便跨平台打包）
           cp all/chefer-vmlinuz-* all/chefer-initramfs-* "out/$PKG/kit/"
+          # macOS VZ 開機 helper（兩種 darwin 架構；打包 macOS 目標時內嵌進 bundle agents/）
+          cp all/chefer-vz-helper-x86_64 all/chefer-vz-helper-aarch64 "out/$PKG/kit/"
           cp all/BUILDINFO-* all/SHA256SUMS-* "out/$PKG/kit/"
 
           chmod +x "out/$PKG/chefer$EXT" out/$PKG/kit/* || true
