@@ -4,7 +4,8 @@
 //! 全部與作業系統無關，跨平台皆可編譯與測試（實際的 Virtualization.framework
 //! 開機在 `vz.rs`，僅 macOS 編譯、僅能在實體 Mac 驗證）。
 
-use std::net::Ipv4Addr;
+use std::io;
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 
 /// guest 內 virtiofs 共享標籤：bundle（唯讀）與 data（讀寫）。
@@ -144,6 +145,41 @@ pub fn forward_ports(manifest: &chefer_bundle::Manifest) -> Vec<PortForward> {
         .collect()
 }
 
+/// 在 host 端起一條 TCP relay：`127.0.0.1:host_port` → `<guest_ip>:guest_port`（背景執行緒）。
+/// VZ 後端取得 guest IP 後，對每個宣告的 TCP 埠呼叫一次。bind 失敗（多半是埠被占用）即回錯，
+/// 由呼叫端決定如何回報。每個連線各自雙向轉送、互不阻塞。
+pub fn spawn_tcp_forward(guest_ip: Ipv4Addr, host_port: u16, guest_port: u16) -> io::Result<()> {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, host_port))?;
+    let target = SocketAddr::from((guest_ip, guest_port));
+    std::thread::spawn(move || {
+        for conn in listener.incoming() {
+            let Ok(client) = conn else { continue };
+            std::thread::spawn(move || {
+                let _ = relay_tcp_conn(client, target);
+            });
+        }
+    });
+    Ok(())
+}
+
+/// 單一 TCP 連線的雙向轉送：client ↔ upstream(`target`)。
+fn relay_tcp_conn(client: TcpStream, target: SocketAddr) -> io::Result<()> {
+    let upstream = TcpStream::connect(target)?;
+    let mut client_to_up = client.try_clone()?;
+    let mut up_from_client = upstream.try_clone()?;
+    let up_thread = std::thread::spawn(move || {
+        let _ = io::copy(&mut client_to_up, &mut up_from_client);
+        // 上行結束 → 關掉 upstream 的寫端，讓下行的 copy 收到 EOF。
+        let _ = up_from_client.shutdown(std::net::Shutdown::Write);
+    });
+    let mut up_to_client = upstream;
+    let mut client_write = client;
+    let _ = io::copy(&mut up_to_client, &mut client_write);
+    let _ = client_write.shutdown(std::net::Shutdown::Write);
+    let _ = up_thread.join();
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +291,39 @@ mod tests {
             fwd.iter()
                 .any(|f| f.proto == PortProto::Udp && f.host == 5353 && f.guest == 53)
         );
+    }
+
+    #[test]
+    fn tcp_forward_relays_bidirectionally() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener as L;
+
+        // 假「guest」服務：收到資料後回 "echo:" + 原文。
+        let upstream = L::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let guest_port = upstream.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = upstream.accept().unwrap();
+            let mut buf = [0u8; 16];
+            let n = s.read(&mut buf).unwrap();
+            let mut reply = b"echo:".to_vec();
+            reply.extend_from_slice(&buf[..n]);
+            s.write_all(&reply).unwrap();
+        });
+
+        // 在某個 host port 起 relay → 127.0.0.1:guest_port（以 127.0.0.1 代替 guest IP）。
+        let host_listener = L::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let host_port = host_listener.local_addr().unwrap().port();
+        drop(host_listener); // 釋放埠給 relay 用（仍有 TOCTOU 風險，但測試環境可接受）
+        spawn_tcp_forward(Ipv4Addr::LOCALHOST, host_port, guest_port).unwrap();
+
+        // 透過 host_port 連線，應被轉到 guest 服務。
+        let mut c = TcpStream::connect((Ipv4Addr::LOCALHOST, host_port)).unwrap();
+        c.write_all(b"hi").unwrap();
+        c.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut got = String::new();
+        c.read_to_string(&mut got).unwrap();
+        assert_eq!(got, "echo:hi");
+        server.join().unwrap();
     }
 
     #[test]

@@ -4,15 +4,23 @@
 //! 以 bundle 內附的 appliance（`vm/chefer-vmlinuz-<arch>` + `chefer-initramfs-<arch>`）
 //! 開機，virtiofs 共享 bundle/data，guest 內 initramfs 執行 guest-agent。
 //!
-//! 狀態：契約與跨平台純邏輯（[`crate::vz_util`]）已完成並測試；實際的
-//! Virtualization.framework 開機 shim 尚待在實體 Mac 上實作與驗證；
-//! Linux appliance 由 scripts/build-appliance.sh 與 scripts/qemu-e2e.sh 驗證。
-//! **在 VZ 實機驗證通過前 `availability()` 一律回報
-//! `Unavailable`，絕不偽稱可執行。**
+//! 開機由內附的 **Swift helper**（`agents/chefer-vz-helper-<arch>`）驅動：本後端只負責
+//! spawn helper、把它的 stdout（接著 guest 序列 console）串接解析 `CHEFER_GUEST_IP` /
+//! `CHEFER_GUEST_EXIT` 標記，並依 guest IP 起 host→guest 埠轉發。實際的
+//! Virtualization.framework 呼叫全在 helper（Swift）內，僅能在實體 Mac 驗證 VM 真的開得起來。
+//!
+//! **誠實回報**：在實機驗證通過前 `availability()` 預設 `Unavailable`，需
+//! `CHEFER_VZ_EXPERIMENTAL=1` 才啟用。
 
-use anyhow::Result;
+use std::io::{BufRead, BufReader};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
-use crate::vz_util;
+use anyhow::{Context, Result, bail};
+use chefer_bundle::PortProto;
+
+use crate::vz_util::{self, PortForward};
 use crate::{AppRunContext, Availability, ExecBackend};
 
 /// macOS Virtualization.framework 後端。
@@ -24,6 +32,17 @@ impl ExecBackend for VzBackend {
     }
 
     fn availability(&self, ctx: &AppRunContext) -> Availability {
+        // 實機驗證前預設不可用；需 CHEFER_VZ_EXPERIMENTAL=1 才啟用（誠實不偽稱可執行）。
+        if std::env::var("CHEFER_VZ_EXPERIMENTAL").ok().as_deref() != Some("1") {
+            return Availability::Unavailable(
+                "The macOS (vz) backend is experimental and not yet validated on real hardware. \
+                 To try it on a Mac, set CHEFER_VZ_EXPERIMENTAL=1 (the app must embed a \
+                 chefer-vz-helper signed with the com.apple.security.virtualization entitlement, \
+                 or you can point CHEFER_VZ_HELPER at a locally built one)."
+                    .to_string(),
+            );
+        }
+
         let host_arch = std::env::consts::ARCH;
         let Some(arch) = vz_util::host_guest_arch(host_arch) else {
             return Availability::Unavailable(format!(
@@ -38,39 +57,176 @@ impl ExecBackend for VzBackend {
                 chefer_bundle::layout::initramfs_name(arch)
             ));
         }
+        if resolve_helper(ctx.bundle_dir, host_arch).is_err() {
+            return Availability::Unavailable(format!(
+                "This single-file app has no embedded macOS VM helper (missing agents/{}); \
+                 rebuild with a kit that includes it, or set CHEFER_VZ_HELPER to a locally built helper",
+                chefer_bundle::layout::vz_helper_name(host_arch)
+            ));
+        }
         if let Some(reason) = macos_version_unsupported_reason() {
             return Availability::Unavailable(reason);
         }
-        // VZ 開機 shim 尚未實機驗證前仍誠實回報不可用。Linux+QEMU appliance
-        // E2E 通過後，下一步才可把這裡接到真正的 Virtualization.framework helper。
-        Availability::Unavailable(
-            "The macOS appliance is embedded and the host architecture is supported, but the \
-             Virtualization.framework boot shim has not yet been validated on a physical Mac. \
-             For now, run this app on Linux or Windows, or enable the vz backend after \
-             validating the vz helper on a physical Apple Silicon Mac."
-                .to_string(),
-        )
+        Availability::Available
     }
 
     fn run(&self, ctx: &AppRunContext) -> Result<i32> {
-        // 即使尚未能開機，也先跑通「定位 appliance + 計算資源」這條純邏輯，
-        // 讓錯誤訊息帶上實際診斷（哪個 arch、appliance 是否內嵌）。
         let host_arch = std::env::consts::ARCH;
         let arch = vz_util::host_guest_arch(host_arch)
             .ok_or_else(|| anyhow::anyhow!("unsupported host architecture: {host_arch}"))?;
+        let appliance = vz_util::appliance_in_bundle(ctx.bundle_dir, arch).ok_or_else(|| {
+            anyhow::anyhow!(
+                "This single-file app has no embedded macOS micro-VM appliance (missing vm/{} or vm/{})",
+                chefer_bundle::layout::kernel_name(arch),
+                chefer_bundle::layout::initramfs_name(arch)
+            )
+        })?;
+        let helper = resolve_helper(ctx.bundle_dir, host_arch)?;
 
-        match vz_util::appliance_in_bundle(ctx.bundle_dir, arch) {
-            Some(ap) => anyhow::bail!(
-                "The macOS execution backend is not implemented yet (embedded appliance found: {}, {}). \
-                 The VM boot shim still needs to be completed on a physical Mac; for now, run this app on Linux or Windows.",
-                ap.kernel.display(),
-                ap.initramfs.display()
-            ),
-            None => anyhow::bail!(
-                "This single-file app has no embedded macOS micro-VM appliance (missing vm/chefer-vmlinuz-{arch} or \
-                 chefer-initramfs-{arch}), and the macOS execution backend is not implemented yet; \
-                 for now, run this app on Linux or Windows."
-            ),
+        std::fs::create_dir_all(ctx.data_dir).with_context(|| {
+            format!(
+                "failed to create data directory: {}",
+                ctx.data_dir.display()
+            )
+        })?;
+
+        let host_cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let mem_override = std::env::var("CHEFER_VZ_MEMORY_MIB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok());
+        let res = vz_util::VmResources::compute(host_cpus, mem_override);
+        let cmdline = vz_util::kernel_command_line(ctx.opts.keep_tmp);
+
+        eprintln!(
+            "[chefer] starting macOS micro-VM via {} (cpus={}, mem={}MiB)",
+            helper.display(),
+            res.cpu_count,
+            res.memory_mib
+        );
+
+        let mut child = Command::new(&helper)
+            .arg("--kernel")
+            .arg(&appliance.kernel)
+            .arg("--initramfs")
+            .arg(&appliance.initramfs)
+            .arg("--cmdline")
+            .arg(&cmdline)
+            .arg("--bundle-dir")
+            .arg(ctx.bundle_dir)
+            .arg("--data-dir")
+            .arg(ctx.data_dir)
+            .arg("--cpus")
+            .arg(res.cpu_count.to_string())
+            .arg("--memory-mib")
+            .arg(res.memory_mib.to_string())
+            .stdout(Stdio::piped())
+            .spawn()
+            .with_context(|| {
+                format!("failed to spawn the macOS VM helper: {}", helper.display())
+            })?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .expect("child stdout was requested as piped");
+        let forwards = vz_util::forward_ports(ctx.manifest);
+        let mut forwards_started = false;
+        let mut guest_exit: Option<i32> = None;
+
+        // 串接 helper（=guest console）的 stdout：直通給使用者，同時解析標記。
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            println!("{line}");
+            if !forwards_started {
+                if let Some(ip) = vz_util::parse_guest_ip(&line) {
+                    start_port_forwards(ip, &forwards);
+                    forwards_started = true;
+                }
+            }
+            if let Some(code) = vz_util::parse_guest_exit_code(&line) {
+                guest_exit = Some(code);
+            }
+        }
+
+        let status = child
+            .wait()
+            .context("failed to wait for the macOS VM helper")?;
+        if let Some(code) = guest_exit {
+            return Ok(code);
+        }
+        if !status.success() {
+            bail!(
+                "the macOS VM helper exited with status {} before the guest reported an exit code; \
+                 see the messages above for the Virtualization.framework error",
+                status.code().unwrap_or(-1)
+            );
+        }
+        // 乾淨結束卻沒看到 exit 標記（理論上不該發生）——保守回 0。
+        Ok(0)
+    }
+}
+
+/// 找開機 helper：`CHEFER_VZ_HELPER` env（供實機驗證直接指向自建 helper）優先，
+/// 否則 bundle 內的 `agents/chefer-vz-helper-<host_arch>`。
+fn resolve_helper(bundle_dir: &Path, host_arch: &str) -> Result<PathBuf> {
+    if let Some(p) = std::env::var_os("CHEFER_VZ_HELPER") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Ok(p);
+        }
+        bail!(
+            "CHEFER_VZ_HELPER points to a file that does not exist: {}",
+            p.display()
+        );
+    }
+    let p = chefer_bundle::layout::agents_dir(bundle_dir)
+        .join(chefer_bundle::layout::vz_helper_name(host_arch));
+    if p.is_file() {
+        return Ok(p);
+    }
+    bail!(
+        "macOS VM helper not found: {}; rebuild with a kit that includes chefer-vz-helper-{host_arch}, \
+         or set CHEFER_VZ_HELPER to a locally built helper",
+        p.display()
+    )
+}
+
+/// 取得 guest IP 後，對每個宣告的埠起 host→guest relay。best-effort：單一埠失敗只警告
+/// （VM 已在跑），不中斷整個 app。
+fn start_port_forwards(guest_ip: Ipv4Addr, forwards: &[PortForward]) {
+    for f in forwards {
+        match f.proto {
+            PortProto::Tcp => match vz_util::spawn_tcp_forward(guest_ip, f.host, f.guest) {
+                Ok(()) => eprintln!(
+                    "[chefer] TCP port forward: 127.0.0.1:{} → {guest_ip}:{}",
+                    f.host, f.guest
+                ),
+                Err(e) => eprintln!(
+                    "[chefer] warning: could not forward TCP port {} (host bind failed: {e}); \
+                     the service may be unreachable from the host",
+                    f.host
+                ),
+            },
+            PortProto::Udp => match UdpSocket::bind((Ipv4Addr::LOCALHOST, f.host)) {
+                Ok(sock) => {
+                    let target = SocketAddr::from((guest_ip, f.guest));
+                    guest_agent::udp_bridge::spawn_udp_relay(sock, move || {
+                        let up = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
+                        up.connect(target)?;
+                        Ok(up)
+                    });
+                    eprintln!(
+                        "[chefer] UDP port forward: 127.0.0.1:{} → {guest_ip}:{}",
+                        f.host, f.guest
+                    );
+                }
+                Err(e) => eprintln!(
+                    "[chefer] warning: could not forward UDP port {} (host bind failed: {e})",
+                    f.host
+                ),
+            },
         }
     }
 }
