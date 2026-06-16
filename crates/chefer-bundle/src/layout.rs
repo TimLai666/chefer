@@ -33,6 +33,13 @@ pub fn pasta_name(arch: &str) -> String {
     format!("pasta-{arch}")
 }
 
+/// macOS vz 後端的開機 helper（Swift 編成的 **host macho**，arch 為 host 架構）檔名。
+/// 與其他協力檔同放 `agents/`；打包 macOS 目標時嵌入，runtime 解壓後 spawn 它驅動
+/// Virtualization.framework（見 docs/DESIGN.md macOS（vz）節）。
+pub fn vz_helper_name(arch: &str) -> String {
+    format!("chefer-vz-helper-{arch}")
+}
+
 /// macOS micro-VM appliance（kernel + initramfs）目錄。
 pub fn vm_dir(bundle_dir: &Path) -> PathBuf {
     bundle_dir.join("vm")

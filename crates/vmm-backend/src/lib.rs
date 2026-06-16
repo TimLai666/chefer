@@ -3,7 +3,8 @@
 //! 對應 docs/DESIGN.md §6「vmm-backend」節：
 //! - Linux：`namespaces` 後端（in-process 呼叫 guest-agent lib）。
 //! - Windows：`wsl2` 後端（chefer 專用 distro 內跑 bundle 內嵌的 musl guest-agent）。
-//! - macOS：`vz` 後端（v1 骨架，回報明確未支援訊息）。
+//! - macOS：`vz` 後端（內附 Swift helper 驅動 Virtualization.framework；實機驗證前
+//!   預設 `Unavailable`，需 `CHEFER_VZ_EXPERIMENTAL=1` 啟用）。
 //!
 //! 公開 API：[`Availability`]、[`RunOptions`]、[`AppRunContext`]、[`ExecBackend`]、
 //! [`backends`]、[`run_app`]；另提供 [`cleanup_distros`] 供未來 CLI 清理 WSL distro。

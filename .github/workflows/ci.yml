@@ -66,6 +66,23 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  vz-helper:
+    name: vz-helper (swiftc compile-check)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # 編譯 + ad-hoc 簽章 macOS vz 開機 helper（Swift）。GHA macOS runner 為巢狀虛擬化，
+      # 開不了 VZ guest，故此處僅 compile-check + 簽章驗證；VM 真正開機需實體 Mac。
+      - name: Build + sign chefer-vz-helper
+        run: bash scripts/build-vz-helper.sh dist
+
+      - name: Verify entitlement is present
+        run: |
+          codesign -d --entitlements - dist/chefer-vz-helper-* 2>&1 | tee ent.txt
+          grep -q "com.apple.security.virtualization" ent.txt \
+            || { echo "::error::vz helper is missing the virtualization entitlement"; exit 1; }
+
   musl-guest-agent:
     name: guest-agent (x86_64 musl static)
     runs-on: ubuntu-latest
