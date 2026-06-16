@@ -139,11 +139,9 @@ impl ExecBackend for VzBackend {
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
             println!("{line}");
-            if !forwards_started {
-                if let Some(ip) = vz_util::parse_guest_ip(&line) {
-                    start_port_forwards(ip, &forwards);
-                    forwards_started = true;
-                }
+            if !forwards_started && let Some(ip) = vz_util::parse_guest_ip(&line) {
+                start_port_forwards(ip, &forwards);
+                forwards_started = true;
             }
             if let Some(code) = vz_util::parse_guest_exit_code(&line) {
                 guest_exit = Some(code);
