@@ -527,6 +527,7 @@ fn pack_copies_macos_appliance_from_kit_when_targeting_darwin() {
     std::fs::write(kit_dir.join("guest-agent-aarch64"), b"fake-musl-agent").unwrap();
     std::fs::write(kit_dir.join("chefer-vmlinuz-aarch64"), b"fake-kernel").unwrap();
     std::fs::write(kit_dir.join("chefer-initramfs-aarch64"), b"fake-initramfs").unwrap();
+    std::fs::write(kit_dir.join("chefer-vz-helper-aarch64"), b"fake-vz-helper").unwrap();
 
     let svc = make_service(ImageSourceOrPath::Full {
         source: ImageSourceType::Tar,
@@ -552,6 +553,12 @@ fn pack_copies_macos_appliance_from_kit_when_targeting_darwin() {
     assert_eq!(
         std::fs::read(vm.join(layout::initramfs_name("aarch64"))).unwrap(),
         b"fake-initramfs"
+    );
+    // vz 開機 helper 也應從 kit 內嵌到 agents/。
+    assert_eq!(
+        std::fs::read(layout::agents_dir(&res.bundle_dir).join(layout::vz_helper_name("aarch64")))
+            .unwrap(),
+        b"fake-vz-helper"
     );
 }
 
