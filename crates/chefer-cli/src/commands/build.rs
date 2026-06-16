@@ -25,10 +25,14 @@ pub struct BuiltArtifact {
 }
 
 /// 執行 build；回傳各 target 的產物（dry-run 時為空清單）。
+///
+/// `local_run`：是否為 `chefer run`（本機建置後立即在本機執行）。決定 chefer-pack 的
+/// mount host 路徑檢查嚴格度——只有本機立即執行且非 VM 目標時，缺路徑才報錯（見 PackOptions）。
 pub fn cmd_build(
     opts: &BuildOpts,
     targets: &[String],
     dry_run: bool,
+    local_run: bool,
 ) -> Result<Vec<BuiltArtifact>> {
     let file = crate::resolve_appcipe_path(opts.file.clone());
     let app = appcipe_normalize::load(Path::new(&file))?;
@@ -73,6 +77,7 @@ pub fn cmd_build(
         require_agents,
         zstd_level: opts.zstd_level,
         builder_version: env!("CARGO_PKG_VERSION").to_string(),
+        local_run,
     };
     let pack_res = chefer_pack::pack(&app, &pack_opts).context("failed to pack bundle")?;
     println!("📦 Bundle: {}", pack_res.bundle_dir.display());

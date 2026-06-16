@@ -148,7 +148,8 @@ fn main() -> Result<()> {
             targets,
             dry_run,
         } => {
-            commands::build::cmd_build(&opts, &targets, dry_run)?;
+            // local_run=false：build 產物是要散布到別台機器執行的（mount host 路徑檢查放寬）。
+            commands::build::cmd_build(&opts, &targets, dry_run, false)?;
             Ok(())
         }
         Cmd::Run { opts } => {

@@ -554,10 +554,9 @@ main() {
   mkdir -p "$work/vm-data/extra1" "$work/vm-data/extra2"
   printf 'bind-one' > "$work/vm-data/extra1/file.txt"
   printf 'bind-two' > "$work/vm-data/extra2/file.txt"
-  # chefer-pack 於 **build 機**檢查 mount host 路徑存在；但 VM 後端的 host 是 guest 路徑
-  # （/mnt/data/extra*），runner 上預設沒有 → 先建同名空目錄滿足 build 檢查（執行時實際
-  # 內容由 VM 內 /mnt/data 的 virtiofs 提供，與此 runner 端 stub 無關）。
-  sudo mkdir -p /mnt/data/extra1 /mnt/data/extra2
+  # mount host 路徑（/mnt/data/extra*）是 VM 內路徑，runner 上沒有也無妨：`chefer build`
+  # 的 mount host 路徑檢查對散布產物為寬鬆（只警告，見 chefer-pack mount_check_is_lenient），
+  # 執行時實際內容由 VM 內 /mnt/data 的 virtiofs 提供，故 runner 端不需預建同名目錄。
 
   note "建置含內嵌 guest-agent 的 QemuE2E bundle"
   write_appcipe "$work/app/appcipe.yml" "QemuE2E" "$work/data" "$image_tar" "$host_port" "$guest_port" "$image_platform"
@@ -586,6 +585,15 @@ main() {
   #（而非合併 fallback）。確認真的走到 overlay，避免靜默退化讓此測試失去意義。
   grep -q "rootfs via overlayfs" "$first_log" \
     || die "expected the overlay rootfs path (root backend) but guest-agent did not report it; see ${first_log}"
+  # appliance init 應印出 guest eth0 IPv4 標記（macOS vz 後端用以做 host→guest 埠轉發）。
+  # 這裡驗證標記存在且為合法 IPv4，確保 VZ 後端可依此規劃轉發（vz_util::parse_guest_ip 對應）。
+  guest_ip_line="$(grep -o 'CHEFER_GUEST_IP=[0-9.]*' "$first_log" | tail -n 1 || true)"
+  [[ -n "$guest_ip_line" ]] \
+    || die "expected a CHEFER_GUEST_IP=<ipv4> marker on the guest console (needed for vz host→guest port forwarding); see ${first_log}"
+  guest_ip="${guest_ip_line#CHEFER_GUEST_IP=}"
+  python3 -c "import ipaddress,sys; ipaddress.IPv4Address('$guest_ip')" \
+    || die "guest IP marker is not a valid IPv4: '${guest_ip}'"
+  note "guest IP marker present and valid: ${guest_ip}"
 
   local second_log="$work/qemu-second.console.log"
   start_qemu "$arch" "$kernel" "$initramfs" "$bundle" "$work/vm-data" "$host_port" "$guest_port" "$second_log" "$virtiofsd" "second"

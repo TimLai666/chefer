@@ -211,6 +211,8 @@ fn default_opts(out: &Path) -> PackOptions {
         require_agents: false,
         zstd_level: 3,
         builder_version: "test".into(),
+        // 預設模擬 `chefer build`（散布產物）：mount host 路徑檢查放寬為警告。
+        local_run: false,
     }
 }
 
@@ -387,8 +389,9 @@ fn pack_rejects_invalid_archive() {
     assert!(format!("{err:#}").contains("not a valid image archive"));
 }
 
+/// `chefer run`（本機立即執行、非 VM 目標）時，缺 mount host 路徑維持 fail-fast 錯誤。
 #[test]
-fn pack_rejects_missing_mount_host_path() {
+fn pack_run_rejects_missing_mount_host_path() {
     let tmp = tempfile::tempdir().unwrap();
     let (image_tar, _) = build_docker_archive(tmp.path(), "linux", "amd64", None);
 
@@ -400,8 +403,52 @@ fn pack_rejects_missing_mount_host_path() {
 
     let app = make_app("BadMount", vec![("web", svc)]);
     let out = tmp.path().join("out");
-    let err = pack(&app, &default_opts(&out)).unwrap_err();
+    let mut opts = default_opts(&out);
+    opts.local_run = true; // 模擬 `chefer run`
+    let err = pack(&app, &opts).unwrap_err();
     assert!(format!("{err:#}").contains("mount host path does not exist"));
+}
+
+/// `chefer build`（散布產物，local_run=false）時，缺 mount host 路徑只警告、不報錯——
+/// 產物本來就要在別台機器執行，由 guest-agent 於執行期重新檢查。
+#[test]
+fn pack_build_allows_missing_mount_host_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (image_tar, _) = build_docker_archive(tmp.path(), "linux", "amd64", None);
+
+    let missing = tmp.path().join("definitely-missing-dir");
+    let mut svc = make_service(ImageSourceOrPath::TarPath(
+        image_tar.to_string_lossy().to_string(),
+    ));
+    svc.mounts = vec![format!("{}:/data", missing.to_string_lossy())];
+
+    let app = make_app("DistMount", vec![("web", svc)]);
+    let out = tmp.path().join("out");
+    // default_opts 的 local_run=false（build 語意）→ 應成功打包。
+    let res = pack(&app, &default_opts(&out)).expect("build should not fail on missing host path");
+    assert_eq!(res.manifest.services[0].mounts.len(), 1);
+}
+
+/// 即使是本機立即執行（local_run=true），只要 build 含 VM（darwin）目標，host 即為 guest VM，
+/// 缺 mount host 路徑亦放寬為警告。
+#[test]
+fn pack_vm_target_allows_missing_mount_host_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (image_tar, _) = build_docker_archive(tmp.path(), "linux", "amd64", None);
+
+    let missing = tmp.path().join("definitely-missing-dir");
+    let mut svc = make_service(ImageSourceOrPath::TarPath(
+        image_tar.to_string_lossy().to_string(),
+    ));
+    svc.mounts = vec![format!("{}:/data", missing.to_string_lossy())];
+
+    let app = make_app("VmMount", vec![("web", svc)]);
+    let out = tmp.path().join("out");
+    let mut opts = default_opts(&out);
+    opts.local_run = true;
+    opts.target_triples = vec!["aarch64-apple-darwin".to_string()];
+    let res = pack(&app, &opts).expect("VM target build should not fail on missing host path");
+    assert_eq!(res.manifest.services[0].mounts.len(), 1);
 }
 
 #[test]

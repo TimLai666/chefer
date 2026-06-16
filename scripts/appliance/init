@@ -88,6 +88,14 @@ chmod 0755 /run/chefer/guest-agent || true
 cache_dir="/tmp/chefer-rootfs-cache"
 mkdir -p "$cache_dir"
 
+# 印出 guest eth0 的對外 IPv4 供 VM host（macOS vz）做 host→guest 埠轉發：VZ 的 NAT
+# 不會自動把 host 埠轉進 guest，host 端需直接連 guest IP relay。取不到不致命（純 stdout 應用
+# 或無宣告埠時無妨）。QEMU 走 slirp hostfwd 不需這個，但印出來也無害、且可被 e2e 驗證。
+guest_ip="$(/run/chefer/guest-agent vmip 2>/dev/null || true)"
+if [ -n "$guest_ip" ]; then
+  echo "CHEFER_GUEST_IP=${guest_ip}"
+fi
+
 # --udp-bridge：VM 內補起 UDP 埠的 eth0→loopback 橋接（無 UDP 埠時為 no-op）。
 # host 端（macOS vz）的 UDP relay 待實機實作；guest 側先就緒。
 set +e
