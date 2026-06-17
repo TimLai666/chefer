@@ -1,5 +1,5 @@
 //! 服務生命週期監控（fail_fast + 介面服務生命週期）：
-//! 依拓撲順序啟動全部服務 → 任一服務以非零結束 → SIGTERM 其餘 → 5 秒後 SIGKILL
+//! 依拓撲順序啟動全部服務 → 任一服務以非零結束 → SIGTERM 其餘 → 10 秒後 SIGKILL
 //! → 回傳該 exit code；**介面服務（gui/terminal/both）即使 exit 0 也收掉整個 app**
 //! （關窗/關終端 = app 結束）；非介面服務 exit 0 屬背景/一次性、其餘繼續；
 //! 全部正常結束 → 0；收到 SIGTERM/SIGINT → 同終止程序 → 130。
@@ -61,6 +61,9 @@ pub fn install_signal_handlers() -> Result<()> {
 
 /// 健康檢查未通過時，app 整體回傳的 exit code。
 const UNHEALTHY_EXIT: i32 = 1;
+
+/// 服務優雅停止寬限期：先送 SIGTERM，逾時才 SIGKILL。
+const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 /// 依拓撲順序啟動所有服務並監控至結束，回傳 app 整體 exit code。
 ///
@@ -320,12 +323,16 @@ fn monitor(running: &mut Vec<Running>) -> Result<i32> {
     }
 }
 
-/// SIGTERM 全部 → 最多等 5 秒 → 仍存活者 SIGKILL（並回收殭屍行程）。
+/// SIGTERM 全部 → 最多等 [`DEFAULT_SHUTDOWN_GRACE`] → 仍存活者 SIGKILL（並回收殭屍行程）。
 ///
 /// 同時對「中繼行程的 process group」與「服務本體（pid-ns init）的 host pid」送訊號：
 /// 前者涵蓋一般情況；後者確保即使服務 setsid/setpgid 脫離中繼 group，
 /// 仍能直接殺掉 pid-ns 的 init 而拆除整個 namespace（避免行程/埠洩漏）。
 fn terminate_all(running: &mut Vec<Running>) {
+    terminate_all_with_grace(running, DEFAULT_SHUTDOWN_GRACE);
+}
+
+fn terminate_all_with_grace(running: &mut Vec<Running>, grace: Duration) {
     if running.is_empty() {
         return;
     }
@@ -335,14 +342,9 @@ fn terminate_all(running: &mut Vec<Running>) {
             let _ = kill(init, Signal::SIGTERM);
         }
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = shutdown_deadline(Instant::now(), grace);
     while !running.is_empty() && Instant::now() < deadline {
-        running.retain(|r| {
-            !matches!(
-                waitpid(r.mid, Some(WaitPidFlag::WNOHANG)),
-                Ok(WaitStatus::Exited(..)) | Ok(WaitStatus::Signaled(..)) | Err(_)
-            )
-        });
+        running.retain(|r| !service_has_exited(r.mid));
         if running.is_empty() {
             break;
         }
@@ -350,8 +352,9 @@ fn terminate_all(running: &mut Vec<Running>) {
     }
     for r in running.iter() {
         eprintln!(
-            "[guest-agent] service `{}` did not exit within 5 seconds, forcing termination (SIGKILL)",
-            r.name
+            "[guest-agent] service `{}` did not exit within {} seconds, forcing termination (SIGKILL)",
+            r.name,
+            grace.as_secs()
         );
         let _ = killpg(r.mid, Signal::SIGKILL);
         if let Some(init) = r.init {
@@ -360,6 +363,23 @@ fn terminate_all(running: &mut Vec<Running>) {
         let _ = waitpid(r.mid, None);
     }
     running.clear();
+}
+
+fn shutdown_deadline(start: Instant, grace: Duration) -> Instant {
+    start + grace
+}
+
+fn service_has_exited(mid: Pid) -> bool {
+    loop {
+        match waitpid(mid, Some(WaitPidFlag::WNOHANG)) {
+            Ok(WaitStatus::Exited(..)) | Ok(WaitStatus::Signaled(..)) => return true,
+            Ok(WaitStatus::StillAlive) => return false,
+            Ok(_) => return false,
+            Err(Errno::EINTR) => continue,
+            Err(Errno::ECHILD) => return true,
+            Err(_) => return true,
+        }
+    }
 }
 
 /// 轉發子行程輸出：逐行加上 `[svc]` 前綴寫到自身 stdout / stderr。
@@ -391,4 +411,29 @@ fn spawn_forwarder(name: String, fd: OwnedFd, to_stderr: bool) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_grace_is_ten_seconds() {
+        assert_eq!(
+            DEFAULT_SHUTDOWN_GRACE,
+            Duration::from_secs(10),
+            "預設優雅停止寬限期應為 10 秒"
+        );
+    }
+
+    #[test]
+    fn shutdown_deadline_adds_grace() {
+        let start = Instant::now();
+        let deadline = shutdown_deadline(start, Duration::from_secs(10));
+        assert_eq!(
+            deadline.duration_since(start),
+            Duration::from_secs(10),
+            "deadline 應等於開始時間加上 grace"
+        );
+    }
 }

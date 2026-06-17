@@ -304,7 +304,7 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
   - 網路（v1 預設 = `shared`）：**不** unshare netns（共享網路 → ports 直接生效，WSL2 下 TCP 由 localhost forwarding 對外、UDP 由 `--udp-bridge` 起的 VM 內橋接 + host 端 relay 對外）。**已知缺口**：未宣告的 port 仍可從 host 連到（共用 netns + WSL2 wslrelay 鏡射）。真正隔離見下方「網路隔離」設計。
   - **depends_on 健康檢查（wait-until-ready）**：服務可選 `healthcheck`（見「健康檢查」節）。啟動採**拓撲序、序列化**：spawn 一個服務後，若它有 `healthcheck` 就**輪詢到 healthy 才 spawn 下一個**；無 healthcheck 的服務 spawn 即視為 ready（沿用 v1 行為）。因 `depends_on` 驅動拓撲序，被依賴者必在依賴者之前 ready，故 `depends_on: [db]` 等同「等 db ready」（db 有 healthcheck=等 healthy；否則=等 spawn）。輪詢期間同時偵測該服務崩潰與 SHUTDOWN。**fail_fast**：healthcheck 在 `retries` 次內（扣除 `start_period` 寬限）未成功 → 視為 unhealthy → terminate_all 並回非零碼。（MVP 序列化啟動：一個 healthcheck 會擋住其後所有服務，含不相依者；之後可改成只擋實際 dependents 的並行版。）
   - 監控（fail_fast + 介面服務生命週期）：
-    - 任一服務 exit ≠ 0 → 終止其餘全部（SIGTERM → 等 5s → SIGKILL，對中繼 pgid 與 pid-ns init 雙送）→ 回傳該 exit code。
+    - 任一服務 exit ≠ 0 → 終止其餘全部（SIGTERM → 等 10s → SIGKILL，對中繼 pgid 與 pid-ns init 雙送）→ 回傳該 exit code。
     - **介面服務（interface_mode 含 gui/terminal/both）即使 exit 0 也視為「整個 app 結束」**（使用者關掉視窗/終端 = app 該收掉）→ 終止其餘、回 0。否則 GUI app 關窗後背景服務（如 db）會殘留、佔住埠、無法重啟。
     - 非介面（none）服務 exit 0 → 屬背景/一次性任務，其餘繼續跑；全部結束 → 0。
   - `interface_mode=terminal/both`：該服務 stdio 直通（v1：所有服務 stdout/stderr 都加 `[svc]` 前綴轉發；terminal 服務 stdin 直通——僅允許一個服務宣告 terminal/both，多個→驗證期報錯）。彙整輸出的去向（那個「共用主控台」要不要顯示）由 app 級 `console` 控制，見下方「主控台顯示」。
