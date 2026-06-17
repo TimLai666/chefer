@@ -251,6 +251,32 @@ services:
 YAML
 }
 
+write_graceful_shutdown_appcipe() {
+  local path="$1"
+  local data_dir="$2"
+  local image_tar="$3"
+  local image_platform="$4"
+  mkdir -p "$(dirname "$path")"
+  cat >"$path" <<YAML
+version: "0.1"
+name: LinuxGracefulTerm
+app_version: "e2e"
+data_dir: "${data_dir}"
+crash: fail_fast
+network: shared
+services:
+  app:
+    image:
+      source: tar
+      file: "${image_tar}"
+      format: docker-archive
+      platform: ${image_platform}
+    cmd: ["sh", "-c", "trap 'echo CHEFER_TERM_TRAPPED; mkdir -p /data; echo CHEFER_TERM_TRAPPED > /data/term.txt; exit 0' TERM INT; echo CHEFER_GRACEFUL_READY; while true; do sleep 1; done"]
+    persist_path: /data
+    interface_mode: none
+YAML
+}
+
 write_gui_appcipe() {
   local path="$1"
   local data_dir="$2"
@@ -813,6 +839,54 @@ YAML
   note "Healthcheck negative E2E passed: unhealthy service tore the app down (exit=${bad_code}, ${elapsed}s)"
 }
 
+# 優雅關閉 E2E：host 對單檔送 SIGTERM 後，服務本體應先收到 SIGTERM、
+# 在寬限期內寫出 marker 並乾淨退出，而不是直接被 SIGKILL。
+run_graceful_shutdown_e2e() {
+  local work="$1" output_target="$2" image_platform="$3" cli="$4" kit="$5" image_tar="$6"
+
+  note "Graceful shutdown E2E: service traps SIGTERM before supervisor escalates"
+  mkdir -p "$work/graceful"
+  write_graceful_shutdown_appcipe "$work/graceful/appcipe.yml" "$work/graceful-data" "$image_tar" "$image_platform"
+  "$cli" build "$work/graceful/appcipe.yml" --out "$work/out-graceful" --kit-dir "$kit" --target "$output_target"
+  local graceful_app="$work/out-graceful/LinuxGracefulTerm/LinuxGracefulTerm_${output_target}"
+  [[ -f "$graceful_app" ]] || die "missing built graceful shutdown app: $graceful_app"
+  chmod +x "$graceful_app"
+
+  local graceful_log="$work/graceful.log"
+  "$graceful_app" >"$graceful_log" 2>&1 &
+  local graceful_pid=$!
+  for _ in $(seq 1 150); do
+    if grep -q "CHEFER_GRACEFUL_READY" "$graceful_log"; then
+      break
+    fi
+    if ! kill -0 "$graceful_pid" 2>/dev/null; then
+      cat "$graceful_log" >&2 || true
+      die "graceful shutdown app exited before it became ready"
+    fi
+    sleep 0.2
+  done
+  grep -q "CHEFER_GRACEFUL_READY" "$graceful_log" || {
+    cat "$graceful_log" >&2 || true
+    die "timed out waiting for graceful shutdown app readiness"
+  }
+
+  kill -TERM "$graceful_pid" 2>/dev/null || true
+  set +e
+  wait "$graceful_pid"
+  local graceful_code=$?
+  set -e
+  local marker="$work/graceful-data/data/app/term.txt"
+  if [[ ! -f "$marker" ]] || ! grep -q "CHEFER_TERM_TRAPPED" "$marker"; then
+    cat "$graceful_log" >&2 || true
+    die "service did not record the SIGTERM trap marker; exit=${graceful_code}"
+  fi
+  if grep -q "forcing termination (SIGKILL)" "$graceful_log"; then
+    cat "$graceful_log" >&2 || true
+    die "service was escalated to SIGKILL instead of exiting during the grace period"
+  fi
+  note "Graceful shutdown E2E passed: service received SIGTERM and exited before SIGKILL"
+}
+
 # source: dockerfile —— chefer 直接從 Dockerfile build（偵測 host builder），免手動 docker save。
 # 先以自動偵測（docker）跑一次；若 podman 存在，再強制用 podman 跑一次，
 # 把「非-docker、docker 相容 CLI」這條路徑也納入實測。
@@ -1046,6 +1120,9 @@ main() {
 
   note "Checking depends_on healthcheck (wait-until-ready + fail_fast)"
   run_healthcheck_e2e "$work" "$output_target" "$image_platform" "$cli" "$kit" "$image_tar"
+
+  note "Checking graceful shutdown on SIGTERM"
+  run_graceful_shutdown_e2e "$work" "$output_target" "$image_platform" "$cli" "$kit" "$image_tar"
 
   note "Checking Dockerfile build (source: dockerfile)"
   run_dockerfile_e2e "$work" "$output_target" "$image_platform" "$cli" "$kit" "$base_image"

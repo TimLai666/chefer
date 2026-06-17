@@ -1,6 +1,6 @@
 //! chefer-cli — Chefer 的命令列入口（DESIGN.md §6 chefer-cli 節）。
 //!
-//! 子命令：init / check / build / run / inspect / version / upgrade。
+//! 子命令：init / check / build / run / doctor / inspect / version / upgrade。
 //! 各命令實作位於 `commands/` 下（一檔一命令）；表格 UI 輔助集中在 `ui.rs`。
 
 mod commands;
@@ -71,6 +71,13 @@ enum Cmd {
     Run {
         #[command(flatten)]
         opts: BuildOpts,
+    },
+
+    /// Check whether this machine can build and run Chefer apps
+    Doctor {
+        /// Additional kit search directory (highest priority; repeatable)
+        #[arg(long = "kit-dir", value_name = "DIR")]
+        kit_dirs: Vec<PathBuf>,
     },
 
     /// Inspect a Chefer single executable's footer and embedded manifest summary (no run, no extraction)
@@ -156,6 +163,13 @@ fn main() -> Result<()> {
             let code = commands::run::cmd_run(&opts)?;
             // 透傳被執行應用的 exit code
             std::process::exit(code);
+        }
+        Cmd::Doctor { kit_dirs } => {
+            let code = commands::doctor::cmd_doctor(&kit_dirs)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
         }
         Cmd::Inspect { file } => commands::inspect::cmd_inspect(&file),
         Cmd::Version => commands::version::cmd_version(),
