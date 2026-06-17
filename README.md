@@ -144,12 +144,12 @@ cargo run -p chefer-cli -- build examples/gui-demo/appcipe.yml --out dist
 | `chefer build [path] [--out <dir>] [--target <triple>]... [--kit-dir <dir>]... [--zstd-level N] [--no-embed-original] [--dry-run]` | Package into single-file executable(s); `--target` may be repeated, defaults to the host target. |
 | `chefer run [path] [build options]` | Build for the host target, then run the artifact immediately (stdio passthrough, exit code propagated). |
 | `chefer doctor [--kit-dir <dir>]...` | Check whether the current machine can build/run Chefer apps; prints PASS/WARN/FAIL diagnostics with actionable fixes. |
-| `chefer inspect <file>` | Show the footer and embedded manifest summary of a Chefer single-file executable (no execution, no extraction). |
+| `chefer inspect <file>` | Show the footer, app metadata, service details, layer sizes, and embedded companion files of a Chefer single-file executable (no execution, no filesystem extraction). |
 | `chefer version` | Show Chefer and environment version info. |
 | `chefer upgrade [--channel stable] [--to <ver>] [--check-only]` | Self-update from GitHub Releases — replaces **both** the `chefer` binary and the whole `kit/` together (sha256-verified, with rollback), so the CLI and kit never drift apart. |
 | `chefer selfrm [-y]` | Remove Chefer itself (the `chefer` binary + its `kit/`) and clean the installer's PATH entry. Does **not** touch apps you packaged, their data, or WSL distros. |
 
-> `chefer inspect` now also shows **"Packed by chefer"** — the chefer version that built that single-file app (recorded in its manifest), so you can always tell which version produced a given artifact.
+> `chefer inspect` also shows **"Packed by chefer"**, service layer sizes, ports, mounts, healthcheck presence, and embedded `agents/` / `vm/` companion files, so you can tell what a single-file app contains without extracting it.
 
 `[path]` defaults to `./appcipe.yml`; a directory argument means `<dir>/appcipe.yml`.
 
