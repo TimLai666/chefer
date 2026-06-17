@@ -140,6 +140,18 @@ fn build_then_inspect_end_to_end() {
         stdout.contains("web"),
         "inspect 輸出應含 service 名稱：{stdout}"
     );
+    assert!(
+        stdout.contains("linux/amd64"),
+        "inspect 輸出應含 image platform：{stdout}"
+    );
+    assert!(
+        stdout.contains("Health"),
+        "inspect 輸出應含 healthcheck 欄位：{stdout}"
+    );
+    assert!(
+        stdout.contains("Embedded companion files"),
+        "inspect 輸出應含 embedded companion files 區塊：{stdout}"
+    );
 }
 
 #[test]

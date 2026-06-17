@@ -39,6 +39,23 @@ pub fn human_mb(bytes: u64) -> String {
     format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
 }
 
+/// 位元組數 → 人類可讀字串（自動選 KiB / MiB / GiB）。
+pub fn human_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * KIB;
+    const GIB: f64 = 1024.0 * MIB;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.2} GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.2} MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.2} KiB", b / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 /// 位元組 slice → 小寫十六進位字串（顯示 sha256 用）。
 pub fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -233,6 +250,15 @@ mod tests {
         assert_eq!(human_mb(0), "0.00 MB");
         assert_eq!(human_mb(1024 * 1024), "1.00 MB");
         assert_eq!(human_mb(1024 * 1024 * 1024), "1024.00 MB");
+    }
+
+    #[test]
+    fn human_bytes_formats_units() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(2048), "2.00 KiB");
+        assert_eq!(human_bytes(3 * 1024 * 1024), "3.00 MiB");
+        assert_eq!(human_bytes(2 * 1024 * 1024 * 1024), "2.00 GiB");
     }
 
     #[test]

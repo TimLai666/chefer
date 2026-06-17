@@ -37,10 +37,17 @@ fn console_label(c: chefer_bundle::ConsoleMode) -> &'static str {
     }
 }
 
-/// 解壓輸出總量上限：bundle 佈局中 manifest.json 之前只有 agents/（數 MB）
-/// 與 appcipe.yml，256 MiB 足以涵蓋並讀到 manifest，遠低於 OOM 門檻。
-/// 套在 tar 之前以擋下長檔名/pax 標頭撐爆 read_to_end 的解壓炸彈。
-const MAX_INSPECT_INFLATE_BYTES: u64 = 256 * 1024 * 1024;
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CompanionInventory {
+    agents: Vec<String>,
+    vm: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct InspectPayload {
+    manifest: chefer_bundle::Manifest,
+    companions: CompanionInventory,
+}
 
 pub fn cmd_inspect(file: &Path) -> Result<()> {
     let footer = chefer_bundle::Footer::read_from_file(file)?;
@@ -69,7 +76,7 @@ pub fn cmd_inspect(file: &Path) -> Result<()> {
         Cell::new(format!(
             "{} bytes ({})",
             footer.offset,
-            ui::human_mb(footer.offset)
+            ui::human_bytes(footer.offset)
         )),
     ]);
     t.add_row(vec![
@@ -77,7 +84,7 @@ pub fn cmd_inspect(file: &Path) -> Result<()> {
         Cell::new(format!(
             "{} bytes ({})",
             footer.length,
-            ui::human_mb(footer.length)
+            ui::human_bytes(footer.length)
         )),
     ]);
     t.add_row(vec![
@@ -86,7 +93,11 @@ pub fn cmd_inspect(file: &Path) -> Result<()> {
     ]);
     t.add_row(vec![
         Cell::new("File Size").fg(Color::Cyan),
-        Cell::new(format!("{} bytes ({})", file_size, ui::human_mb(file_size))),
+        Cell::new(format!(
+            "{} bytes ({})",
+            file_size,
+            ui::human_bytes(file_size)
+        )),
     ]);
 
     println!();
@@ -94,16 +105,14 @@ pub fn cmd_inspect(file: &Path) -> Result<()> {
     println!("{t}");
 
     // ── 串流取出 manifest.json 並列印摘要 ───────────────────────
-    let manifest = read_embedded_manifest(file, &footer)?;
-    render_manifest_summary(&manifest);
+    let payload = read_embedded_payload(file, &footer)?;
+    render_manifest_summary(&payload.manifest, footer.length, &payload.companions);
     Ok(())
 }
 
-/// 串流讀取 payload，只取出 `bundle/manifest.json`（不解壓其他 entry 到磁碟）。
-fn read_embedded_manifest(
-    path: &Path,
-    footer: &chefer_bundle::Footer,
-) -> Result<chefer_bundle::Manifest> {
+/// 串流讀取 payload，取出 `bundle/manifest.json` 並掃描內嵌協力檔清單。
+/// 不把 bundle 解到磁碟，也不把 layer 內容讀進記憶體。
+fn read_embedded_payload(path: &Path, footer: &chefer_bundle::Footer) -> Result<InspectPayload> {
     if !footer.is_zstd() {
         bail!(
             "unsupported payload format (flags={:#04x}): this version only supports zstd-compressed tar payloads",
@@ -118,10 +127,13 @@ fn read_embedded_manifest(
     let limited = BufReader::new(f).take(footer.length);
     let decoder = zstd::stream::read::Decoder::new(limited)
         .context("failed to create zstd decoder (payload may be corrupted)")?;
-    // 在 tar 之前限制解壓「輸出」總量：擋下長檔名/pax 標頭撐爆 read_to_end 的炸彈，
-    // 以及把 manifest 排在超大 entry 之後的 DoS。take(footer.length) 只限壓縮輸入，無法防此。
-    let guarded = chefer_bundle::LimitedReader::new(decoder, MAX_INSPECT_INFLATE_BYTES);
+    // 在 tar 之前限制解壓「輸出」總量：擋下長檔名/pax 標頭撐爆 read_to_end 的炸彈。
+    // inspect 需要掃描 agents/vm entry，因此用與壓縮 payload 大小成比例的既有安全邊界。
+    let guarded =
+        chefer_bundle::LimitedReader::new(decoder, chefer_bundle::bomb_limit_for(footer.length));
     let mut archive = tar::Archive::new(guarded);
+    let mut manifest = None;
+    let mut companions = CompanionInventory::default();
 
     for entry in archive.entries().context("failed to read payload tar")? {
         let mut entry = entry.context("failed to read payload tar entry")?;
@@ -130,6 +142,9 @@ fn read_embedded_manifest(
             .context("failed to read tar entry path")?
             .to_string_lossy()
             .replace('\\', "/");
+        if entry.header().entry_type().is_file() {
+            record_companion(&mut companions, &entry_path);
+        }
         if entry_path != "bundle/manifest.json" {
             continue; // 其他 entry 一律跳過（iterator 會自行略過內容，不落地）
         }
@@ -153,15 +168,40 @@ fn read_embedded_manifest(
                 chefer_bundle::MANIFEST_FORMAT_VERSION
             );
         }
-        return Ok(m);
+        manifest = Some(m);
     }
-    bail!(
-        "bundle/manifest.json not found in payload; file may not be a Chefer single-file or is corrupted"
-    );
+    let Some(manifest) = manifest else {
+        bail!(
+            "bundle/manifest.json not found in payload; file may not be a Chefer single-file or is corrupted"
+        );
+    };
+    companions.agents.sort();
+    companions.vm.sort();
+    Ok(InspectPayload {
+        manifest,
+        companions,
+    })
+}
+
+fn record_companion(companions: &mut CompanionInventory, entry_path: &str) {
+    if let Some(name) = entry_path.strip_prefix("bundle/agents/") {
+        if !name.is_empty() && !name.contains('/') {
+            companions.agents.push(name.to_string());
+        }
+    } else if let Some(name) = entry_path.strip_prefix("bundle/vm/")
+        && !name.is_empty()
+        && !name.contains('/')
+    {
+        companions.vm.push(name.to_string());
+    }
 }
 
 /// 列印 manifest 的 app 與 services 摘要表格。
-fn render_manifest_summary(m: &chefer_bundle::Manifest) {
+fn render_manifest_summary(
+    m: &chefer_bundle::Manifest,
+    payload_len: u64,
+    companions: &CompanionInventory,
+) {
     use comfy_table::{
         Attribute, ColumnConstraint, ContentArrangement, Table, Width, presets::UTF8_BORDERS_ONLY,
     };
@@ -190,6 +230,14 @@ fn render_manifest_summary(m: &chefer_bundle::Manifest) {
     t.add_row(vec![
         Cell::new("Console").fg(Color::Cyan),
         Cell::new(console_label(m.app.console)).fg(Color::Yellow),
+    ]);
+    t.add_row(vec![
+        Cell::new("Payload Size").fg(Color::Cyan),
+        Cell::new(format!(
+            "{} bytes ({})",
+            payload_len,
+            ui::human_bytes(payload_len)
+        )),
     ]);
     if let Some(d) = &m.app.data_dir_override {
         t.add_row(vec![
@@ -226,14 +274,15 @@ fn render_manifest_summary(m: &chefer_bundle::Manifest) {
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_width(ui::term_width())
         .set_constraints(vec![
-            ColumnConstraint::Absolute(Width::Percentage(12)), // Service
-            ColumnConstraint::Absolute(Width::Percentage(14)), // Platform
-            ColumnConstraint::Absolute(Width::Percentage(8)),  // Layers
-            ColumnConstraint::Absolute(Width::Percentage(12)), // Size
+            ColumnConstraint::Absolute(Width::Percentage(10)), // Service
+            ColumnConstraint::Absolute(Width::Percentage(13)), // Platform
             ColumnConstraint::Absolute(Width::Percentage(8)),  // Mode
-            ColumnConstraint::Absolute(Width::Percentage(18)), // Persist
-            ColumnConstraint::Absolute(Width::Percentage(16)), // Ports
-            ColumnConstraint::Absolute(Width::Percentage(12)), // Depends
+            ColumnConstraint::Absolute(Width::Percentage(13)), // Layers
+            ColumnConstraint::Absolute(Width::Percentage(10)), // Persist
+            ColumnConstraint::Absolute(Width::Percentage(13)), // Ports
+            ColumnConstraint::Absolute(Width::Percentage(15)), // Mounts
+            ColumnConstraint::Absolute(Width::Percentage(10)), // Depends
+            ColumnConstraint::Absolute(Width::Percentage(8)),  // Health
         ]);
     t.set_header(vec![
         Cell::new("Service")
@@ -242,13 +291,10 @@ fn render_manifest_summary(m: &chefer_bundle::Manifest) {
         Cell::new("Platform")
             .add_attribute(Attribute::Bold)
             .fg(Color::Green),
-        Cell::new("Layers")
-            .add_attribute(Attribute::Bold)
-            .fg(Color::Green),
-        Cell::new("Size")
-            .add_attribute(Attribute::Bold)
-            .fg(Color::Green),
         Cell::new("Mode")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Green),
+        Cell::new("Layers")
             .add_attribute(Attribute::Bold)
             .fg(Color::Green),
         Cell::new("Persist")
@@ -257,22 +303,18 @@ fn render_manifest_summary(m: &chefer_bundle::Manifest) {
         Cell::new("Ports")
             .add_attribute(Attribute::Bold)
             .fg(Color::Green),
+        Cell::new("Mounts")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Green),
         Cell::new("Depends")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Green),
+        Cell::new("Health")
             .add_attribute(Attribute::Bold)
             .fg(Color::Green),
     ]);
 
     for svc in &m.services {
-        let layers_size: u64 = svc.layers.iter().filter_map(|l| l.size).sum();
-        let ports = if svc.ports.is_empty() {
-            "—".to_string()
-        } else {
-            svc.ports
-                .iter()
-                .map(|p| p.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        };
         let depends = if svc.depends_on.is_empty() {
             "—".to_string()
         } else {
@@ -281,16 +323,97 @@ fn render_manifest_summary(m: &chefer_bundle::Manifest) {
         t.add_row(vec![
             Cell::new(&svc.name).fg(Color::Cyan),
             Cell::new(&svc.platform),
-            Cell::new(svc.layers.len()),
-            Cell::new(ui::human_mb(layers_size)).fg(Color::Yellow),
             Cell::new(format!("{:?}", svc.interface_mode)).fg(Color::Magenta),
+            Cell::new(format_layers(&svc.layers)).fg(Color::Yellow),
             Cell::new(svc.persist_path.as_deref().unwrap_or("—")).fg(Color::Yellow),
-            Cell::new(ports).fg(Color::Blue),
+            Cell::new(format_ports(&svc.ports)).fg(Color::Blue),
+            Cell::new(format_mounts(&svc.mounts)).fg(Color::Blue),
             Cell::new(depends).fg(Color::Magenta),
+            Cell::new(if svc.healthcheck.is_some() {
+                "yes"
+            } else {
+                "no"
+            }),
         ]);
     }
 
     println!("{}", "▎Services (manifest)".bold());
+    println!("{t}");
+    println!();
+
+    render_companions(companions);
+}
+
+fn format_layers(layers: &[chefer_bundle::LayerRef]) -> String {
+    if layers.is_empty() {
+        return "0".to_string();
+    }
+    let total: u64 = layers.iter().filter_map(|l| l.size).sum();
+    let mut parts = vec![format!(
+        "{} total ({})",
+        layers.len(),
+        ui::human_bytes(total)
+    )];
+    for (idx, layer) in layers.iter().enumerate() {
+        let size = layer
+            .size
+            .map(ui::human_bytes)
+            .unwrap_or_else(|| "unknown size".to_string());
+        parts.push(format!("#{idx}: {size}"));
+    }
+    parts.join("\n")
+}
+
+fn format_ports(ports: &[chefer_bundle::PortSpec]) -> String {
+    if ports.is_empty() {
+        "—".to_string()
+    } else {
+        ports
+            .iter()
+            .map(|p| format!("{}:{}/{}", p.host, p.guest, p.proto))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn format_mounts(mounts: &[chefer_bundle::MountSpec]) -> String {
+    if mounts.is_empty() {
+        "—".to_string()
+    } else {
+        mounts
+            .iter()
+            .map(|m| {
+                format!(
+                    "{}:{} ({})",
+                    m.host,
+                    m.guest,
+                    if m.read_only { "ro" } else { "rw" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+fn render_companions(companions: &CompanionInventory) {
+    let mut t = ui::kv_table(24, 76);
+    t.add_row(vec![
+        Cell::new("agents/").fg(Color::Cyan),
+        Cell::new(if companions.agents.is_empty() {
+            "—".to_string()
+        } else {
+            companions.agents.join(", ")
+        }),
+    ]);
+    t.add_row(vec![
+        Cell::new("vm/").fg(Color::Cyan),
+        Cell::new(if companions.vm.is_empty() {
+            "—".to_string()
+        } else {
+            companions.vm.join(", ")
+        }),
+    ]);
+    println!("{}", "▎Embedded companion files".bold());
     println!("{t}");
     println!();
 }
@@ -318,14 +441,54 @@ mod tests {
                 generated_at_utc: "2026-01-01T00:00:00Z".into(),
                 builder_version: "1.2.3".into(),
             },
-            services: vec![],
+            services: vec![chefer_bundle::ServiceEntry {
+                name: "web".into(),
+                platform: "linux/amd64".into(),
+                layers: vec![chefer_bundle::LayerRef {
+                    rel_path: "services/web/layers/0000-aaaaaaaaaaaa.tar.zst".into(),
+                    diff_id:
+                        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                            .into(),
+                    size: Some(2048),
+                }],
+                image_config: chefer_bundle::ImageConfig::default(),
+                cmd_override: None,
+                env: Default::default(),
+                workdir_override: None,
+                persist_path: Some("/data".into()),
+                ports: vec![chefer_bundle::PortSpec {
+                    host: 18080,
+                    guest: 8080,
+                    proto: chefer_bundle::PortProto::Tcp,
+                }],
+                mounts: vec![chefer_bundle::MountSpec {
+                    host: "/host".into(),
+                    guest: "/mnt/host".into(),
+                    read_only: true,
+                }],
+                interface_mode: chefer_bundle::InterfaceMode::None,
+                depends_on: vec!["db".into()],
+                healthcheck: Some(chefer_bundle::HealthCheck {
+                    test: chefer_bundle::CmdSpec::Argv(vec!["true".into()]),
+                    interval_ms: 1000,
+                    timeout_ms: 1000,
+                    retries: 1,
+                    start_period_ms: 0,
+                }),
+            }],
         };
         m.save(&chefer_bundle::layout::manifest_path(&bundle))
             .unwrap();
+        std::fs::create_dir_all(bundle.join("agents")).unwrap();
+        std::fs::write(bundle.join("agents/guest-agent-x86_64"), b"agent").unwrap();
+        std::fs::write(bundle.join("agents/pasta-x86_64"), b"pasta").unwrap();
+        std::fs::create_dir_all(bundle.join("vm")).unwrap();
+        std::fs::write(bundle.join("vm/chefer-vmlinuz-x86_64"), b"kernel").unwrap();
+        std::fs::write(bundle.join("vm/chefer-initramfs-x86_64"), b"initramfs").unwrap();
         // 額外放一個大一點的檔，確認 inspect 只取 manifest 也能正確跳過其他 entry
-        std::fs::create_dir_all(bundle.join("services/db/layers")).unwrap();
+        std::fs::create_dir_all(bundle.join("services/web/layers")).unwrap();
         std::fs::write(
-            bundle.join("services/db/layers/0000-aaaaaaaaaaaa.tar.zst"),
+            bundle.join("services/web/layers/0000-aaaaaaaaaaaa.tar.zst"),
             vec![0u8; 300_000],
         )
         .unwrap();
@@ -349,9 +512,23 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let single = make_single_file(tmp.path());
         let footer = chefer_bundle::Footer::read_from_file(&single).unwrap();
-        let m = read_embedded_manifest(&single, &footer).unwrap();
-        assert_eq!(m.app.name, "InspectMe");
-        assert_eq!(m.app.app_version.as_deref(), Some("1.2.3"));
+        let payload = read_embedded_payload(&single, &footer).unwrap();
+        assert_eq!(payload.manifest.app.name, "InspectMe");
+        assert_eq!(payload.manifest.app.app_version.as_deref(), Some("1.2.3"));
+        assert!(
+            payload
+                .companions
+                .agents
+                .contains(&"guest-agent-x86_64".to_string()),
+            "應列出內嵌 guest-agent"
+        );
+        assert!(
+            payload
+                .companions
+                .vm
+                .contains(&"chefer-vmlinuz-x86_64".to_string()),
+            "應列出內嵌 appliance"
+        );
     }
 
     #[test]
@@ -378,7 +555,7 @@ mod tests {
 
         // 手刻一個 GNU 長檔名（'L'）entry，宣告 size 略高於 inspect 上限，內容為零。
         // 真實攻擊可宣告數 GB；此處取剛好超過上限即足以證明限制器在 OOM 前生效。
-        let bomb_size: u64 = MAX_INSPECT_INFLATE_BYTES + 16 * 1024 * 1024;
+        let bomb_size: u64 = chefer_bundle::bomb_limit_for(1) + 16 * 1024 * 1024;
         let mut h = tar::Header::new_gnu();
         h.set_entry_type(tar::EntryType::GNULongName);
         h.set_mode(0);
@@ -416,11 +593,35 @@ mod tests {
         }
 
         // 限制器須在配置數 GB 之前回錯，而非 OOM。
-        let err = read_embedded_manifest(&exe, &ft).unwrap_err();
+        let err = read_embedded_payload(&exe, &ft).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             msg.contains("exceeds the limit") || msg.contains("manifest.json"),
             "應因超過解壓上限而報錯：{msg}"
         );
+    }
+
+    #[test]
+    fn formatting_helpers_include_requested_details() {
+        let layers = vec![chefer_bundle::LayerRef {
+            rel_path: "services/web/layers/0000-a.tar.zst".into(),
+            diff_id: "sha256:a".into(),
+            size: Some(2048),
+        }];
+        assert!(format_layers(&layers).contains("#0: 2.00 KiB"));
+
+        let ports = vec![chefer_bundle::PortSpec {
+            host: 18080,
+            guest: 8080,
+            proto: chefer_bundle::PortProto::Tcp,
+        }];
+        assert_eq!(format_ports(&ports), "18080:8080/tcp");
+
+        let mounts = vec![chefer_bundle::MountSpec {
+            host: "/host".into(),
+            guest: "/guest".into(),
+            read_only: true,
+        }];
+        assert_eq!(format_mounts(&mounts), "/host:/guest (ro)");
     }
 }
