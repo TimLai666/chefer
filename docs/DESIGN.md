@@ -6,7 +6,7 @@
 
 - **依賴版本**：新增依賴一律用 `cargo add`（由 crates.io 解析），**禁止手寫猜測版本號**。專案自身版本號不主動調整。
 - **可編譯性**：整個 workspace 必須在 Windows / Linux / macOS 三平台都能 `cargo build`。平台限定邏輯用 `#[cfg(target_os = "...")]` 隔離，其他平台給出可編譯的 stub（回傳明確錯誤）。
-- **語言**：程式註解與使用者訊息以繁體中文為主（與既有程式碼一致）；錯誤訊息需可行動（說明缺什麼、怎麼補）。
+- **語言**：所有給使用者看的輸出一律使用英文（CLI 的 println/eprintln、錯誤訊息、clap help、驗證訊息、init scaffold、examples 註解）；程式碼註解、`docs/DESIGN.md`、commit message、PR 描述、`#[cfg(test)]` 斷言訊息一律使用繁體中文。錯誤訊息需可行動（說明缺什麼、怎麼補）。
 - **安全**：所有 tar 解包都必須做路徑安全檢查（拒絕絕對路徑、`..`、Windows 前綴）；symlink/hardlink 目標必須限制在解壓根目錄內。
 - 編輯既有 crate 時維持 `edition = "2024"`。
 
@@ -416,6 +416,7 @@ AppCipe 新增 app 級欄位 **`console`**（appcipe-spec enum `ConsoleMode`，s
   - `check [path] [--format pretty|json|yaml]`：驗證 + 摘要（沿用現有表格 UI）。
   - `build [path] [--out dist] [--target <triple>]... [--kit-dir <dir>] [--dry-run] [--zstd-level N]`：load → pack → 對每個 target 找 runtime → assemble → 印出輸出路徑與大小。預設 target = host triple（編譯期 `BUILD_TARGET`）。
   - `run [path] [--build 之參數]`：build（單一 host target）後直接執行產物，stdio 直通。
+  - `doctor [--kit-dir <dir>]...`：檢查目前 host 是否具備 build/run Chefer app 的基本條件；輸出每項 PASS/WARN/FAIL 與英文可行動建議。檢查 OS/arch、平台後端前提（Windows WSL2、Linux root 或 unprivileged user namespaces）、kit 探索（沿用 `chefer_bundle::kit`）、Chefer 版本/build 資訊，以及平台預設 data 目錄是否可寫。任一 FAIL → exit code 非 0。
   - `inspect <single-file>`：讀 footer + 解出 manifest.json 摘要（不執行）；含 **「Packed by chefer」**＝打包該單檔的 chefer 版本（取自 manifest 的 `app.builder_version`，由 `build` 寫入自身 `CARGO_PKG_VERSION`；舊 bundle 無此欄位則顯示 unknown）。
   - `version` / `upgrade`：repo = `TimLai666/chefer`（常數修正）。`upgrade` 經 HTTPS（rustls）自 GitHub Releases 取得**目前 host target 的完整 kit 壓縮包**並**同時替換 `chefer` 二進位與整個 `kit/`**（sha256 驗證、含 rollback），而不是只替換單一二進位——CLI 與 kit 永遠同版本、不會漂移。
     - asset 命名沿用 release workflow：`chefer_<tag>_<target>.zip`（Windows）或 `chefer_<tag>_<target>.tar.gz`（Linux/macOS）；`<tag>` 取自 GitHub Release tag/version，不在程式碼硬寫。

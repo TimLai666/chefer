@@ -143,6 +143,7 @@ cargo run -p chefer-cli -- build examples/gui-demo/appcipe.yml --out dist
 | `chefer check [path] [--format pretty\|json\|yaml]` | Parse and validate the recipe, print a summary. |
 | `chefer build [path] [--out <dir>] [--target <triple>]... [--kit-dir <dir>]... [--zstd-level N] [--no-embed-original] [--dry-run]` | Package into single-file executable(s); `--target` may be repeated, defaults to the host target. |
 | `chefer run [path] [build options]` | Build for the host target, then run the artifact immediately (stdio passthrough, exit code propagated). |
+| `chefer doctor [--kit-dir <dir>]...` | Check whether the current machine can build/run Chefer apps; prints PASS/WARN/FAIL diagnostics with actionable fixes. |
 | `chefer inspect <file>` | Show the footer and embedded manifest summary of a Chefer single-file executable (no execution, no extraction). |
 | `chefer version` | Show Chefer and environment version info. |
 | `chefer upgrade [--channel stable] [--to <ver>] [--check-only]` | Self-update from GitHub Releases — replaces **both** the `chefer` binary and the whole `kit/` together (sha256-verified, with rollback), so the CLI and kit never drift apart. |
