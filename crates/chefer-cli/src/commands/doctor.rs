@@ -1,7 +1,6 @@
 //! `chefer doctor` — 檢查目前機器是否具備 build/run Chefer app 的基本條件。
 
 use std::path::PathBuf;
-use std::process::Command;
 
 use anyhow::{Context, Result};
 use comfy_table::{Attribute, Cell, Color, ColumnConstraint, ContentArrangement, Table, Width};
@@ -134,7 +133,10 @@ fn check_backend_prerequisite() -> DoctorCheck {
 
 #[cfg(target_os = "windows")]
 fn check_wsl_status() -> DoctorCheck {
-    match Command::new("wsl.exe").arg("--status").output() {
+    match std::process::Command::new("wsl.exe")
+        .arg("--status")
+        .output()
+    {
         Ok(out) if out.status.success() => DoctorCheck::pass(
             "WSL2 backend",
             "wsl.exe --status completed successfully.",
@@ -195,7 +197,7 @@ fn check_linux_userns() -> DoctorCheck {
 
 #[cfg(target_os = "linux")]
 fn current_uid() -> Result<u32> {
-    let out = Command::new("id")
+    let out = std::process::Command::new("id")
         .arg("-u")
         .output()
         .context("failed to execute id -u")?;
