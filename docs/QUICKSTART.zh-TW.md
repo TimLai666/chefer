@@ -38,7 +38,7 @@ chefer init
 - `name:` — 應用名稱（也是輸出檔名與資料目錄名）
 - `services.<服務名>.image:` — 指向步驟 1 匯出的 tar（路徑可相對於 appcipe.yml）
 
-常用選填欄位：`ports`（埠映射 `"host:guest[/proto]"`）、`env`、`persist_path`（容器內要持久化的路徑）、`mounts`、`depends_on`、`interface_mode`。完整範例見 [examples/appcipe.yml](../examples/appcipe.yml)。
+常用選填欄位：`ports`（埠映射 `"host:guest[/proto]"`）、`env`、`persist_path`（容器內要持久化的路徑）、`mounts`、`depends_on`、`healthcheck`、`interface_mode`。完整範例見 [examples/appcipe.yml](../examples/appcipe.yml)。
 
 改完先驗證：
 
@@ -62,7 +62,7 @@ chefer build --target x86_64-unknown-linux-musl --target aarch64-apple-darwin
 
 1. 驗證並解壓內嵌的 bundle 到暫存目錄
 2. 建立資料目錄、啟動埠映射
-3. 在容器隔離環境內依 `depends_on` 順序啟動所有服務
+3. 在容器隔離環境內依 `depends_on` 順序啟動所有服務；若服務有 `healthcheck`，會等到 healthy 才繼續啟動後續服務
 4. 任一服務以非 0 退出 → 整體退出並透傳 exit code（fail_fast）
 
 ### Windows 使用者注意事項
@@ -89,4 +89,4 @@ chefer build --target x86_64-unknown-linux-musl --target aarch64-apple-darwin
 
 - **build 報找不到 runtime / guest-agent？** 確認 `kit/` 與 chefer 在同一目錄，或用 `--kit-dir` / `CHEFER_KIT_DIR` 指定；也可從 GitHub Releases 重新下載完整包。
 - **打包 Windows / macOS 目標時要求 guest-agent？** 這兩種目標必須內嵌 musl guest-agent（Releases 的 kit 已含 x86_64 與 aarch64 兩種）。
-- **服務啟動順序？** `depends_on` 只決定先後順序，沒有健康檢查；需要等待依賴就緒的服務請自行在 entrypoint 重試。
+- **服務啟動順序？** `depends_on` 會決定拓撲啟動順序；若被依賴服務有 `healthcheck`，Chefer 會等它 healthy 後才啟動後續服務。沒有 `healthcheck` 的服務仍是啟動後即視為 ready。

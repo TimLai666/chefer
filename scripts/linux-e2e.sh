@@ -1135,7 +1135,7 @@ main() {
 
   docker image rm "$image" >/dev/null 2>&1 || true
   CLEANUP_IMAGE=""
-  note "Linux E2E passed: docker save -> chefer build -> single-file run, rootless namespaces, persist, fail_fast, host!=guest port mapping, network isolation${gui_summary}"
+  note "Linux E2E passed: docker save -> chefer build -> single-file run, rootless namespaces, persist, fail_fast, healthcheck gating, host!=guest port mapping, network isolation${gui_summary}"
 }
 
 main "$@"
