@@ -10,6 +10,7 @@ services:
   # Database: official redis, **pulled straight from the registry** (no docker save). Pin the tag for reproducibility.
   # No ports -> it is never bridged out; the default network: bridge gives this app its own netns,
   # so the db is genuinely unreachable from the host (internal only). app connects to it at 127.0.0.1:6379 (services in the same app share the netns).
+  # The healthcheck gates dependents: app will not start until Redis answers PING.
   # Note: the official redis entrypoint does chown/gosu to redis uid 999 -- this works on WSL2 / macOS VM /
   # native Linux running as root; on native Linux rootless, the single-uid mapping makes it fail (see Roadmap).
   db:
@@ -17,6 +18,11 @@ services:
     cmd: ["redis-server", "--bind", "127.0.0.1", "--appendonly", "yes", "--dir", "/data"]
     persist_path: /data            # redis's AOF lands here, so data survives app restarts
     interface_mode: none
+    healthcheck:
+      test: ["CMD", "redis-cli", "-h", "127.0.0.1", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
 
   # Application: an HTTP service that connects to db to keep a count. Only this service exposes a port (18080 -> 8080 inside the container).
   app:
@@ -27,4 +33,4 @@ services:
       PORT: "8080"
     ports: ["18080:8080"]          # the only externally exposed port
     interface_mode: none
-    depends_on: [db]               # start db first (app still retries the connection on startup)
+    depends_on: [db]               # wait until db's healthcheck is healthy, then start app

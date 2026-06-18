@@ -2,7 +2,8 @@
 每次 GET / 對計數器 +1 並回傳。計數存在 redis、由 redis 持久化到 /data，
 因此整個 app 重啟後計數仍會延續。
 
-depends_on 只保證「db 先啟動」，不保證就緒，故啟動時對 db 做重試連線。
+appcipe.yml 裡的 db healthcheck 會讓 Chefer 等 Redis ready 後才啟動 app。
+這裡仍保留短暫重試，作為網路或程序瞬間抖動時的防線。
 """
 
 import os
