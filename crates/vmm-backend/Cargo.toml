@@ -16,3 +16,4 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_
 
 [dev-dependencies]
 serde_json = "1.0.145"
+tempfile = "3.27.0"

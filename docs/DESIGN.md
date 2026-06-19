@@ -41,10 +41,12 @@
 bundle/
 ├─ manifest.json                  # 唯一執行協定（schema 見 §3）
 ├─ appcipe.yml                    # （選）原始設定回寫
-├─ agents/                        # （選）內嵌 guest-agent 靜態 musl 二進位
+├─ agents/                        # （選）內嵌 guest-agent 與 VM host helper
 │  ├─ guest-agent-x86_64          # 對應 linux/amd64
-│  └─ guest-agent-aarch64         # 對應 linux/arm64
-├─ vm/                            # （選）macOS 目標內嵌的 Linux micro-VM appliance
+│  ├─ guest-agent-aarch64         # 對應 linux/arm64
+│  ├─ chefer-vz-helper-<arch>     # （選）macOS vz host helper
+│  └─ chefer-whp-helper-<arch>.exe # （選）Windows WHP host helper
+├─ vm/                            # （選）VM 目標內嵌的 Linux micro-VM appliance
 │  ├─ chefer-vmlinuz-<arch>       # 預編 Linux kernel
 │  └─ chefer-initramfs-<arch>     # 最小 initramfs（/init 掛 virtiofs 後 exec guest-agent）
 └─ services/
@@ -57,7 +59,7 @@ bundle/
 
 - 層檔名：`{序號:04}-{diff_id去掉"sha256:"後取前12碼}.tar.zst`。
 - `agents/` 規則：建置 Windows / macOS 目標的單檔時**必須**內嵌對應 guest 架構的 agent（缺少時 build 報錯並說明如何取得 kit）；Linux 目標可省略（Linux 後端 in-process 執行）。
-- `vm/` 規則：建置 macOS 目標的單檔時內嵌 Linux appliance（kernel+initramfs）到 `vm/`，並把 vz 開機 helper（`chefer-vz-helper-<arch>`）內嵌到 `agents/`；兩者皆 best-effort——kit 缺少時 build 以警告略過（產物仍可組裝，僅 macOS 執行時 vz 後端回報不可用，或可用 `CHEFER_VZ_HELPER` 指向自建 helper），不阻斷建置。release kit 兩種 darwin 架構的 appliance 與 helper 皆出貨（helper 以 virtualization entitlement ad-hoc 簽章；正式對外散布尚需 Developer ID 簽章 + notarization）。
+- `vm/` 規則：建置 VM 目標的單檔時內嵌 Linux appliance（kernel+initramfs）到 `vm/`，並把對應 host helper 內嵌到 `agents/`：macOS `vz` 使用 `chefer-vz-helper-<arch>`，Windows `whp` 使用 `chefer-whp-helper-<arch>.exe`。兩者皆 best-effort——kit 缺少時 build 以警告略過（產物仍可組裝，僅執行時由對應後端回報不可用；macOS 另可用 `CHEFER_VZ_HELPER` 指向自建 helper），不阻斷建置。release kit 兩種 darwin/windows host 架構的 appliance 與 helper 皆出貨（vz helper 以 virtualization entitlement ad-hoc 簽章；正式對外散布尚需 Developer ID 簽章 + notarization）。
 
 ## 3. manifest.json schema（chefer-bundle::Manifest）
 
@@ -161,9 +163,9 @@ bundle/
 - `footer::{Footer, FOOTER_LEN, FLAG_ZSTD, MAGIC}`：`Footer::read_from_file(path)`、`Footer::write_bytes(&self) -> [u8; 80]`、欄位同 §4。
 - `PortSpec::parse("host:guest[/proto]")`（預設 tcp；驗證 1..=65535）。
 - `MountSpec::parse("<host>:<guest>")`：從**右往左**切一次 `:`（相容 `C:\`）。
-- layout 輔助：`manifest_path(bundle_dir)`、`service_layers_dir(bundle_dir, svc)`、`agents_dir(bundle_dir)`、`guest_agent_name(arch)`、`platform_to_arch(platform)`、`layer_file_name(idx, diff_id)`。
+- layout 輔助：`manifest_path(bundle_dir)`、`service_layers_dir(bundle_dir, svc)`、`agents_dir(bundle_dir)`、`guest_agent_name(arch)`、`pasta_name(arch)`、`vz_helper_name(arch)`、`whp_helper_name(arch)`、`platform_to_arch(platform)`、`layer_file_name(idx, diff_id)`。
 - `topo_sort(services) -> Result<Vec<&ServiceEntry>>`（depends_on 拓撲排序；偵測循環）。
-- `kit` 模組（**kit 探索統一在此**，pack/assembler/cli 共用）：`default_kit_dirs()`、`find_runtime(kit_dirs, target, allow_plain)`、`find_guest_agent(kit_dirs, arch)`、`find_appliance(kit_dirs, arch)`、`runtime_file_name(target)`、`not_found_help(...)`。
+- `kit` 模組（**kit 探索統一在此**，pack/assembler/cli 共用）：`default_kit_dirs()`、`find_runtime(kit_dirs, target, allow_plain)`、`find_guest_agent(kit_dirs, arch)`、`find_pasta(kit_dirs, arch)`、`find_appliance(kit_dirs, arch)`、`find_vz_helper(kit_dirs, arch)`、`find_whp_helper(kit_dirs, arch)`、`runtime_file_name(target)`、`not_found_help(...)`。
 
 ### appcipe-spec（lib）
 - 維持 `from_file/from_str`（內容=解析+驗證；**路徑正規化移到 normalize**。spec **不得**依賴 normalize——正式入口是 `appcipe_normalize::load`，CLI/pack 一律走那裡）。
@@ -205,7 +207,7 @@ bundle/
   4. 從 image config 抽出 `ImageConfig`（Entrypoint/Cmd/Env/WorkingDir/User/ExposedPorts）。
   5. 寫 manifest.json（用 chefer-bundle 型別）。
   6. 從 kit 複製 guest-agent 到 `agents/`（依 services 用到的 arch 去重；`require_agents=false` 時缺少僅警告）。
-  7. 若 `target_triples` 含 macOS target，從 kit best-effort 複製對應架構的 appliance 到 `vm/`；缺少 `chefer-vmlinuz-<arch>` 或 `chefer-initramfs-<arch>` 時只警告、不阻斷建置，產物在 macOS 執行時由 vz 後端回報明確不可用原因。
+  7. 若 `target_triples` 含 VM target，從 kit best-effort 複製對應架構的 appliance 到 `vm/`，並複製對應 host helper 到 `agents/`：macOS target 需要 `chefer-vz-helper-<arch>`，Windows target 需要 `chefer-whp-helper-<arch>.exe`；缺少時只警告、不阻斷建置，產物在執行時由對應後端回報明確不可用原因。
 - **mount host 路徑檢查（便利性防呆，非正確性需求）**：打包前對各 service bind mount 的 host 半邊在**打包機**上做存在性檢查。但 manifest 只存該絕對路徑字串，guest-agent 於執行期會在**真正的執行 host** 重新檢查（見 guest-agent 服務啟動節：「bind mounts（host 路徑不存在→啟動前報錯）」），故此 build 期檢查只在 **打包機 == 執行機** 時才有意義。
   - 真正能確定「打包機 == 執行機」的只有 `chefer run` 在**非 VM 後端**時（本機建置、本機立即執行）。`chefer build` 產出的單檔本來就是要散布到別台機器執行，在打包機檢查路徑等於檢查錯的機器；VM 後端（macOS vz／appliance）的 host 是 guest VM，同樣 host≠build-host（bind 的 host 半邊常是 guest 路徑如 `/mnt/data/...`）。
   - 因此 `PackOptions.local_run` 區分兩條路：**只有 `local_run == true` 且 build 不含 VM（darwin）目標時，缺路徑為 fail-fast 錯誤**；其餘（`chefer build`、或任何含 darwin 目標的 build）一律降級為**警告**，交由執行期在真正的 host 重新檢查。CLI：`chefer run` 設 `local_run=true`、`chefer build` 設 `false`。`scripts/qemu-e2e.sh` 走 `chefer build`（已是寬鬆），故不需在 runner 上預建 guest 路徑。
@@ -260,7 +262,7 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
   4. 注意命令注入：所有外部參數都走 argv 陣列（`std::process::Command` 個別 arg），絕不組 shell 字串。
   5. **網路（實測）**：WSL2 的 localhost 轉送（wslrelay）只綁 IPv6 `[::1]`；runtime TCP 埠代理後端因此「先試 127.0.0.1、再退 [::1]」，且對 `host == guest` 的 TCP 埠在 Windows 上加 best-effort 的 IPv4 補橋（127.0.0.1:port → [::1]:port）。
   6. **UDP 埠映射（已解決，實測）**：wslrelay 不轉 UDP，故 wsl2 後端在啟動 guest-agent 前先以 `wsl -d <distro> --exec /bin/guest-agent vmip` 取得 VM eth0 的 IPv4，對每個 UDP PortSpec（含 `host == guest`）於 host 端起 `127.0.0.1:host → <vm_ip>:guest` 的 session relay；並以 `--udp-bridge` 旗標叫 guest-agent 在 VM 內補起 `<vm_ip>:guest → 127.0.0.1:guest` 橋接（涵蓋服務只綁 loopback 的情形；服務綁 0.0.0.0 則直接命中、橋接以 EADDRINUSE 略過）。VM IP 每次啟動現查（NAT 模式下會變）。已知殘留：服務若綁 0.0.0.0 且 bind 時機晚於 VM 內橋接（橋接已設寬限期降低機率），可能與橋接搶埠——屬罕見且會以明確 bind 錯誤呈現、可重試。
-  7. **規劃中：免 WSL 的 `whp` 後端**：以 **Windows Hypervisor Platform（WHP）** 開機 bundle 內附的 Linux micro-VM appliance（與 macOS `vz` 共用同一 kernel/initramfs/guest-agent），作為 `wsl2` 的替代後端，移除對 WSL2 的依賴（仍需硬體虛擬化 + WHP 功能）。對完全無虛擬化的機器，另可選擇性 bundle 軟體模擬（QEMU/TCG）作為最終備援（可跑但慢）。backend 抽象（`ExecBackend`）已納入 `whp` skeleton，Windows 後端排序為 `wsl2` → `whp`；目前 `whp` 會先以 `WinHvPlatform.dll` + `WHvGetCapability(HypervisorPresent)` 做 host preflight，但仍誠實回傳 `Unavailable`，不影響既有 WSL2 執行路徑。guest 側（appliance + guest-agent）已就緒，下一步是補 WHP host shim。
+  7. **規劃中：免 WSL 的 `whp` 後端**：以 **Windows Hypervisor Platform（WHP）** 開機 bundle 內附的 Linux micro-VM appliance（與 macOS `vz` 共用同一 kernel/initramfs/guest-agent），作為 `wsl2` 的替代後端，移除對 WSL2 的依賴（仍需硬體虛擬化 + WHP 功能）。對完全無虛擬化的機器，另可選擇性 bundle 軟體模擬（QEMU/TCG）作為最終備援（可跑但慢）。backend 抽象（`ExecBackend`）已納入 `whp` skeleton，Windows 後端排序為 `wsl2` → `whp`；目前 `whp` 會先以 `WinHvPlatform.dll` + `WHvGetCapability(HypervisorPresent)` 做 host preflight，並在有 bundle context 時檢查 `vm/chefer-vmlinuz-<arch>`、`vm/chefer-initramfs-<arch>`、`agents/chefer-whp-helper-<arch>.exe` 是否存在，但仍誠實回傳 `Unavailable`，不影響既有 WSL2 執行路徑。guest 側（appliance + guest-agent）已就緒，host helper contract 已固定為 CLI 介面：`chefer-whp-helper --kernel <p> --initramfs <p> --cmdline <s> --bundle-dir <p> --data-dir <p> --cpus <n> --memory-mib <n>`，helper stdout 後續會沿用 appliance console 標記 `CHEFER_GUEST_IP=<ipv4>` / `CHEFER_GUEST_EXIT=<code>`；目前 helper 是 not-implemented skeleton，下一步是補 WHP device model / VM boot shim。
 - **macOS**（`vz`，Apple Virtualization.framework）：macOS 沒有現成 Linux，必須自行開一台輕量 Linux micro-VM 來跑容器。設計如下（**狀態：契約已定 + 跨平台純邏輯已實作並測試；Linux appliance 建置與 QEMU E2E 已納入 scripts/CI；開機改採內附 Swift helper（見下），其 swiftc 編譯與 Rust 後端 compile-check 已納入 CI，VM 真正開機仍待在實體 Mac 上驗證**——在實機驗證通過前 `availability()` 預設 `Unavailable`，需 `CHEFER_VZ_EXPERIMENTAL=1` 才啟用，不偽稱可執行）。
   - **Appliance（kit 內附預編 kernel）**：kit 與 macOS 目標的 bundle 內附一份精簡 Linux 開機組合：
     - `vm/chefer-vmlinuz-<arch>`：預編 Linux kernel（含 virtio-blk/virtiofs/virtio-net/overlayfs）。
@@ -416,7 +418,7 @@ AppCipe 新增 app 級欄位 **`console`**（appcipe-spec enum `ConsoleMode`，s
   - `check [path] [--format pretty|json|yaml]`：驗證 + 摘要（沿用現有表格 UI）。
   - `build [path] [--out dist] [--target <triple>]... [--kit-dir <dir>] [--dry-run] [--zstd-level N]`：load → pack → 對每個 target 找 runtime → assemble → 印出輸出路徑與大小。預設 target = host triple（編譯期 `BUILD_TARGET`）。
   - `run [path] [--build 之參數]`：build（單一 host target）後直接執行產物，stdio 直通。
-  - `doctor [--kit-dir <dir>]...`：檢查目前 host 是否具備 build/run Chefer app 的基本條件；輸出每項 PASS/WARN/FAIL 與英文可行動建議。檢查 OS/arch、平台後端前提（Windows WSL2 + 規劃中的 WHP fallback host preflight、Linux root 或 unprivileged user namespaces）、kit 探索（沿用 `chefer_bundle::kit`）、Chefer 版本/build 資訊，以及平台預設 data 目錄是否可寫。任一 FAIL → exit code 非 0。
+  - `doctor [--kit-dir <dir>]...`：檢查目前 host 是否具備 build/run Chefer app 的基本條件；輸出每項 PASS/WARN/FAIL 與英文可行動建議。檢查 OS/arch、平台後端前提（Windows WSL2 + 規劃中的 WHP fallback host preflight、Linux root 或 unprivileged user namespaces）、kit 探索（沿用 `chefer_bundle::kit`，含 guest-agent/pasta/appliance/vz helper/whp helper）、Chefer 版本/build 資訊，以及平台預設 data 目錄是否可寫。任一 FAIL → exit code 非 0。
   - `inspect <single-file>`：讀 footer + 串流掃描 payload tar（不執行、不落地解壓），顯示 manifest 摘要、app network/console、payload 大小、**「Packed by chefer」**（取自 manifest 的 `app.builder_version`，舊 bundle 無此欄位則顯示 unknown）、每個 service 的 platform/layers/各層壓縮大小/persist/ports/mounts/interface/depends_on/healthcheck，以及內嵌 `agents/`、`vm/` 協力檔清單。
   - `version` / `upgrade`：repo = `TimLai666/chefer`（常數修正）。`upgrade` 經 HTTPS（rustls）自 GitHub Releases 取得**目前 host target 的完整 kit 壓縮包**並**同時替換 `chefer` 二進位與整個 `kit/`**（sha256 驗證、含 rollback），而不是只替換單一二進位——CLI 與 kit 永遠同版本、不會漂移。
     - asset 命名沿用 release workflow：`chefer_<tag>_<target>.zip`（Windows）或 `chefer_<tag>_<target>.tar.gz`（Linux/macOS）；`<tag>` 取自 GitHub Release tag/version，不在程式碼硬寫。
@@ -426,7 +428,7 @@ AppCipe 新增 app 級欄位 **`console`**（appcipe-spec enum `ConsoleMode`，s
     - 解壓到同目錄暫存資料夾；安全檢查每個 archive entry（拒絕絕對路徑、Windows 前綴、`..`、空路徑）。解壓後必須剛好得到 `chefer_<tag>_<target>/` 根目錄，內含 `chefer[.exe]` 與 `kit/chefer-runtime-*`、`kit/guest-agent-x86_64`、`kit/guest-agent-aarch64`。
     - 驗證完整後，先以 `self_replace` 替換目前執行中的 `chefer`，再以暫存 `kit/` 原子性（同檔案系統 rename）替換目前執行檔旁的 `kit/`；若任一步失敗，錯誤訊息需指出可手動解壓 release kit 覆蓋安裝目錄。
     - 傳輸層受 TLS 保護，且 `.sha256` 可偵測下載損毀；但**不驗證發佈產物簽章**。供應鏈強化（防 release/帳號層級妥協）的後續方向：啟用 self_update 的 `signatures` feature + 內嵌 maintainer 簽章公鑰，對 Release 資產以 zipsign 簽署。
-    - release workflow 在上傳前必須以 `scripts/verify-release-kit.sh` 驗證每個 kit 壓縮包與 `.sha256`：檔名安全、checksum 正確、唯一根目錄、host CLI、六個 runtime、兩個 guest-agent、兩個架構的 macOS appliance（kernel + initramfs），且不含 symlink/special entry。workflow 先以 preflight 驗證 tag 存在於 `refs/tags/<tag>`、可 resolve 到 commit，且 tag 僅含 `A-Za-z0-9._-` 並以英數字開頭；`workflow_dispatch` dry-run 必須要求輸入既有 git tag，checkout 該 tag 後跑同一套六目標 build/package/verify，但只上傳 Actions artifacts、不掛到 GitHub Release；published release 則使用 release tag 並上傳 release assets。
+    - release workflow 在上傳前必須以 `scripts/verify-release-kit.sh` 驗證每個 kit 壓縮包與 `.sha256`：檔名安全、checksum 正確、唯一根目錄、host CLI、六個 runtime、兩個 guest-agent、兩個架構的 macOS appliance（kernel + initramfs）、兩個 VZ helper、兩個 WHP helper，且不含 symlink/special entry。workflow 先以 preflight 驗證 tag 存在於 `refs/tags/<tag>`、可 resolve 到 commit，且 tag 僅含 `A-Za-z0-9._-` 並以英數字開頭；`workflow_dispatch` dry-run 必須要求輸入既有 git tag，checkout 該 tag 後跑同一套六目標 build/package/verify，但只上傳 Actions artifacts、不掛到 GitHub Release；published release 則使用 release tag 並上傳 release assets。
 - 錯誤輸出統一走 `anyhow` context；user-facing 摘要維持彩色表格。
 
 ## 7. 平台支援矩陣（v1 目標）
@@ -434,7 +436,7 @@ AppCipe 新增 app 級欄位 **`console`**（appcipe-spec enum `ConsoleMode`，s
 | 能力 | Linux | Windows | macOS |
 |---|---|---|---|
 | `chefer build`（產任意平台單檔，給定 kit）| ✅ | ✅ | ✅ |
-| 單檔執行（linux/amd64,arm64 服務）| ✅ namespaces | ✅ WSL2；🔜 whp skeleton + host preflight（明確 Unavailable） | 🔜 vz 骨架（明確錯誤）|
+| 單檔執行（linux/amd64,arm64 服務）| ✅ namespaces | ✅ WSL2；🔜 whp helper contract + host/bundle preflight（明確 Unavailable） | 🔜 vz 骨架（明確錯誤）|
 | GUI 服務 | ✅ X11/Wayland socket 直通 | ✅ WSLg | 🔜 |
 | windows/amd64 容器 | ❌（驗證期報「尚未支援」）| ❌ 同左 | ❌ |
 

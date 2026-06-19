@@ -166,7 +166,7 @@ fn check_whp_status() -> DoctorCheck {
         vmm_backend::Availability::Unavailable(reason) => DoctorCheck::warn(
             "WHP backend",
             reason,
-            "Use the WSL2 backend today; WHP will become the non-WSL Windows backend after the host shim is implemented.",
+            "Use the WSL2 backend today; WHP will become the non-WSL Windows backend after the VM boot shim is implemented.",
         ),
     }
 }
@@ -326,6 +326,7 @@ fn check_kit(extra_kit_dirs: &[PathBuf]) -> Vec<DoctorCheck> {
         });
         checks.push(check_appliance(&kit_dirs, arch));
         checks.push(check_vz_helper(&kit_dirs, arch));
+        checks.push(check_whp_helper(&kit_dirs, arch));
     }
 
     checks
@@ -402,6 +403,24 @@ fn check_vz_helper(kit_dirs: &[PathBuf], arch: &str) -> DoctorCheck {
                 chefer_bundle::layout::vz_helper_name(arch)
             ),
             "macOS VM execution needs the VZ helper from the latest release kit.",
+        ),
+    }
+}
+
+fn check_whp_helper(kit_dirs: &[PathBuf], arch: &str) -> DoctorCheck {
+    match chefer_bundle::kit::find_whp_helper(kit_dirs, arch) {
+        Some(path) => DoctorCheck::pass(
+            "Kit: WHP helper",
+            format!("Found {}.", path.display()),
+            "No action needed.",
+        ),
+        None => DoctorCheck::warn(
+            "Kit: WHP helper",
+            format!(
+                "{} was not found.",
+                chefer_bundle::layout::whp_helper_name(arch)
+            ),
+            "Windows without WSL2 will need the WHP helper after the VM boot shim is implemented.",
         ),
     }
 }

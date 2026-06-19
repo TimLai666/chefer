@@ -563,6 +563,54 @@ fn pack_copies_macos_appliance_from_kit_when_targeting_darwin() {
 }
 
 #[test]
+fn pack_copies_windows_whp_assets_from_kit_when_targeting_windows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (image_tar, _) = build_docker_archive(tmp.path(), "linux", "amd64", None);
+
+    let kit_dir = tmp.path().join("kit");
+    std::fs::create_dir_all(&kit_dir).unwrap();
+    std::fs::write(kit_dir.join("guest-agent-x86_64"), b"fake-musl-agent").unwrap();
+    std::fs::write(kit_dir.join("chefer-vmlinuz-x86_64"), b"fake-kernel").unwrap();
+    std::fs::write(kit_dir.join("chefer-initramfs-x86_64"), b"fake-initramfs").unwrap();
+    std::fs::write(
+        kit_dir.join("chefer-whp-helper-x86_64.exe"),
+        b"fake-whp-helper",
+    )
+    .unwrap();
+
+    let svc = make_service(ImageSourceOrPath::Full {
+        source: ImageSourceType::Tar,
+        file: image_tar.to_string_lossy().to_string(),
+        format: ImageFormat::DockerArchive,
+        platform: ImagePlatform::LinuxAmd64,
+        context: None,
+        build_args: Default::default(),
+    });
+    let app = make_app("WindowsWhpAssetsApp", vec![("web", svc)]);
+    let out = tmp.path().join("out");
+    let mut opts = default_opts(&out);
+    opts.kit_dirs = vec![kit_dir];
+    opts.target_triples = vec!["x86_64-pc-windows-msvc".to_string()];
+    opts.require_agents = true;
+    let res = pack(&app, &opts).unwrap();
+
+    let vm = layout::vm_dir(&res.bundle_dir);
+    assert_eq!(
+        std::fs::read(vm.join(layout::kernel_name("x86_64"))).unwrap(),
+        b"fake-kernel"
+    );
+    assert_eq!(
+        std::fs::read(vm.join(layout::initramfs_name("x86_64"))).unwrap(),
+        b"fake-initramfs"
+    );
+    assert_eq!(
+        std::fs::read(layout::agents_dir(&res.bundle_dir).join(layout::whp_helper_name("x86_64")))
+            .unwrap(),
+        b"fake-whp-helper"
+    );
+}
+
+#[test]
 fn pack_skips_missing_macos_appliance_without_failing() {
     let tmp = tempfile::tempdir().unwrap();
     let (image_tar, _) = build_docker_archive(tmp.path(), "linux", "arm64", None);

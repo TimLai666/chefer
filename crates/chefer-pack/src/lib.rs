@@ -7,7 +7,8 @@
 //!    → zstd 重壓寫入 `services/<svc>/layers/`，並與 config 的 rootfs.diff_ids 比對。
 //! 3. 產出 manifest.json（chefer_bundle::Manifest）與（選）appcipe.yml 回寫。
 //! 4. 從 kit 複製對應 guest 架構的 musl guest-agent 到 `agents/`。
-//! 5. 建置 macOS 目標時，best-effort 從 kit 複製 micro-VM appliance 到 `vm/`。
+//! 5. 建置 VM 目標（macOS vz / Windows WHP）時，best-effort 從 kit 複製
+//!    micro-VM appliance 與 host helper 到 `vm/` / `agents/`。
 
 mod archive;
 mod convert;
@@ -128,7 +129,7 @@ pub fn pack(app: &AppCipe, opts: &PackOptions) -> Result<PackResult> {
     }
 
     copy_agents(&bundle_dir, &manifest, opts)?;
-    copy_macos_appliances(&bundle_dir, opts)?;
+    copy_vm_assets(&bundle_dir, opts)?;
 
     Ok(PackResult {
         bundle_dir,
@@ -401,11 +402,17 @@ fn copy_agents(bundle_dir: &Path, manifest: &Manifest, opts: &PackOptions) -> Re
     Ok(())
 }
 
-/// 建置 macOS target 時，將對應架構的 Linux micro-VM appliance 複製到 `vm/`。
+/// 建置 VM target 時，將對應架構的 Linux micro-VM appliance 與 host helper 複製到 bundle。
 ///
-/// appliance 尚未進入 kit 前依 DESIGN §2 採 best-effort：缺少時警告但不阻斷建置；
-/// 產物仍可 assemble，只是在 macOS 執行時 availability/run 會給出明確錯誤。
-fn copy_macos_appliances(bundle_dir: &Path, opts: &PackOptions) -> Result<()> {
+/// VM 資產依 DESIGN §2 採 best-effort：缺少時警告但不阻斷建置；產物仍可 assemble，
+/// 只是在執行時由對應後端回報明確不可用原因。
+fn copy_vm_assets(bundle_dir: &Path, opts: &PackOptions) -> Result<()> {
+    copy_macos_vm_assets(bundle_dir, opts)?;
+    copy_windows_whp_vm_assets(bundle_dir, opts)?;
+    Ok(())
+}
+
+fn copy_macos_vm_assets(bundle_dir: &Path, opts: &PackOptions) -> Result<()> {
     let mut arches: BTreeSet<&'static str> = BTreeSet::new();
     for target in &opts.target_triples {
         if let Some(arch) = macos_target_arch(target) {
@@ -421,35 +428,13 @@ fn copy_macos_appliances(bundle_dir: &Path, opts: &PackOptions) -> Result<()> {
 
     let vm_dir = layout::vm_dir(bundle_dir);
     for arch in arches {
-        match kit::find_appliance(&kit_dirs, arch) {
-            Some((kernel, initramfs)) => {
-                fs::create_dir_all(&vm_dir)?;
-                let kernel_dst = vm_dir.join(layout::kernel_name(arch));
-                let initramfs_dst = vm_dir.join(layout::initramfs_name(arch));
-                fs::copy(&kernel, &kernel_dst).with_context(|| {
-                    format!(
-                        "failed to copy macOS appliance kernel: {}",
-                        kernel.display()
-                    )
-                })?;
-                fs::copy(&initramfs, &initramfs_dst).with_context(|| {
-                    format!(
-                        "failed to copy macOS appliance initramfs: {}",
-                        initramfs.display()
-                    )
-                })?;
-            }
-            None => {
-                eprintln!(
-                    "warning: macOS micro-VM appliance not found (need {} and {}). \
-                     Searched kit directories: {}. \
-                     Skipping embedding vm/; this artifact can still be assembled, but will report the backend as unavailable on macOS.",
-                    layout::kernel_name(arch),
-                    layout::initramfs_name(arch),
-                    format_kit_dirs(&kit_dirs),
-                );
-            }
-        }
+        copy_appliance_for_arch(
+            &kit_dirs,
+            &vm_dir,
+            arch,
+            "macOS micro-VM appliance",
+            "macOS",
+        )?;
 
         // vz 開機 helper（host macho，已於 release 以 virtualization entitlement 簽章）→ agents/。
         // best-effort：缺少時警告但不阻斷（執行期 vz 後端會回報 helper 缺失，或可用 CHEFER_VZ_HELPER）。
@@ -483,10 +468,106 @@ fn copy_macos_appliances(bundle_dir: &Path, opts: &PackOptions) -> Result<()> {
     Ok(())
 }
 
+fn copy_windows_whp_vm_assets(bundle_dir: &Path, opts: &PackOptions) -> Result<()> {
+    let mut arches: BTreeSet<&'static str> = BTreeSet::new();
+    for target in &opts.target_triples {
+        if let Some(arch) = windows_target_arch(target) {
+            arches.insert(arch);
+        }
+    }
+    if arches.is_empty() {
+        return Ok(());
+    }
+
+    let mut kit_dirs = opts.kit_dirs.clone();
+    kit_dirs.extend(kit::default_kit_dirs());
+
+    let vm_dir = layout::vm_dir(bundle_dir);
+    for arch in arches {
+        copy_appliance_for_arch(
+            &kit_dirs,
+            &vm_dir,
+            arch,
+            "Windows WHP micro-VM appliance",
+            "Windows WHP",
+        )?;
+
+        // WHP helper（host Windows exe）→ agents/。
+        // 目前是 contract skeleton；缺少時只警告，執行期 whp 後端仍會明確 Unavailable。
+        let helper_name = layout::whp_helper_name(arch);
+        match kit::find_whp_helper(&kit_dirs, arch) {
+            Some(src) => {
+                let agents_dir = layout::agents_dir(bundle_dir);
+                fs::create_dir_all(&agents_dir)?;
+                let dst = agents_dir.join(&helper_name);
+                fs::copy(&src, &dst).with_context(|| {
+                    format!("failed to copy Windows WHP helper: {}", src.display())
+                })?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perm = std::fs::metadata(&dst)?.permissions();
+                    perm.set_mode(0o755);
+                    std::fs::set_permissions(&dst, perm)?;
+                }
+            }
+            None => {
+                eprintln!(
+                    "warning: Windows WHP helper not found (need {}). Searched kit directories: {}. \
+                     Skipping embedding it; the WHP backend will remain unavailable until the helper and VM boot shim are implemented.",
+                    helper_name,
+                    format_kit_dirs(&kit_dirs),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn copy_appliance_for_arch(
+    kit_dirs: &[PathBuf],
+    vm_dir: &Path,
+    arch: &str,
+    label: &str,
+    runtime_label: &str,
+) -> Result<()> {
+    match kit::find_appliance(kit_dirs, arch) {
+        Some((kernel, initramfs)) => {
+            fs::create_dir_all(vm_dir)?;
+            let kernel_dst = vm_dir.join(layout::kernel_name(arch));
+            let initramfs_dst = vm_dir.join(layout::initramfs_name(arch));
+            fs::copy(&kernel, &kernel_dst)
+                .with_context(|| format!("failed to copy {label} kernel: {}", kernel.display()))?;
+            fs::copy(&initramfs, &initramfs_dst).with_context(|| {
+                format!("failed to copy {label} initramfs: {}", initramfs.display())
+            })?;
+        }
+        None => {
+            eprintln!(
+                "warning: {label} not found (need {} and {}). \
+                 Searched kit directories: {}. \
+                 Skipping embedding vm/; this artifact can still be assembled, but will report the backend as unavailable on {runtime_label}.",
+                layout::kernel_name(arch),
+                layout::initramfs_name(arch),
+                format_kit_dirs(kit_dirs),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn macos_target_arch(target: &str) -> Option<&'static str> {
     match target {
         "x86_64-apple-darwin" => Some("x86_64"),
         "aarch64-apple-darwin" => Some("aarch64"),
+        _ => None,
+    }
+}
+
+fn windows_target_arch(target: &str) -> Option<&'static str> {
+    match target {
+        "x86_64-pc-windows-msvc" => Some("x86_64"),
+        "aarch64-pc-windows-msvc" => Some("aarch64"),
         _ => None,
     }
 }

@@ -70,7 +70,7 @@ jobs:
           echo "checkout_ref=refs/tags/$TAG" >> "$GITHUB_OUTPUT"
           echo "linux_ref=$LINUX_REF" >> "$GITHUB_OUTPUT"
 
-  # ── 第一階段：各 target 編譯 chefer-cli / chefer-runtime（musl target 加 guest-agent）──
+  # ── 第一階段：各 target 編譯 chefer-cli / chefer-runtime（Windows 加 WHP helper；musl target 加 guest-agent）──
   build:
     name: build (${{ matrix.target }})
     needs: preflight
@@ -113,6 +113,10 @@ jobs:
             cargo build --release --target ${{ matrix.target }} -p chefer-cli -p chefer-runtime
           fi
 
+      - name: Build WHP helper (Windows targets)
+        if: contains(matrix.target, 'windows')
+        run: cargo build --release --target ${{ matrix.target }} -p whp-helper
+
       - name: Build guest-agent (musl static)
         if: matrix.agent
         run: cross build --release --target ${{ matrix.target }} -p guest-agent
@@ -126,6 +130,10 @@ jobs:
           mkdir -p stage
           cp "target/$T/release/chefer-cli$EXT" "stage/chefer-cli-$T$EXT"
           cp "target/$T/release/chefer-runtime$EXT" "stage/chefer-runtime-$T$EXT"
+          if [[ "$T" == *windows* ]]; then
+            ARCH="${T%%-*}"   # x86_64 / aarch64
+            cp "target/$T/release/chefer-whp-helper$EXT" "stage/chefer-whp-helper-$ARCH$EXT"
+          fi
           if [[ "${{ matrix.agent }}" == "true" ]]; then
             ARCH="${T%%-*}"   # x86_64 / aarch64
             cp "target/$T/release/guest-agent" "stage/guest-agent-$ARCH"
@@ -261,6 +269,8 @@ jobs:
           cp all/chefer-vmlinuz-* all/chefer-initramfs-* "out/$PKG/kit/"
           # macOS VZ 開機 helper（兩種 darwin 架構；打包 macOS 目標時內嵌進 bundle agents/）
           cp all/chefer-vz-helper-x86_64 all/chefer-vz-helper-aarch64 "out/$PKG/kit/"
+          # Windows WHP 開機 helper（兩種 windows host 架構；打包 Windows 目標時內嵌進 bundle agents/）
+          cp all/chefer-whp-helper-x86_64.exe all/chefer-whp-helper-aarch64.exe "out/$PKG/kit/"
           cp all/BUILDINFO-* all/SHA256SUMS-* "out/$PKG/kit/"
 
           chmod +x "out/$PKG/chefer$EXT" out/$PKG/kit/* || true

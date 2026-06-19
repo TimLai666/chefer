@@ -15,7 +15,7 @@ use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExA,
 };
 
-use crate::{AppRunContext, Availability, ExecBackend};
+use crate::{AppRunContext, Availability, ExecBackend, whp_util};
 
 const WIN_HV_PLATFORM_DLL: &[u8] = b"WinHvPlatform.dll\0";
 const WHV_GET_CAPABILITY: &[u8] = b"WHvGetCapability\0";
@@ -35,12 +35,32 @@ impl ExecBackend for WhpBackend {
         "whp"
     }
 
-    fn availability(&self, _ctx: &AppRunContext) -> Availability {
-        availability()
+    fn availability(&self, ctx: &AppRunContext) -> Availability {
+        availability_for_bundle(ctx)
     }
 
-    fn run(&self, _ctx: &AppRunContext) -> Result<i32> {
-        anyhow::bail!("{}", availability_reason())
+    fn run(&self, ctx: &AppRunContext) -> Result<i32> {
+        let host_cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let mem_override = std::env::var("CHEFER_WHP_MEMORY_MIB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok());
+        match whp_util::helper_invocation(
+            ctx.bundle_dir,
+            ctx.data_dir,
+            ctx.opts.keep_tmp,
+            std::env::consts::ARCH,
+            host_cpus,
+            mem_override,
+        ) {
+            Ok(invocation) => anyhow::bail!(
+                "{} Helper contract is staged at {}, but the WHP VM boot shim is not implemented yet.",
+                availability_reason(),
+                invocation.helper.display()
+            ),
+            Err(_) => anyhow::bail!("{}", availability_reason_for_bundle(ctx)),
+        }
     }
 }
 
@@ -48,8 +68,12 @@ pub(crate) fn availability() -> Availability {
     Availability::Unavailable(availability_reason())
 }
 
+fn availability_for_bundle(ctx: &AppRunContext) -> Availability {
+    Availability::Unavailable(availability_reason_for_bundle(ctx))
+}
+
 fn availability_reason() -> String {
-    availability_reason_for(probe_host_capability())
+    availability_reason_for(probe_host_capability(), None)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,7 +85,10 @@ enum WhpHostCapability {
     HypervisorPresent,
 }
 
-fn availability_reason_for(capability: WhpHostCapability) -> String {
+fn availability_reason_for(
+    capability: WhpHostCapability,
+    bundle: Option<&whp_util::BundlePreflight>,
+) -> String {
     let preflight = match capability {
         WhpHostCapability::ApiUnavailable => {
             "The Windows Hypervisor Platform (WHP) API is not available \
@@ -92,10 +119,38 @@ fn availability_reason_for(capability: WhpHostCapability) -> String {
         }
     };
 
+    let bundle = bundle.map_or_else(String::new, |status| match status {
+        whp_util::BundlePreflight::Ready { .. } => {
+            " This bundle contains the WHP helper contract files.".to_string()
+        }
+        whp_util::BundlePreflight::UnsupportedHostArch { host_arch } => format!(
+            " The WHP helper contract does not support this Windows host architecture ({host_arch}); \
+             only x86_64 and aarch64 are supported."
+        ),
+        whp_util::BundlePreflight::MissingAppliance { arch } => format!(
+            " This single-file app has no embedded WHP micro-VM appliance (missing vm/{} or vm/{}); \
+             rebuild the Windows target with a kit that includes the appliance.",
+            chefer_bundle::layout::kernel_name(arch),
+            chefer_bundle::layout::initramfs_name(arch)
+        ),
+        whp_util::BundlePreflight::MissingHelper {
+            host_arch: _,
+            helper_name,
+        } => format!(
+            " This single-file app has no embedded WHP helper (missing agents/{helper_name}); \
+             rebuild the Windows target with a kit that includes it."
+        ),
+    });
+
     format!(
-        "{preflight} The Chefer whp host shim is not implemented yet; use or repair WSL2 \
+        "{preflight}{bundle} The Chefer whp VM boot shim is not implemented yet; use or repair WSL2 \
          to run Chefer apps on Windows today."
     )
+}
+
+fn availability_reason_for_bundle(ctx: &AppRunContext) -> String {
+    let bundle = whp_util::bundle_preflight(ctx.bundle_dir, std::env::consts::ARCH);
+    availability_reason_for(probe_host_capability(), Some(&bundle))
 }
 
 fn probe_host_capability() -> WhpHostCapability {
@@ -163,7 +218,7 @@ mod tests {
 
     #[test]
     fn formats_missing_whp_api_with_install_hint() {
-        let reason = availability_reason_for(WhpHostCapability::ApiUnavailable);
+        let reason = availability_reason_for(WhpHostCapability::ApiUnavailable, None);
 
         assert!(reason.contains("WinHvPlatform.dll"));
         assert!(reason.contains("not implemented"));
@@ -172,7 +227,7 @@ mod tests {
 
     #[test]
     fn formats_hypervisor_absent_with_reboot_hint() {
-        let reason = availability_reason_for(WhpHostCapability::HypervisorAbsent);
+        let reason = availability_reason_for(WhpHostCapability::HypervisorAbsent, None);
 
         assert!(reason.contains("no active hypervisor"));
         assert!(reason.contains("reboot"));
@@ -181,18 +236,30 @@ mod tests {
 
     #[test]
     fn formats_hypervisor_present_as_still_unavailable() {
-        let reason = availability_reason_for(WhpHostCapability::HypervisorPresent);
+        let reason = availability_reason_for(WhpHostCapability::HypervisorPresent, None);
 
         assert!(reason.contains("active hypervisor is present"));
-        assert!(reason.contains("host shim is not implemented"));
+        assert!(reason.contains("VM boot shim is not implemented"));
         assert!(reason.contains("WSL2"));
     }
 
     #[test]
     fn formats_probe_hresult() {
-        let reason = availability_reason_for(WhpHostCapability::ProbeFailed(-1));
+        let reason = availability_reason_for(WhpHostCapability::ProbeFailed(-1), None);
 
         assert!(reason.contains("HRESULT 0xFFFFFFFF"));
+        assert!(reason.contains("not implemented"));
+    }
+
+    #[test]
+    fn formats_bundle_missing_helper() {
+        let status = whp_util::BundlePreflight::MissingHelper {
+            host_arch: "x86_64".to_string(),
+            helper_name: chefer_bundle::layout::whp_helper_name("x86_64"),
+        };
+        let reason = availability_reason_for(WhpHostCapability::HypervisorPresent, Some(&status));
+
+        assert!(reason.contains("missing agents/chefer-whp-helper-x86_64.exe"));
         assert!(reason.contains("not implemented"));
     }
 }

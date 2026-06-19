@@ -30,6 +30,11 @@ mod wsl_util;
 #[allow(dead_code)]
 mod vz_util;
 
+// Windows WHP 後端的純函式（appliance/helper 查找、helper CLI contract、資源計算）；
+// 跨平台可測。真正 WHP VM boot 尚未實作，故目前多數函式是 contract scaffolding。
+#[allow(dead_code)]
+mod whp_util;
+
 use anyhow::Result;
 
 /// 後端可用性檢查結果。
@@ -91,10 +96,11 @@ pub fn backends() -> Vec<Box<dyn ExecBackend>> {
     }
 }
 
-/// Report the current state of the planned Windows Hypervisor Platform backend.
+/// Report the host state of the planned Windows Hypervisor Platform backend.
 ///
 /// This lets diagnostics mention WHP without presenting it as a supported
-/// runtime path before the host shim exists.
+/// runtime path before the VM boot shim exists. It intentionally has no bundle
+/// context; [`ExecBackend::availability`] performs bundle-specific checks.
 pub fn whp_availability() -> Availability {
     #[cfg(target_os = "windows")]
     {
