@@ -1,9 +1,10 @@
 //! `chefer selfrm` — 移除 chefer 本身（CLI 執行檔 + 同層的 kit/）。
 //!
-//! 只移除 chefer 工具本身；**不會**動到：
+//! 預設只移除 chefer 工具本身；**不會**動到：
 //! - 你用 chefer 打包出來的 app 單檔（那是獨立檔案）
 //! - 那些 app 執行後寫的持久化資料（在各平台資料目錄下，屬於 app 不屬於 chefer）
-//! - 舊版 Windows packaged app 可能留下的 WSL distro（chefer-rt-*）
+//! - 舊版 Windows packaged app 可能留下的 WSL distro（chefer-rt-*），除非明確傳
+//!   `--clean-wsl`
 //!
 //! 設計上不依賴任何外部狀態：以 self-replace 的 self_delete 刪掉自身執行檔
 //! （Windows 上會排程於行程結束後刪除），並盡力清掉安裝腳本加進 PATH 的設定。
@@ -15,7 +16,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
 
-pub fn cmd_selfrm(yes: bool) -> Result<()> {
+pub fn cmd_selfrm(yes: bool, clean_wsl: bool) -> Result<()> {
     let exe = std::env::current_exe().context("failed to determine the chefer executable path")?;
     let install_dir = exe
         .parent()
@@ -39,15 +40,39 @@ pub fn cmd_selfrm(yes: bool) -> Result<()> {
     }
     println!(
         "{}",
-        "Will NOT remove: the single-file apps you packed, their persisted data, or old WSL runtime leftovers.".dimmed()
+        "Will NOT remove: the single-file apps you packed or their persisted data.".dimmed()
     );
+    #[cfg(windows)]
+    if clean_wsl {
+        println!(
+            "{}",
+            "Will also remove old chefer-rt-* WSL runtime distros.".yellow()
+        );
+    } else {
+        println!(
+            "{}",
+            "Will NOT remove old chefer-rt-* WSL runtime leftovers (pass --clean-wsl to remove them).".dimmed()
+        );
+    }
+    #[cfg(not(windows))]
+    if clean_wsl {
+        println!(
+            "{}",
+            "--clean-wsl was requested, but this platform has no Chefer WSL runtime distros."
+                .dimmed()
+        );
+    }
 
     if !yes && !confirm("Remove chefer? [y/N] ")? {
         println!("Cancelled.");
         return Ok(());
     }
 
-    // 1) 先移除 kit（自身執行檔最後刪，避免中途失敗留下半套）
+    // 1) 若明確要求，先清 WSL runtime distro。失敗即中止，避免先刪掉 chefer 後
+    //    使用者還需要 chefer 幫忙處理舊殘留。
+    cleanup_wsl_distros_if_requested(clean_wsl)?;
+
+    // 2) 先移除 kit（自身執行檔最後刪，避免中途失敗留下半套）
     if kit_is_chefer {
         fs::remove_dir_all(&kit).with_context(|| {
             format!(
@@ -58,10 +83,10 @@ pub fn cmd_selfrm(yes: bool) -> Result<()> {
         println!("{} {}", "Removed".green(), kit.display());
     }
 
-    // 2) 盡力清掉安裝腳本加進 PATH 的設定（找不到就只提示，不視為失敗）
+    // 3) 盡力清掉安裝腳本加進 PATH 的設定（找不到就只提示，不視為失敗）
     clean_path_entries(&install_dir);
 
-    // 3) 最後刪掉自身執行檔
+    // 4) 最後刪掉自身執行檔
     //    - Unix：unlink 後本行程仍以已開啟的 inode 繼續跑到結束。
     //    - Windows：排程於行程結束後刪除（執行中無法直接刪）。
     self_replace::self_delete().with_context(|| {
@@ -83,13 +108,42 @@ pub fn cmd_selfrm(yes: bool) -> Result<()> {
     println!(
         "{}",
         "Note: current Windows packaged apps clean their temporary chefer-rt-* WSL distro on exit. \
-         Old leftovers, if any, can be removed with WSL's unregister command."
+         Old leftovers are removed only when selfrm is run with --clean-wsl."
             .dimmed()
     );
     println!(
         "{}",
         "Note: data written by the apps you packed is not removed (it belongs to the app, not to chefer).".dimmed()
     );
+    Ok(())
+}
+
+fn cleanup_wsl_distros_if_requested(clean_wsl: bool) -> Result<()> {
+    if !clean_wsl {
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    {
+        let removed = vmm_backend::cleanup_distros()
+            .context("failed to remove old chefer-rt-* WSL distros")?;
+        if removed.is_empty() {
+            println!("{}", "No chefer-rt-* WSL runtime distros found.".dimmed());
+        } else {
+            for name in &removed {
+                println!("{} WSL distro {}", "Removed".green(), name);
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        println!(
+            "{}",
+            "No Chefer WSL runtime distros exist on this platform.".dimmed()
+        );
+    }
+
     Ok(())
 }
 
