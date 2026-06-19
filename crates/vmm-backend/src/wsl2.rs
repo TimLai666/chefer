@@ -1,5 +1,5 @@
 //! Windows `wsl2` 後端：建立（或重用）chefer 專用的最小 WSL distro，
-//! 在其中執行 bundle 內嵌的 musl guest-agent。
+//! 在其中執行 bundle 內嵌的 musl guest-agent，並在 app 結束時盡力清理。
 //!
 //! 安全注意：所有 wsl.exe 呼叫一律以 `std::process::Command` 傳遞個別參數
 //! （argv 陣列），絕不組 shell 字串；並設 `WSL_UTF8=1` 讓輸出為 UTF-8。
@@ -7,9 +7,12 @@
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use chefer_bundle::PortProto;
+use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 
 use crate::wsl_util::{
     DISTRO_PREFIX, agent_distro_name, build_min_rootfs_tar, decode_wsl_output, windows_path_to_wsl,
@@ -62,70 +65,82 @@ impl ExecBackend for Wsl2Backend {
 
         // b. distro 名 = chefer-rt-<agent sha256 前 8 碼>（同 hash 冪等重用）
         let distro = agent_distro_name(&agent_bytes);
+        let run_guard = WslDistroRunGuard::new(&distro)?;
 
-        // c. distro 不存在時匯入最小 rootfs
-        if !distro_exists(&distro)? {
-            ensure_distro_imported(&distro, &agent_bytes)?;
+        let result = run_in_distro(ctx, &distro, &agent_bytes);
+        if should_keep_wsl_distro() {
+            drop(run_guard);
+        } else if let Err(err) = run_guard.cleanup_if_last() {
+            eprintln!("[chefer] warning: could not remove temporary WSL distro `{distro}`: {err}");
         }
 
-        // d. Windows 路徑 → WSL 路徑
-        let bundle_wsl = to_wsl_path(ctx.bundle_dir).with_context(|| {
-            format!(
-                "failed to convert bundle path: {}",
-                ctx.bundle_dir.display()
-            )
-        })?;
-        std::fs::create_dir_all(ctx.data_dir).with_context(|| {
-            format!(
-                "failed to create data directory: {}",
-                ctx.data_dir.display()
-            )
-        })?;
-        let data_wsl = to_wsl_path(ctx.data_dir).with_context(|| {
-            format!(
-                "failed to convert data directory path: {}",
-                ctx.data_dir.display()
-            )
-        })?;
-
-        // e. UDP 埠：wslrelay 不轉 UDP，故在啟動 guest-agent 前先取 VM eth0 的 IPv4，
-        //    對每個 UDP PortSpec 於 host 端起 `127.0.0.1:host → <vm_ip>:guest` relay
-        //    （含 host == guest——UDP 在 Windows 不會自然生效，一律 relay）。
-        //    VM 內側的 `<vm_ip>:guest → 127.0.0.1:guest` 橋接由下方 --udp-bridge 觸發。
-        let udp_specs = udp_port_specs(ctx.manifest);
-        if !udp_specs.is_empty() {
-            let vm_ip = query_vm_ipv4(&distro)?;
-            start_host_udp_relays(vm_ip, &udp_specs)?;
-        }
-
-        // f. 在 distro 內執行 guest-agent；stdio 直通，exit code 透傳。
-        //    rootfs 快取一律放 distro 內的 ext4（/var/lib/chefer/cache）：
-        //    /mnt/c（drvfs）上 symlink/hardlink/權限不可靠且 I/O 慢，
-        //    不能在那裡組 rootfs。
-        let mut cmd = wsl_command();
-        cmd.arg("-d")
-            .arg(&distro)
-            .arg("--user")
-            .arg("root")
-            .arg("--exec")
-            .arg("/bin/guest-agent")
-            .arg("run")
-            .arg("--bundle")
-            .arg(&bundle_wsl)
-            .arg("--data")
-            .arg(&data_wsl)
-            .arg("--cache")
-            .arg("/var/lib/chefer/cache")
-            // VM 內補起 UDP 埠的 eth0→loopback 橋接（無 UDP 埠時於 guest 內為 no-op）
-            .arg("--udp-bridge");
-        if ctx.opts.keep_tmp {
-            cmd.arg("--keep-rootfs");
-        }
-        let status = cmd
-            .status()
-            .with_context(|| format!("failed to start guest-agent in WSL distro `{distro}`"))?;
-        Ok(status.code().unwrap_or(1))
+        result
     }
+}
+
+fn run_in_distro(ctx: &AppRunContext, distro: &str, agent_bytes: &[u8]) -> Result<i32> {
+    // c. distro 不存在時匯入最小 rootfs
+    if !distro_exists(distro)? {
+        ensure_distro_imported(distro, agent_bytes)?;
+    }
+
+    // d. Windows 路徑 → WSL 路徑
+    let bundle_wsl = to_wsl_path(ctx.bundle_dir).with_context(|| {
+        format!(
+            "failed to convert bundle path: {}",
+            ctx.bundle_dir.display()
+        )
+    })?;
+    std::fs::create_dir_all(ctx.data_dir).with_context(|| {
+        format!(
+            "failed to create data directory: {}",
+            ctx.data_dir.display()
+        )
+    })?;
+    let data_wsl = to_wsl_path(ctx.data_dir).with_context(|| {
+        format!(
+            "failed to convert data directory path: {}",
+            ctx.data_dir.display()
+        )
+    })?;
+
+    // e. UDP 埠：wslrelay 不轉 UDP，故在啟動 guest-agent 前先取 VM eth0 的 IPv4，
+    //    對每個 UDP PortSpec 於 host 端起 `127.0.0.1:host → <vm_ip>:guest` relay
+    //    （含 host == guest——UDP 在 Windows 不會自然生效，一律 relay）。
+    //    VM 內側的 `<vm_ip>:guest → 127.0.0.1:guest` 橋接由下方 --udp-bridge 觸發。
+    let udp_specs = udp_port_specs(ctx.manifest);
+    if !udp_specs.is_empty() {
+        let vm_ip = query_vm_ipv4(distro)?;
+        start_host_udp_relays(vm_ip, &udp_specs)?;
+    }
+
+    // f. 在 distro 內執行 guest-agent；stdio 直通，exit code 透傳。
+    //    rootfs 快取一律放 distro 內的 ext4（/var/lib/chefer/cache）：
+    //    /mnt/c（drvfs）上 symlink/hardlink/權限不可靠且 I/O 慢，
+    //    不能在那裡組 rootfs。
+    let mut cmd = wsl_command();
+    cmd.arg("-d")
+        .arg(distro)
+        .arg("--user")
+        .arg("root")
+        .arg("--exec")
+        .arg("/bin/guest-agent")
+        .arg("run")
+        .arg("--bundle")
+        .arg(&bundle_wsl)
+        .arg("--data")
+        .arg(&data_wsl)
+        .arg("--cache")
+        .arg("/var/lib/chefer/cache")
+        // VM 內補起 UDP 埠的 eth0→loopback 橋接（無 UDP 埠時於 guest 內為 no-op）
+        .arg("--udp-bridge");
+    if ctx.opts.keep_tmp {
+        cmd.arg("--keep-rootfs");
+    }
+    let status = cmd
+        .status()
+        .with_context(|| format!("failed to start guest-agent in WSL distro `{distro}`"))?;
+    Ok(status.code().unwrap_or(1))
 }
 
 /// 蒐集 manifest 中所有 UDP PortSpec 的 `(host, guest)`（含 host == guest）。
@@ -318,6 +333,176 @@ fn ensure_distro_imported(distro: &str, agent_bytes: &[u8]) -> Result<()> {
     );
 }
 
+struct WslDistroRunGuard {
+    distro: String,
+    marker_path: Option<PathBuf>,
+}
+
+impl WslDistroRunGuard {
+    fn new(distro: &str) -> Result<Self> {
+        let run_dir = distro_run_dir(distro)?;
+        std::fs::create_dir_all(&run_dir).with_context(|| {
+            format!(
+                "failed to create WSL runtime marker directory: {}",
+                run_dir.display()
+            )
+        })?;
+
+        let pid = std::process::id();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let marker_path = run_dir.join(format!("{pid}-{nonce}.run"));
+        let exe = std::env::current_exe()
+            .ok()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "(unknown executable)".to_string());
+        std::fs::write(&marker_path, format!("pid={pid}\nexe={exe}\n")).with_context(|| {
+            format!(
+                "failed to create WSL runtime marker: {}",
+                marker_path.display()
+            )
+        })?;
+
+        Ok(Self {
+            distro: distro.to_string(),
+            marker_path: Some(marker_path),
+        })
+    }
+
+    fn cleanup_if_last(mut self) -> Result<()> {
+        self.remove_marker();
+        if distro_has_active_runs(&self.distro)? {
+            return Ok(());
+        }
+        cleanup_single_distro(&self.distro)
+    }
+
+    fn remove_marker(&mut self) {
+        if let Some(path) = self.marker_path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+impl Drop for WslDistroRunGuard {
+    fn drop(&mut self) {
+        self.remove_marker();
+    }
+}
+
+fn should_keep_wsl_distro() -> bool {
+    matches!(
+        std::env::var("CHEFER_KEEP_WSL_DISTRO").ok().as_deref(),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
+fn distro_has_active_runs(distro: &str) -> Result<bool> {
+    let run_dir = distro_run_dir(distro)?;
+    let entries = match std::fs::read_dir(&run_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "failed to read WSL runtime marker directory: {}",
+                    run_dir.display()
+                )
+            });
+        }
+    };
+
+    let mut has_active = false;
+    for entry in entries {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to read an entry in WSL runtime marker directory: {}",
+                run_dir.display()
+            )
+        })?;
+        let path = entry.path();
+        let pid = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(marker_pid);
+        if pid.is_some_and(process_is_running) {
+            has_active = true;
+            continue;
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    Ok(has_active)
+}
+
+fn marker_pid(file_name: &str) -> Option<u32> {
+    let (pid, suffix) = file_name.split_once('-')?;
+    if !suffix.ends_with(".run") {
+        return None;
+    }
+    pid.parse().ok()
+}
+
+fn process_is_running(pid: u32) -> bool {
+    // SAFETY: OpenProcess/CloseHandle are called with a PID from marker filenames.
+    // A valid handle means some process with that PID still exists. PID reuse is
+    // intentionally conservative: it may keep a distro longer, but will not cause
+    // us to unregister a distro that might still be in use.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        CloseHandle(handle);
+    }
+    true
+}
+
+fn distro_run_dir(distro: &str) -> Result<PathBuf> {
+    Ok(wsl_state_root()?.join("runs").join(distro))
+}
+
+fn distro_install_dir(distro: &str) -> Result<PathBuf> {
+    Ok(wsl_state_root()?.join(distro))
+}
+
+fn wsl_state_root() -> Result<PathBuf> {
+    let local_app_data = std::env::var_os("LOCALAPPDATA").ok_or_else(|| {
+        anyhow::anyhow!(
+            "%LOCALAPPDATA% environment variable not found; cannot determine the WSL state directory"
+        )
+    })?;
+    Ok(PathBuf::from(local_app_data).join("chefer").join("wsl"))
+}
+
+fn cleanup_single_distro(name: &str) -> Result<()> {
+    let _ = wsl_command().arg("--terminate").arg(name).output();
+
+    let st = wsl_command()
+        .arg("--unregister")
+        .arg(name)
+        .output()
+        .with_context(|| format!("failed to run `wsl --unregister {name}`"))?;
+    if !st.status.success() {
+        bail!(
+            "failed to remove WSL distro `{name}` (exit {}): {}; \
+             you can run `wsl --unregister {name}` manually",
+            st.status.code().unwrap_or(-1),
+            first_line(
+                &decode_wsl_output(&st.stderr),
+                &decode_wsl_output(&st.stdout)
+            ),
+        );
+    }
+
+    if let Ok(install_dir) = distro_install_dir(name) {
+        let _ = std::fs::remove_dir_all(install_dir);
+    }
+    Ok(())
+}
+
 /// 清理所有 `chefer-rt-` 前綴的 distro；回傳已移除的名稱。
 pub(crate) fn cleanup_distros_impl() -> Result<Vec<String>> {
     let out = wsl_command()
@@ -335,27 +520,7 @@ pub(crate) fn cleanup_distros_impl() -> Result<Vec<String>> {
         if name.is_empty() || !name.starts_with(DISTRO_PREFIX) {
             continue;
         }
-        let st = wsl_command()
-            .arg("--unregister")
-            .arg(name)
-            .output()
-            .with_context(|| format!("failed to run `wsl --unregister {name}`"))?;
-        if !st.status.success() {
-            bail!(
-                "failed to remove WSL distro `{name}` (exit {}): {}; \
-                 you can run `wsl --unregister {name}` manually",
-                st.status.code().unwrap_or(-1),
-                first_line(
-                    &decode_wsl_output(&st.stderr),
-                    &decode_wsl_output(&st.stdout)
-                ),
-            );
-        }
-        // 盡力清掉安裝目錄（失敗不致命：vhdx 已由 --unregister 移除）
-        if let Some(lad) = std::env::var_os("LOCALAPPDATA") {
-            let _ =
-                std::fs::remove_dir_all(PathBuf::from(lad).join("chefer").join("wsl").join(name));
-        }
+        cleanup_single_distro(name)?;
         removed.push(name.to_string());
     }
     Ok(removed)
@@ -372,4 +537,27 @@ fn first_line<'a>(stderr: &'a str, stdout: &'a str) -> &'a str {
         .find(|l| !l.trim().is_empty())
         .unwrap_or("(no output)")
         .trim()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn marker_pid_accepts_runtime_marker_names() {
+        assert_eq!(marker_pid("1234-5678.run"), Some(1234));
+        assert_eq!(marker_pid("1234-0.run"), Some(1234));
+    }
+
+    #[test]
+    fn marker_pid_rejects_unknown_names() {
+        assert_eq!(marker_pid("1234.run"), None);
+        assert_eq!(marker_pid("abcd-5678.run"), None);
+        assert_eq!(marker_pid("1234-5678.txt"), None);
+    }
+
+    #[test]
+    fn process_is_running_sees_current_process() {
+        assert!(process_is_running(std::process::id()));
+    }
 }

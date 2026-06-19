@@ -3,7 +3,7 @@
 //! 只移除 chefer 工具本身；**不會**動到：
 //! - 你用 chefer 打包出來的 app 單檔（那是獨立檔案）
 //! - 那些 app 執行後寫的持久化資料（在各平台資料目錄下，屬於 app 不屬於 chefer）
-//! - Windows 上 chefer 建立的 WSL distro（chefer-rt-*）——僅提示如何手動移除
+//! - 舊版 Windows packaged app 可能留下的 WSL distro（chefer-rt-*）
 //!
 //! 設計上不依賴任何外部狀態：以 self-replace 的 self_delete 刪掉自身執行檔
 //! （Windows 上會排程於行程結束後刪除），並盡力清掉安裝腳本加進 PATH 的設定。
@@ -39,7 +39,7 @@ pub fn cmd_selfrm(yes: bool) -> Result<()> {
     }
     println!(
         "{}",
-        "Will NOT remove: the single-file apps you packed, their persisted data, or the WSL distro.".dimmed()
+        "Will NOT remove: the single-file apps you packed, their persisted data, or old WSL runtime leftovers.".dimmed()
     );
 
     if !yes && !confirm("Remove chefer? [y/N] ")? {
@@ -82,8 +82,8 @@ pub fn cmd_selfrm(yes: bool) -> Result<()> {
     #[cfg(windows)]
     println!(
         "{}",
-        "Note: the WSL distro chefer creates on Windows is named chefer-rt-*; \
-         to remove it too, run `wsl --unregister <name>` (leaving it does not affect the system)."
+        "Note: current Windows packaged apps clean their temporary chefer-rt-* WSL distro on exit. \
+         Old leftovers, if any, can be removed with WSL's unregister command."
             .dimmed()
     );
     println!(
