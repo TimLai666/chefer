@@ -108,6 +108,10 @@ enum Cmd {
         /// Remove without prompting for confirmation
         #[arg(long, short = 'y')]
         yes: bool,
+
+        /// Also remove old chefer-rt-* WSL runtime distros (Windows only)
+        #[arg(long)]
+        clean_wsl: bool,
     },
 }
 
@@ -178,7 +182,7 @@ fn main() -> Result<()> {
             to,
             check_only,
         } => commands::upgrade::cmd_upgrade(&channel, to.as_deref(), check_only),
-        Cmd::Selfrm { yes } => commands::selfrm::cmd_selfrm(yes),
+        Cmd::Selfrm { yes, clean_wsl } => commands::selfrm::cmd_selfrm(yes, clean_wsl),
     }
 }
 
@@ -234,5 +238,17 @@ mod tests {
             resolve_appcipe_path(Some("foo/bar.yml".to_string())),
             "foo/bar.yml"
         );
+    }
+
+    #[test]
+    fn selfrm_parses_clean_wsl_flag() {
+        let cli = Cli::try_parse_from(["chefer", "selfrm", "--clean-wsl", "-y"]).unwrap();
+        match cli.cmd {
+            Cmd::Selfrm { yes, clean_wsl } => {
+                assert!(yes);
+                assert!(clean_wsl);
+            }
+            other => panic!("expected selfrm command, got {other:?}"),
+        }
     }
 }
