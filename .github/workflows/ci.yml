@@ -83,6 +83,29 @@ jobs:
           grep -q "com.apple.security.virtualization" ent.txt \
             || { echo "::error::vz helper is missing the virtualization entitlement"; exit 1; }
 
+  whp-helper:
+    name: whp-helper (windows compile-check)
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-pc-windows-msvc, aarch64-pc-windows-msvc]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: whp-helper-${{ matrix.target }}
+
+      - name: Build chefer-whp-helper
+        run: cargo build --release -p whp-helper --target ${{ matrix.target }}
+
   musl-guest-agent:
     name: guest-agent (x86_64 musl static)
     runs-on: ubuntu-latest

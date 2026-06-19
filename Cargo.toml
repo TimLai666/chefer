@@ -5,6 +5,7 @@ members = [
     "crates/chefer-pack",
     "crates/chefer-runtime",
     "crates/vmm-backend",
+    "crates/whp-helper",
     "crates/guest-agent",
     "crates/chefer-cli", "crates/chefer-assembler", "crates/chefer-bundle",
 ]

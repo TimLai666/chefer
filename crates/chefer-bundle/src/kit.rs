@@ -72,6 +72,12 @@ pub fn find_vz_helper(kit_dirs: &[PathBuf], arch: &str) -> Option<PathBuf> {
     find_first(kit_dirs, &[crate::layout::vz_helper_name(arch)])
 }
 
+/// 尋找 Windows WHP 開機 helper（`chefer-whp-helper-<arch>.exe`，host Windows exe）。
+/// 供 chefer-pack 在打包 Windows 目標時內嵌進 bundle 的 `agents/`。
+pub fn find_whp_helper(kit_dirs: &[PathBuf], arch: &str) -> Option<PathBuf> {
+    find_first(kit_dirs, &[crate::layout::whp_helper_name(arch)])
+}
+
 fn find_first<S: AsRef<str>>(dirs: &[PathBuf], names: &[S]) -> Option<PathBuf> {
     for d in dirs {
         for n in names {

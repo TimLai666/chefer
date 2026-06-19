@@ -40,6 +40,13 @@ pub fn vz_helper_name(arch: &str) -> String {
     format!("chefer-vz-helper-{arch}")
 }
 
+/// Windows WHP 後端的開機 helper（host Windows exe，arch 為 host 架構）檔名。
+/// 與其他協力檔同放 `agents/`；打包 Windows 目標時嵌入，runtime 解壓後 spawn 它
+/// 驅動 Windows Hypervisor Platform（見 docs/DESIGN.md Windows `whp` 節）。
+pub fn whp_helper_name(arch: &str) -> String {
+    format!("chefer-whp-helper-{arch}.exe")
+}
+
 /// macOS micro-VM appliance（kernel + initramfs）目錄。
 pub fn vm_dir(bundle_dir: &Path) -> PathBuf {
     bundle_dir.join("vm")
@@ -94,5 +101,11 @@ mod tests {
         assert_eq!(kernel_name("aarch64"), "chefer-vmlinuz-aarch64");
         assert_eq!(initramfs_name("x86_64"), "chefer-initramfs-x86_64");
         assert!(vm_dir(Path::new("/b")).ends_with("vm"));
+    }
+
+    #[test]
+    fn vm_helper_names() {
+        assert_eq!(vz_helper_name("aarch64"), "chefer-vz-helper-aarch64");
+        assert_eq!(whp_helper_name("x86_64"), "chefer-whp-helper-x86_64.exe");
     }
 }
