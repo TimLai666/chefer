@@ -260,7 +260,7 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
   4. 注意命令注入：所有外部參數都走 argv 陣列（`std::process::Command` 個別 arg），絕不組 shell 字串。
   5. **網路（實測）**：WSL2 的 localhost 轉送（wslrelay）只綁 IPv6 `[::1]`；runtime TCP 埠代理後端因此「先試 127.0.0.1、再退 [::1]」，且對 `host == guest` 的 TCP 埠在 Windows 上加 best-effort 的 IPv4 補橋（127.0.0.1:port → [::1]:port）。
   6. **UDP 埠映射（已解決，實測）**：wslrelay 不轉 UDP，故 wsl2 後端在啟動 guest-agent 前先以 `wsl -d <distro> --exec /bin/guest-agent vmip` 取得 VM eth0 的 IPv4，對每個 UDP PortSpec（含 `host == guest`）於 host 端起 `127.0.0.1:host → <vm_ip>:guest` 的 session relay；並以 `--udp-bridge` 旗標叫 guest-agent 在 VM 內補起 `<vm_ip>:guest → 127.0.0.1:guest` 橋接（涵蓋服務只綁 loopback 的情形；服務綁 0.0.0.0 則直接命中、橋接以 EADDRINUSE 略過）。VM IP 每次啟動現查（NAT 模式下會變）。已知殘留：服務若綁 0.0.0.0 且 bind 時機晚於 VM 內橋接（橋接已設寬限期降低機率），可能與橋接搶埠——屬罕見且會以明確 bind 錯誤呈現、可重試。
-  7. **規劃中：免 WSL 的 `whp` 後端**：以 **Windows Hypervisor Platform（WHP）** 開機 bundle 內附的 Linux micro-VM appliance（與 macOS `vz` 共用同一 kernel/initramfs/guest-agent），作為 `wsl2` 的替代後端，移除對 WSL2 的依賴（仍需硬體虛擬化 + WHP 功能）。對完全無虛擬化的機器，另可選擇性 bundle 軟體模擬（QEMU/TCG）作為最終備援（可跑但慢）。backend 抽象（`ExecBackend`）已納入 `whp` skeleton，Windows 後端排序為 `wsl2` → `whp`；目前 `whp` 會誠實回傳 `Unavailable`，不影響既有 WSL2 執行路徑。guest 側（appliance + guest-agent）已就緒，下一步是補 WHP host shim。
+  7. **規劃中：免 WSL 的 `whp` 後端**：以 **Windows Hypervisor Platform（WHP）** 開機 bundle 內附的 Linux micro-VM appliance（與 macOS `vz` 共用同一 kernel/initramfs/guest-agent），作為 `wsl2` 的替代後端，移除對 WSL2 的依賴（仍需硬體虛擬化 + WHP 功能）。對完全無虛擬化的機器，另可選擇性 bundle 軟體模擬（QEMU/TCG）作為最終備援（可跑但慢）。backend 抽象（`ExecBackend`）已納入 `whp` skeleton，Windows 後端排序為 `wsl2` → `whp`；目前 `whp` 會先以 `WinHvPlatform.dll` + `WHvGetCapability(HypervisorPresent)` 做 host preflight，但仍誠實回傳 `Unavailable`，不影響既有 WSL2 執行路徑。guest 側（appliance + guest-agent）已就緒，下一步是補 WHP host shim。
 - **macOS**（`vz`，Apple Virtualization.framework）：macOS 沒有現成 Linux，必須自行開一台輕量 Linux micro-VM 來跑容器。設計如下（**狀態：契約已定 + 跨平台純邏輯已實作並測試；Linux appliance 建置與 QEMU E2E 已納入 scripts/CI；開機改採內附 Swift helper（見下），其 swiftc 編譯與 Rust 後端 compile-check 已納入 CI，VM 真正開機仍待在實體 Mac 上驗證**——在實機驗證通過前 `availability()` 預設 `Unavailable`，需 `CHEFER_VZ_EXPERIMENTAL=1` 才啟用，不偽稱可執行）。
   - **Appliance（kit 內附預編 kernel）**：kit 與 macOS 目標的 bundle 內附一份精簡 Linux 開機組合：
     - `vm/chefer-vmlinuz-<arch>`：預編 Linux kernel（含 virtio-blk/virtiofs/virtio-net/overlayfs）。
@@ -416,7 +416,7 @@ AppCipe 新增 app 級欄位 **`console`**（appcipe-spec enum `ConsoleMode`，s
   - `check [path] [--format pretty|json|yaml]`：驗證 + 摘要（沿用現有表格 UI）。
   - `build [path] [--out dist] [--target <triple>]... [--kit-dir <dir>] [--dry-run] [--zstd-level N]`：load → pack → 對每個 target 找 runtime → assemble → 印出輸出路徑與大小。預設 target = host triple（編譯期 `BUILD_TARGET`）。
   - `run [path] [--build 之參數]`：build（單一 host target）後直接執行產物，stdio 直通。
-  - `doctor [--kit-dir <dir>]...`：檢查目前 host 是否具備 build/run Chefer app 的基本條件；輸出每項 PASS/WARN/FAIL 與英文可行動建議。檢查 OS/arch、平台後端前提（Windows WSL2 + 規劃中的 WHP fallback 狀態、Linux root 或 unprivileged user namespaces）、kit 探索（沿用 `chefer_bundle::kit`）、Chefer 版本/build 資訊，以及平台預設 data 目錄是否可寫。任一 FAIL → exit code 非 0。
+  - `doctor [--kit-dir <dir>]...`：檢查目前 host 是否具備 build/run Chefer app 的基本條件；輸出每項 PASS/WARN/FAIL 與英文可行動建議。檢查 OS/arch、平台後端前提（Windows WSL2 + 規劃中的 WHP fallback host preflight、Linux root 或 unprivileged user namespaces）、kit 探索（沿用 `chefer_bundle::kit`）、Chefer 版本/build 資訊，以及平台預設 data 目錄是否可寫。任一 FAIL → exit code 非 0。
   - `inspect <single-file>`：讀 footer + 串流掃描 payload tar（不執行、不落地解壓），顯示 manifest 摘要、app network/console、payload 大小、**「Packed by chefer」**（取自 manifest 的 `app.builder_version`，舊 bundle 無此欄位則顯示 unknown）、每個 service 的 platform/layers/各層壓縮大小/persist/ports/mounts/interface/depends_on/healthcheck，以及內嵌 `agents/`、`vm/` 協力檔清單。
   - `version` / `upgrade`：repo = `TimLai666/chefer`（常數修正）。`upgrade` 經 HTTPS（rustls）自 GitHub Releases 取得**目前 host target 的完整 kit 壓縮包**並**同時替換 `chefer` 二進位與整個 `kit/`**（sha256 驗證、含 rollback），而不是只替換單一二進位——CLI 與 kit 永遠同版本、不會漂移。
     - asset 命名沿用 release workflow：`chefer_<tag>_<target>.zip`（Windows）或 `chefer_<tag>_<target>.tar.gz`（Linux/macOS）；`<tag>` 取自 GitHub Release tag/version，不在程式碼硬寫。
@@ -434,7 +434,7 @@ AppCipe 新增 app 級欄位 **`console`**（appcipe-spec enum `ConsoleMode`，s
 | 能力 | Linux | Windows | macOS |
 |---|---|---|---|
 | `chefer build`（產任意平台單檔，給定 kit）| ✅ | ✅ | ✅ |
-| 單檔執行（linux/amd64,arm64 服務）| ✅ namespaces | ✅ WSL2；🔜 whp skeleton（明確 Unavailable） | 🔜 vz 骨架（明確錯誤）|
+| 單檔執行（linux/amd64,arm64 服務）| ✅ namespaces | ✅ WSL2；🔜 whp skeleton + host preflight（明確 Unavailable） | 🔜 vz 骨架（明確錯誤）|
 | GUI 服務 | ✅ X11/Wayland socket 直通 | ✅ WSLg | 🔜 |
 | windows/amd64 容器 | ❌（驗證期報「尚未支援」）| ❌ 同左 | ❌ |
 

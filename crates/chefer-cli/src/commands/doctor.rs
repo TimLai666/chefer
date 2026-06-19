@@ -561,7 +561,7 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_backend_checks_include_whp_scaffold() {
+    fn windows_backend_checks_include_whp_preflight() {
         let checks = check_backend_prerequisites();
         assert!(checks.iter().any(|check| check.name == "WSL2 backend"));
 
@@ -570,6 +570,7 @@ mod tests {
             .find(|check| check.name == "WHP backend")
             .expect("Windows diagnostics should mention the planned WHP backend");
         assert_eq!(whp.status, DoctorStatus::Warn);
+        assert!(whp.detail.contains("WHP"));
         assert!(whp.detail.contains("not implemented"));
     }
 
