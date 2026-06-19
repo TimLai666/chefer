@@ -218,6 +218,14 @@ CHEFER_LINUX_REF=v6.6.32 bash scripts/qemu-e2e.sh
 
 `scripts/qemu-e2e.sh` boots the appliance with QEMU + virtiofs, runs a real Chefer bundle through the musl guest-agent, and verifies namespaces, persistence, fail-fast exit code propagation, and host≠guest TCP forwarding. The actual macOS Virtualization.framework backend still must be validated on a physical Mac; GitHub-hosted macOS runners cannot boot nested VZ guests.
 
+To validate the Windows WSL2 runtime lifecycle on a Windows machine with WSL2 + Docker:
+
+```powershell
+.\scripts\windows-wsl-cleanup-e2e.ps1
+```
+
+The script builds a real Windows single-file app, runs it once with `CHEFER_KEEP_WSL_DISTRO=1` to prove the expected `chefer-rt-*` distro can be retained, unregisters it, then runs normally and verifies the runtime unregisters the distro after app exit. If that distro name already exists before the test, pass `-CleanExisting` only when you are sure it is not in use.
+
 ## Known Limitations
 
 Honest list of what doesn't work (yet):
