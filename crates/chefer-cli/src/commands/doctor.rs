@@ -97,7 +97,7 @@ pub fn cmd_doctor(extra_kit_dirs: &[PathBuf]) -> Result<i32> {
 fn build_report(extra_kit_dirs: &[PathBuf]) -> DoctorReport {
     let mut checks = Vec::new();
     checks.push(check_platform());
-    checks.push(check_backend_prerequisite());
+    checks.extend(check_backend_prerequisites());
     checks.extend(check_kit(extra_kit_dirs));
     checks.push(check_version_info());
     checks.push(check_default_data_root());
@@ -114,20 +114,20 @@ fn check_platform() -> DoctorCheck {
     )
 }
 
-fn check_backend_prerequisite() -> DoctorCheck {
+fn check_backend_prerequisites() -> Vec<DoctorCheck> {
     match std::env::consts::OS {
-        "windows" => check_wsl_status(),
-        "linux" => check_linux_userns(),
-        "macos" => DoctorCheck::warn(
+        "windows" => vec![check_wsl_status(), check_whp_status()],
+        "linux" => vec![check_linux_userns()],
+        "macos" => vec![DoctorCheck::warn(
             "Runtime backend",
             "The macOS VM backend is implemented but still requires real-Mac validation.",
             "Builds can be packaged, but validate runtime execution on the target Mac before shipping.",
-        ),
-        other => DoctorCheck::fail(
+        )],
+        other => vec![DoctorCheck::fail(
             "Runtime backend",
             format!("Unsupported host OS: {other}."),
             "Use Linux, Windows with WSL2, or macOS.",
-        ),
+        )],
     }
 }
 
@@ -153,6 +153,31 @@ fn check_wsl_status() -> DoctorCheck {
             "Install WSL2 and ensure wsl.exe is available on PATH.",
         ),
     }
+}
+
+#[cfg(target_os = "windows")]
+fn check_whp_status() -> DoctorCheck {
+    match vmm_backend::whp_availability() {
+        vmm_backend::Availability::Available => DoctorCheck::pass(
+            "WHP backend",
+            "Windows Hypervisor Platform backend is available.",
+            "No action needed.",
+        ),
+        vmm_backend::Availability::Unavailable(reason) => DoctorCheck::warn(
+            "WHP backend",
+            reason,
+            "Use the WSL2 backend today; WHP will become the non-WSL Windows backend after the host shim is implemented.",
+        ),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn check_whp_status() -> DoctorCheck {
+    DoctorCheck::warn(
+        "WHP backend",
+        "This check only applies on Windows.",
+        "No action needed on this host.",
+    )
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -532,6 +557,20 @@ mod tests {
 
         let apparmor = classify_linux_userns(1000, Some("1"), Some("1"));
         assert_eq!(apparmor.status, DoctorStatus::Fail);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_backend_checks_include_whp_scaffold() {
+        let checks = check_backend_prerequisites();
+        assert!(checks.iter().any(|check| check.name == "WSL2 backend"));
+
+        let whp = checks
+            .iter()
+            .find(|check| check.name == "WHP backend")
+            .expect("Windows diagnostics should mention the planned WHP backend");
+        assert_eq!(whp.status, DoctorStatus::Warn);
+        assert!(whp.detail.contains("not implemented"));
     }
 
     #[test]

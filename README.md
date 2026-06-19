@@ -143,7 +143,7 @@ cargo run -p chefer-cli -- build examples/gui-demo/appcipe.yml --out dist
 | `chefer check [path] [--format pretty\|json\|yaml]` | Parse and validate the recipe, print a summary. |
 | `chefer build [path] [--out <dir>] [--target <triple>]... [--kit-dir <dir>]... [--zstd-level N] [--no-embed-original] [--dry-run]` | Package into single-file executable(s); `--target` may be repeated, defaults to the host target. |
 | `chefer run [path] [build options]` | Build for the host target, then run the artifact immediately (stdio passthrough, exit code propagated). |
-| `chefer doctor [--kit-dir <dir>]...` | Check whether the current machine can build/run Chefer apps; prints PASS/WARN/FAIL diagnostics with actionable fixes. |
+| `chefer doctor [--kit-dir <dir>]...` | Check whether the current machine can build/run Chefer apps; prints PASS/WARN/FAIL diagnostics with actionable fixes, including the planned Windows WHP fallback state. |
 | `chefer inspect <file>` | Show the footer, app metadata, service details, layer sizes, and embedded companion files of a Chefer single-file executable (no execution, no filesystem extraction). |
 | `chefer version` | Show Chefer and environment version info. |
 | `chefer upgrade [--channel stable] [--to <ver>] [--check-only]` | Self-update from GitHub Releases — replaces **both** the `chefer` binary and the whole `kit/` together (sha256-verified, with rollback), so the CLI and kit never drift apart. |
@@ -182,7 +182,7 @@ single executable ── user double-clicks ──> chefer-runtime
   ├─ resolve data dir (+ old_names migration), start port proxies
   └─ pick platform backend:
        Linux   → rootless namespaces (in-process)
-       Windows → WSL2 (auto-provisioned minimal distro)
+       Windows → WSL2 (auto-provisioned minimal distro; WHP fallback scaffold reports unavailable until implemented)
        macOS   → Virtualization.framework micro-VM (appliance/QEMU verified first; real-Mac VZ validation pending)
             │
             ▼

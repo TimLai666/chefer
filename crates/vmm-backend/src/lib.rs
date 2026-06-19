@@ -14,6 +14,8 @@ mod namespaces;
 #[cfg(target_os = "macos")]
 mod vz;
 #[cfg(target_os = "windows")]
+mod whp;
+#[cfg(target_os = "windows")]
 mod wsl2;
 
 // 純函式（路徑轉換、distro 命名、最小 rootfs tar 產生）；跨平台可編譯與測試。
@@ -77,7 +79,7 @@ pub fn backends() -> Vec<Box<dyn ExecBackend>> {
     }
     #[cfg(target_os = "windows")]
     {
-        vec![Box::new(wsl2::Wsl2Backend)]
+        vec![Box::new(wsl2::Wsl2Backend), Box::new(whp::WhpBackend)]
     }
     #[cfg(target_os = "macos")]
     {
@@ -86,6 +88,24 @@ pub fn backends() -> Vec<Box<dyn ExecBackend>> {
     #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
     {
         Vec::new()
+    }
+}
+
+/// Report the current state of the planned Windows Hypervisor Platform backend.
+///
+/// This lets diagnostics mention WHP without presenting it as a supported
+/// runtime path before the host shim exists.
+pub fn whp_availability() -> Availability {
+    #[cfg(target_os = "windows")]
+    {
+        whp::availability()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Availability::Unavailable(format!(
+            "the Windows Hypervisor Platform backend only applies on Windows; this host is {}",
+            std::env::consts::OS
+        ))
     }
 }
 
@@ -142,15 +162,32 @@ mod tests {
         let list = backends();
         #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
         {
-            assert_eq!(list.len(), 1, "本平台應有一個後端");
             #[cfg(target_os = "linux")]
-            assert_eq!(list[0].name(), "namespaces");
+            assert_eq!(backend_names(&list), vec!["namespaces"]);
             #[cfg(target_os = "windows")]
-            assert_eq!(list[0].name(), "wsl2");
+            assert_eq!(backend_names(&list), vec!["wsl2", "whp"]);
             #[cfg(target_os = "macos")]
-            assert_eq!(list[0].name(), "vz");
+            assert_eq!(backend_names(&list), vec!["vz"]);
         }
         let _ = list;
+    }
+
+    #[test]
+    fn whp_availability_is_truthful_scaffold() {
+        let reason = match whp_availability() {
+            Availability::Available => {
+                panic!("whp must stay unavailable until the host shim exists")
+            }
+            Availability::Unavailable(reason) => reason,
+        };
+        #[cfg(target_os = "windows")]
+        assert!(reason.contains("not implemented"));
+        #[cfg(not(target_os = "windows"))]
+        assert!(reason.contains("only applies on Windows"));
+    }
+
+    fn backend_names(list: &[Box<dyn ExecBackend>]) -> Vec<&'static str> {
+        list.iter().map(|backend| backend.name()).collect()
     }
 
     #[cfg(not(target_os = "windows"))]
