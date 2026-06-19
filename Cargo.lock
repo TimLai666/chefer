@@ -2698,6 +2698,7 @@ dependencies = [
  "sha2 0.11.0",
  "tar",
  "tempfile",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

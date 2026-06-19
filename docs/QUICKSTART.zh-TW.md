@@ -68,7 +68,8 @@ chefer build --target x86_64-unknown-linux-musl --target aarch64-apple-darwin
 ### Windows 使用者注意事項
 
 - **需要 WSL2**。沒裝過的話以系統管理員執行一次 `wsl --install` 後重開機即可；可用 `wsl --status` 確認。
-- 首次執行時會自動建立一個 Chefer 專用的最小 WSL distro（幾秒鐘），之後重複使用，不會動到你既有的 distro。
+- 執行時會自動建立 Chefer 專用的最小 WSL distro，app 結束後會盡力自動移除；若同一個 distro 還有另一個 Chefer app 正在使用，會保守跳過清理。不會動到你既有的 distro。
+- 若要本機除錯或反覆量測啟動時間，可暫時設定 `CHEFER_KEEP_WSL_DISTRO=1` 保留 Chefer runtime distro。
 - 持久化資料寫在 `%LOCALAPPDATA%\<name>\data\<service>\`（除非 appcipe 有設 `data_dir`）。
 - **UDP 埠映射可用**：WSL2 自帶的 localhost 轉送只支援 TCP，故 Chefer 改由 host 端 relay 到 VM IP，再於 VM 內補 `eth0→loopback` 橋接（連只綁 loopback 的 UDP 服務也能連入）。TCP 埠（含 host≠guest 的代理）一樣正常。
 - GUI 服務靠 WSLg 顯示（best-effort）。

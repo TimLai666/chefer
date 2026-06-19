@@ -7,7 +7,7 @@
 //!   預設 `Unavailable`，需 `CHEFER_VZ_EXPERIMENTAL=1` 啟用）。
 //!
 //! 公開 API：[`Availability`]、[`RunOptions`]、[`AppRunContext`]、[`ExecBackend`]、
-//! [`backends`]、[`run_app`]；另提供 [`cleanup_distros`] 供未來 CLI 清理 WSL distro。
+//! [`backends`]、[`run_app`]；另提供 [`cleanup_distros`] 供清理舊版殘留 WSL distro。
 
 #[cfg(target_os = "linux")]
 mod namespaces;
@@ -116,7 +116,8 @@ pub fn run_app(ctx: &AppRunContext) -> Result<i32> {
 
 /// 清理所有由 chefer 建立的 WSL distro（`chefer-rt-` 前綴）；回傳已移除的 distro 名稱。
 ///
-/// 供未來 CLI 子命令接線使用；非 Windows 平台回傳明確錯誤。
+/// 新版 Windows runtime 會在 app 結束時自動清理當次使用的 distro；此 API 主要保留給
+/// 舊版殘留或維運工具使用。非 Windows 平台回傳明確錯誤。
 pub fn cleanup_distros() -> Result<Vec<String>> {
     #[cfg(target_os = "windows")]
     {
