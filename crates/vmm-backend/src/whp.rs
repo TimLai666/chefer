@@ -54,11 +54,16 @@ impl ExecBackend for WhpBackend {
             host_cpus,
             mem_override,
         ) {
-            Ok(invocation) => anyhow::bail!(
-                "{} Helper contract is staged at {}, but the WHP VM boot shim is not implemented yet.",
-                availability_reason(),
-                invocation.helper.display()
-            ),
+            Ok(invocation) => {
+                let preflight = run_helper_preflight(&invocation);
+                anyhow::bail!(
+                    "{} Helper is staged at {}. WHP API preflight: {}. \
+                     The WHP VM boot shim is not implemented yet.",
+                    availability_reason(),
+                    invocation.helper.display(),
+                    preflight
+                )
+            }
             Err(_) => anyhow::bail!("{}", availability_reason_for_bundle(ctx)),
         }
     }
@@ -66,6 +71,43 @@ impl ExecBackend for WhpBackend {
 
 pub(crate) fn availability() -> Availability {
     Availability::Unavailable(availability_reason())
+}
+
+/// Spawn the helper with `--preflight` and return a human-readable summary.
+fn run_helper_preflight(invocation: &whp_util::HelperInvocation) -> String {
+    spawn_preflight(&invocation.helper, invocation.resources.cpu_count as u32)
+}
+
+/// Spawn a WHP helper binary with `--preflight` and return a one-line summary.
+///
+/// Public within the crate so `lib.rs` can re-export for doctor.
+pub(crate) fn spawn_preflight(helper: &std::path::Path, cpus: u32) -> String {
+    let args = whp_util::preflight_args(cpus);
+    match std::process::Command::new(helper)
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let line = stdout.trim();
+            if line.is_empty() {
+                "OK".to_string()
+            } else {
+                line.to_string()
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            format!(
+                "FAILED (exit {}): {}",
+                output.status.code().unwrap_or(-1),
+                stderr.trim()
+            )
+        }
+        Err(e) => format!("could not run helper: {e}"),
+    }
 }
 
 fn availability_for_bundle(ctx: &AppRunContext) -> Availability {

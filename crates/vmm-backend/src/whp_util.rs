@@ -75,6 +75,7 @@ pub struct HelperInvocation {
 }
 
 impl HelperInvocation {
+    /// 完整開機模式的 CLI 參數。
     pub fn args(&self) -> Vec<OsString> {
         vec![
             "--kernel".into(),
@@ -93,6 +94,24 @@ impl HelperInvocation {
             self.resources.memory_mib.to_string().into(),
         ]
     }
+
+    /// `--preflight` 模式的 CLI 參數（用來在開機前驗證 WHP API partition 生命週期）。
+    pub fn preflight_args(&self) -> Vec<OsString> {
+        vec![
+            "--preflight".into(),
+            "--cpus".into(),
+            self.resources.cpu_count.to_string().into(),
+        ]
+    }
+}
+
+/// 產生獨立的 preflight CLI 參數（不需要完整的 HelperInvocation）。
+pub fn preflight_args(cpus: u32) -> Vec<OsString> {
+    vec![
+        "--preflight".into(),
+        "--cpus".into(),
+        cpus.to_string().into(),
+    ]
 }
 
 /// Bundle 端的 WHP 執行前置檢查。即使回 `Ready`，目前 WHP backend 仍不可執行；
@@ -254,6 +273,50 @@ mod tests {
         ));
         assert!(has_arg_pair(&args, "--cpus", "4"));
         assert!(has_arg_pair(&args, "--memory-mib", "2048"));
+    }
+
+    #[test]
+    fn preflight_args_contain_flag_and_cpus() {
+        let args = preflight_args(4)
+            .into_iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(args, vec!["--preflight", "--cpus", "4"]);
+    }
+
+    #[test]
+    fn invocation_preflight_args_use_computed_cpus() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("bundle");
+        let data = tmp.path().join("data");
+        let vm = chefer_bundle::layout::vm_dir(&bundle);
+        let agents = chefer_bundle::layout::agents_dir(&bundle);
+        std::fs::create_dir_all(&vm).unwrap();
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(vm.join(chefer_bundle::layout::kernel_name("x86_64")), b"k").unwrap();
+        std::fs::write(
+            vm.join(chefer_bundle::layout::initramfs_name("x86_64")),
+            b"i",
+        )
+        .unwrap();
+        std::fs::write(
+            agents.join(chefer_bundle::layout::whp_helper_name("x86_64")),
+            b"h",
+        )
+        .unwrap();
+
+        let invocation = helper_invocation(&bundle, &data, false, "x86_64", 16, None).unwrap();
+        let args = invocation
+            .preflight_args()
+            .into_iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(args[0], "--preflight");
+        assert!(has_arg_pair(
+            &args,
+            "--cpus",
+            &invocation.resources.cpu_count.to_string()
+        ));
     }
 
     fn has_arg_pair(args: &[String], flag: &str, value: &str) -> bool {

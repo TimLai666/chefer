@@ -409,11 +409,17 @@ fn check_vz_helper(kit_dirs: &[PathBuf], arch: &str) -> DoctorCheck {
 
 fn check_whp_helper(kit_dirs: &[PathBuf], arch: &str) -> DoctorCheck {
     match chefer_bundle::kit::find_whp_helper(kit_dirs, arch) {
-        Some(path) => DoctorCheck::pass(
-            "Kit: WHP helper",
-            format!("Found {}.", path.display()),
-            "No action needed.",
-        ),
+        Some(path) => {
+            let cpus = std::thread::available_parallelism()
+                .map(|n| n.get() as u32)
+                .unwrap_or(1);
+            let preflight = vmm_backend::whp_preflight_with_helper(&path, cpus);
+            DoctorCheck::pass(
+                "Kit: WHP helper",
+                format!("Found {}. Preflight: {}", path.display(), preflight),
+                "No action needed.",
+            )
+        }
         None => DoctorCheck::warn(
             "Kit: WHP helper",
             format!(

@@ -140,6 +140,22 @@ pub fn run_app(ctx: &AppRunContext) -> Result<i32> {
     )
 }
 
+/// Spawn a WHP helper binary with `--preflight` and return a one-line summary.
+///
+/// Doctor calls this with a helper binary found in the kit to validate
+/// that the WHP partition lifecycle works on this host.
+pub fn whp_preflight_with_helper(helper: &std::path::Path, cpus: u32) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        whp::spawn_preflight(helper, cpus)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (helper, cpus);
+        "skipped (not on Windows)".to_string()
+    }
+}
+
 /// 清理所有由 chefer 建立的 WSL distro（`chefer-rt-` 前綴）；回傳已移除的 distro 名稱。
 ///
 /// 新版 Windows runtime 會在 app 結束時自動清理當次使用的 distro；此 API 主要保留給
