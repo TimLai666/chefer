@@ -17,6 +17,8 @@ mod image;
 mod layers;
 mod registry;
 
+pub use dockerfile::available_builder;
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 

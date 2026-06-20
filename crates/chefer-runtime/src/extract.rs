@@ -153,9 +153,21 @@ pub fn extract_bundle_cached(exe: &Path, ft: &Footer, cache_root: &Path) -> Resu
 }
 
 /// 快取目錄是否完整（已有 `.complete` 標記且含 manifest.json）。
+/// 額外拒絕 cache_dir 本身或 bundle 子目錄是 symlink 的情形，
+/// 防止被替換成指向其他位置的連結。
 fn is_complete_cache(cache_dir: &Path) -> bool {
+    let bundle = cache_dir.join("bundle");
+    if is_symlink(cache_dir) || is_symlink(&bundle) {
+        return false;
+    }
     cache_dir.join(COMPLETE_MARKER).is_file()
-        && chefer_bundle::layout::manifest_path(&cache_dir.join("bundle")).is_file()
+        && chefer_bundle::layout::manifest_path(&bundle).is_file()
+}
+
+fn is_symlink(path: &Path) -> bool {
+    path.symlink_metadata()
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
 }
 
 /// 快取完成標記檔名（存在 = 該目錄是一次完整、已驗證的解壓）。
