@@ -98,6 +98,7 @@ fn build_report(extra_kit_dirs: &[PathBuf]) -> DoctorReport {
     let mut checks = Vec::new();
     checks.push(check_platform());
     checks.extend(check_backend_prerequisites());
+    checks.push(check_dockerfile_builder());
     checks.extend(check_kit(extra_kit_dirs));
     checks.push(check_version_info());
     checks.push(check_default_data_root());
@@ -427,6 +428,22 @@ fn check_whp_helper(kit_dirs: &[PathBuf], arch: &str) -> DoctorCheck {
                 chefer_bundle::layout::whp_helper_name(arch)
             ),
             "Windows without WSL2 will need the WHP helper after the VM boot shim is implemented.",
+        ),
+    }
+}
+
+fn check_dockerfile_builder() -> DoctorCheck {
+    match chefer_pack::available_builder() {
+        Some(builder) => DoctorCheck::pass(
+            "Dockerfile builder",
+            format!("Found `{builder}` on PATH."),
+            "No action needed.",
+        ),
+        None => DoctorCheck::warn(
+            "Dockerfile builder",
+            "No container builder (docker/podman/nerdctl/container) found on PATH.",
+            "Install one to use `source: dockerfile` in appcipe.yml. \
+             `source: tar` and `source: image` work without a builder.",
         ),
     }
 }

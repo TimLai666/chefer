@@ -137,7 +137,22 @@ fn detect_builder() -> Result<&'static str> {
     )
 }
 
-/// builder 是否可執行（以 `--version` 探測）。
+/// 回傳第一個可用的 container builder 名稱，找不到則 None。
+///
+/// Doctor 用來告訴使用者是否能用 `source: dockerfile`。
+pub fn available_builder() -> Option<&'static str> {
+    if let Ok(forced) = std::env::var("CHEFER_DOCKERFILE_BUILDER") {
+        let forced = forced.trim();
+        if !forced.is_empty() {
+            if let Some(&b) = BUILDERS.iter().find(|b| **b == forced && runnable(b)) {
+                return Some(b);
+            }
+            return None;
+        }
+    }
+    BUILDERS.iter().copied().find(|b| runnable(b))
+}
+
 fn runnable(builder: &str) -> bool {
     Command::new(builder)
         .arg("--version")
