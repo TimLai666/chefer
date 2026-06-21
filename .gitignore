@@ -1,3 +1,13 @@
 /target
 /dist
 *.tar
+
+# WHP boot shim 手動測試產物
+test-kernel*.bin
+test-vmlinuz
+test-initramfs*.bin
+test-initramfs*.cpio
+
+# test-init crate 的編譯產物（源碼保留，build artifacts 不追蹤）
+crates/whp-helper/test-init/target/
+crates/whp-helper/test-init/Cargo.lock

@@ -1,20 +1,25 @@
-//! Windows `whp` backend scaffold.
+//! Windows `whp` 後端（Windows Hypervisor Platform）。
 //!
-//! WHP is the planned non-WSL Windows backend. It will boot the same Linux
-//! appliance used by the VM paths through Windows Hypervisor Platform, but the
-//! host shim does not exist yet. Keep this backend visible in selection and use
-//! a host preflight probe so diagnostics can say whether WHP itself is ready
-//! without presenting the runtime path as supported.
+//! 設計見 docs/DESIGN.md §6「whp 後端」：以 WHP 開機 bundle 內附的 Linux micro-VM
+//! appliance（與 macOS `vz` 共用同一 kernel/initramfs/guest-agent），spawn 獨立的
+//! `chefer-whp-helper` 做完整 VM boot，本後端串接其 stdout 解析 `CHEFER_GUEST_IP` /
+//! `CHEFER_GUEST_EXIT` 標記，並依 guest IP 起 host→guest 埠轉發。
 
-use anyhow::Result;
 use std::ffi::c_void;
+use std::io::{BufRead, BufReader};
 use std::mem::size_of;
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::process::{Command, Stdio};
+
+use anyhow::{Context, Result, bail};
+use chefer_bundle::PortProto;
 
 use windows_sys::Win32::Foundation::FreeLibrary;
 use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExA,
 };
 
+use crate::vz_util::{self, PortForward};
 use crate::{AppRunContext, Availability, ExecBackend, whp_util};
 
 const WIN_HV_PLATFORM_DLL: &[u8] = b"WinHvPlatform.dll\0";
@@ -36,7 +41,18 @@ impl ExecBackend for WhpBackend {
     }
 
     fn availability(&self, ctx: &AppRunContext) -> Availability {
-        availability_for_bundle(ctx)
+        let capability = probe_host_capability();
+        let bundle = whp_util::bundle_preflight(ctx.bundle_dir, std::env::consts::ARCH);
+
+        match (&capability, &bundle) {
+            (WhpHostCapability::HypervisorPresent, whp_util::BundlePreflight::Ready { .. }) => {
+                Availability::Available
+            }
+            _ => Availability::Unavailable(availability_reason_for(
+                capability,
+                Some(&bundle),
+            )),
+        }
     }
 
     fn run(&self, ctx: &AppRunContext) -> Result<i32> {
@@ -46,41 +62,138 @@ impl ExecBackend for WhpBackend {
         let mem_override = std::env::var("CHEFER_WHP_MEMORY_MIB")
             .ok()
             .and_then(|s| s.parse::<u64>().ok());
-        match whp_util::helper_invocation(
+
+        let invocation = whp_util::helper_invocation(
             ctx.bundle_dir,
             ctx.data_dir,
             ctx.opts.keep_tmp,
             std::env::consts::ARCH,
             host_cpus,
             mem_override,
-        ) {
-            Ok(invocation) => {
-                let preflight = run_helper_preflight(&invocation);
-                anyhow::bail!(
-                    "{} Helper is staged at {}. WHP API preflight: {}. \
-                     The WHP VM boot shim is not implemented yet.",
-                    availability_reason(),
-                    invocation.helper.display(),
-                    preflight
+        )
+        .map_err(|pf| {
+            anyhow::anyhow!(
+                "WHP bundle preflight failed: {}",
+                bundle_preflight_reason(&pf)
+            )
+        })?;
+
+        std::fs::create_dir_all(ctx.data_dir).with_context(|| {
+            format!(
+                "failed to create data directory: {}",
+                ctx.data_dir.display()
+            )
+        })?;
+
+        eprintln!(
+            "[chefer] starting WHP micro-VM via {} (cpus={}, mem={}MiB)",
+            invocation.helper.display(),
+            invocation.resources.cpu_count,
+            invocation.resources.memory_mib
+        );
+
+        let mut child = Command::new(&invocation.helper)
+            .args(invocation.args())
+            .stdout(Stdio::piped())
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "failed to spawn the WHP helper: {}",
+                    invocation.helper.display()
                 )
+            })?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .expect("child stdout was requested as piped");
+        let forwards = vz_util::forward_ports(ctx.manifest);
+        let mut forwards_started = false;
+        let mut guest_exit: Option<i32> = None;
+
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            println!("{line}");
+            if !forwards_started
+                && let Some(ip) = vz_util::parse_guest_ip(&line)
+            {
+                start_port_forwards(ip, &forwards);
+                forwards_started = true;
             }
-            Err(_) => anyhow::bail!("{}", availability_reason_for_bundle(ctx)),
+            if let Some(code) = vz_util::parse_guest_exit_code(&line) {
+                guest_exit = Some(code);
+            }
+        }
+
+        let status = child
+            .wait()
+            .context("failed to wait for the WHP helper")?;
+        if let Some(code) = guest_exit {
+            return Ok(code);
+        }
+        if !status.success() {
+            bail!(
+                "the WHP helper exited with status {} before the guest reported an exit code; \
+                 check the messages above for the VM error",
+                status.code().unwrap_or(-1)
+            );
+        }
+        Ok(0)
+    }
+}
+
+fn start_port_forwards(guest_ip: Ipv4Addr, forwards: &[PortForward]) {
+    for f in forwards {
+        match f.proto {
+            PortProto::Tcp => match vz_util::spawn_tcp_forward(guest_ip, f.host, f.guest) {
+                Ok(_) => eprintln!(
+                    "[chefer] TCP port forward 127.0.0.1:{} → {}:{}",
+                    f.host, guest_ip, f.guest
+                ),
+                Err(e) => eprintln!(
+                    "[chefer] warning: TCP port forward 127.0.0.1:{} → {}:{}: {e}",
+                    f.host, guest_ip, f.guest
+                ),
+            },
+            PortProto::Udp => {
+                let dest = SocketAddr::from((guest_ip, f.guest));
+                match UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], f.host))) {
+                    Ok(sock) => {
+                        eprintln!(
+                            "[chefer] UDP port forward 127.0.0.1:{} → {}:{}",
+                            f.host, guest_ip, f.guest
+                        );
+                        std::thread::spawn(move || {
+                            guest_agent::udp_bridge::spawn_udp_relay(sock, move || {
+                                let s = UdpSocket::bind("0.0.0.0:0")?;
+                                s.connect(dest)?;
+                                Ok(s)
+                            });
+                        });
+                    }
+                    Err(e) => eprintln!(
+                        "[chefer] warning: UDP port forward 127.0.0.1:{}: {e}",
+                        f.host
+                    ),
+                }
+            }
         }
     }
 }
 
+// ---------------------------------------------------------------------------
+// Host capability probing
+// ---------------------------------------------------------------------------
+
 pub(crate) fn availability() -> Availability {
-    Availability::Unavailable(availability_reason())
+    let cap = probe_host_capability();
+    if cap == WhpHostCapability::HypervisorPresent {
+        Availability::Available
+    } else {
+        Availability::Unavailable(availability_reason_for(cap, None))
+    }
 }
 
-/// Spawn the helper with `--preflight` and return a human-readable summary.
-fn run_helper_preflight(invocation: &whp_util::HelperInvocation) -> String {
-    spawn_preflight(&invocation.helper, invocation.resources.cpu_count as u32)
-}
-
-/// Spawn a WHP helper binary with `--preflight` and return a one-line summary.
-///
-/// Public within the crate so `lib.rs` can re-export for doctor.
 pub(crate) fn spawn_preflight(helper: &std::path::Path, cpus: u32) -> String {
     let args = whp_util::preflight_args(cpus);
     match std::process::Command::new(helper)
@@ -108,14 +221,6 @@ pub(crate) fn spawn_preflight(helper: &std::path::Path, cpus: u32) -> String {
         }
         Err(e) => format!("could not run helper: {e}"),
     }
-}
-
-fn availability_for_bundle(ctx: &AppRunContext) -> Availability {
-    Availability::Unavailable(availability_reason_for_bundle(ctx))
-}
-
-fn availability_reason() -> String {
-    availability_reason_for(probe_host_capability(), None)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,14 +268,23 @@ fn availability_reason_for(
 
     let bundle = bundle.map_or_else(String::new, |status| match status {
         whp_util::BundlePreflight::Ready { .. } => {
-            " This bundle contains the WHP helper contract files.".to_string()
+            " This bundle contains the WHP helper and appliance.".to_string()
         }
+        _ => format!(" {}", bundle_preflight_reason(status)),
+    });
+
+    format!("{preflight}{bundle}")
+}
+
+fn bundle_preflight_reason(status: &whp_util::BundlePreflight) -> String {
+    match status {
+        whp_util::BundlePreflight::Ready { .. } => String::new(),
         whp_util::BundlePreflight::UnsupportedHostArch { host_arch } => format!(
-            " The WHP helper contract does not support this Windows host architecture ({host_arch}); \
+            "The WHP helper contract does not support this Windows host architecture ({host_arch}); \
              only x86_64 and aarch64 are supported."
         ),
         whp_util::BundlePreflight::MissingAppliance { arch } => format!(
-            " This single-file app has no embedded WHP micro-VM appliance (missing vm/{} or vm/{}); \
+            "This single-file app has no embedded WHP micro-VM appliance (missing vm/{} or vm/{}); \
              rebuild the Windows target with a kit that includes the appliance.",
             chefer_bundle::layout::kernel_name(arch),
             chefer_bundle::layout::initramfs_name(arch)
@@ -179,27 +293,13 @@ fn availability_reason_for(
             host_arch: _,
             helper_name,
         } => format!(
-            " This single-file app has no embedded WHP helper (missing agents/{helper_name}); \
+            "This single-file app has no embedded WHP helper (missing agents/{helper_name}); \
              rebuild the Windows target with a kit that includes it."
         ),
-    });
-
-    format!(
-        "{preflight}{bundle} The Chefer whp VM boot shim is not implemented yet; use or repair WSL2 \
-         to run Chefer apps on Windows today."
-    )
-}
-
-fn availability_reason_for_bundle(ctx: &AppRunContext) -> String {
-    let bundle = whp_util::bundle_preflight(ctx.bundle_dir, std::env::consts::ARCH);
-    availability_reason_for(probe_host_capability(), Some(&bundle))
+    }
 }
 
 fn probe_host_capability() -> WhpHostCapability {
-    // SAFETY: The names are static NUL-terminated byte strings. We load the WHP
-    // DLL dynamically from System32 so hosts without the optional feature still
-    // get a diagnostic instead of a load-time failure, without using the
-    // process DLL search path.
     let module = unsafe {
         LoadLibraryExA(
             WIN_HV_PLATFORM_DLL.as_ptr(),
@@ -211,25 +311,17 @@ fn probe_host_capability() -> WhpHostCapability {
         return WhpHostCapability::ApiUnavailable;
     }
 
-    // SAFETY: The module handle came from LoadLibraryA above and remains loaded
-    // until FreeLibrary below.
     let proc = unsafe { GetProcAddress(module, WHV_GET_CAPABILITY.as_ptr()) };
     let Some(proc) = proc else {
-        // SAFETY: The handle is valid because LoadLibraryA succeeded.
         unsafe {
             FreeLibrary(module);
         }
         return WhpHostCapability::ProbeUnavailable;
     };
 
-    // SAFETY: WHvGetCapability is exported by WinHvPlatform.dll with this ABI
-    // and signature. The call below passes a BOOL-sized buffer for the
-    // HypervisorPresent capability.
     let whv_get_capability: WhvGetCapability = unsafe { std::mem::transmute(proc) };
     let mut hypervisor_present = 0i32;
     let mut written = 0u32;
-    // SAFETY: The buffer and written-size pointers are valid for the duration of
-    // the call, and the buffer size matches the BOOL value requested.
     let hr = unsafe {
         whv_get_capability(
             WHV_CAPABILITY_CODE_HYPERVISOR_PRESENT,
@@ -238,7 +330,6 @@ fn probe_host_capability() -> WhpHostCapability {
             &mut written,
         )
     };
-    // SAFETY: The handle is valid because LoadLibraryA succeeded.
     unsafe {
         FreeLibrary(module);
     }
@@ -263,8 +354,7 @@ mod tests {
         let reason = availability_reason_for(WhpHostCapability::ApiUnavailable, None);
 
         assert!(reason.contains("WinHvPlatform.dll"));
-        assert!(reason.contains("not implemented"));
-        assert!(reason.contains("WSL2"));
+        assert!(reason.contains("enable"));
     }
 
     #[test]
@@ -273,16 +363,14 @@ mod tests {
 
         assert!(reason.contains("no active hypervisor"));
         assert!(reason.contains("reboot"));
-        assert!(reason.contains("not implemented"));
     }
 
     #[test]
-    fn formats_hypervisor_present_as_still_unavailable() {
+    fn formats_hypervisor_present_as_available() {
         let reason = availability_reason_for(WhpHostCapability::HypervisorPresent, None);
 
         assert!(reason.contains("active hypervisor is present"));
-        assert!(reason.contains("VM boot shim is not implemented"));
-        assert!(reason.contains("WSL2"));
+        assert!(!reason.contains("not implemented"));
     }
 
     #[test]
@@ -290,7 +378,6 @@ mod tests {
         let reason = availability_reason_for(WhpHostCapability::ProbeFailed(-1), None);
 
         assert!(reason.contains("HRESULT 0xFFFFFFFF"));
-        assert!(reason.contains("not implemented"));
     }
 
     #[test]
@@ -302,6 +389,5 @@ mod tests {
         let reason = availability_reason_for(WhpHostCapability::HypervisorPresent, Some(&status));
 
         assert!(reason.contains("missing agents/chefer-whp-helper-x86_64.exe"));
-        assert!(reason.contains("not implemented"));
     }
 }
