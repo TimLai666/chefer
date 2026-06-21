@@ -9,6 +9,10 @@ mod bzimage;
 mod pic;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod serial;
+// virtio-mmio 裝置模型（M1：純邏輯，尚未接線到 boot loop）。無條件 allow(dead_code)：
+// 連 Windows 上都還沒有消費端，待接上 run_loop 的 MMIO dispatch 後移除此 allow。
+#[allow(dead_code)]
+mod virtio;
 
 use std::path::PathBuf;
 
