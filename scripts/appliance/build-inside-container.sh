@@ -39,6 +39,9 @@ enable_kernel_options() {
   "$cfg" --enable VIRTIO
   "$cfg" --enable VIRTIO_PCI
   "$cfg" --enable VIRTIO_MMIO
+  # x86 無 device tree，virtio-mmio 裝置須由 kernel cmdline 靜態註冊
+  # （virtio_mmio.device=<size>@<base>:<irq>）——WHP 後端用此掛 virtio-blk/net。
+  "$cfg" --enable VIRTIO_MMIO_CMDLINE_DEVICES
   "$cfg" --enable VIRTIO_BLK
   "$cfg" --enable VIRTIO_CONSOLE
   "$cfg" --enable VIRTIO_NET
