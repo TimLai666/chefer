@@ -201,7 +201,7 @@ jobs:
       # aarch64 以 docker --platform 經 qemu binfmt 建置。
       - name: Set up QEMU (for cross-arch pasta build)
         if: matrix.arch == 'aarch64'
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Build static pasta
         shell: bash
