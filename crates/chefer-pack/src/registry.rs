@@ -60,9 +60,11 @@ pub(crate) fn pull_image(reference: &str, platform: &str, tmp: &Path) -> Result<
                 entries
                     .iter()
                     .find(|e| {
-                        e.platform
-                            .as_ref()
-                            .is_some_and(|p| p.os == os && p.architecture == arch)
+                        // oci-client 0.17 起 platform 的 os/architecture 為 oci_spec enum，
+                        // 以 Display 字串比對（與 line 上方蒐集 available 的格式一致）。
+                        e.platform.as_ref().is_some_and(|p| {
+                            p.os.to_string() == os && p.architecture.to_string() == arch
+                        })
                     })
                     .map(|e| e.digest.clone())
             }
