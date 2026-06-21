@@ -1,7 +1,13 @@
 //! Windows WHP host helper: preflight 驗證或以 WHP 啟動 Linux appliance。
 
+// 這些模組是跨平台可測的純邏輯（bzImage 解析、PIC/PIT、serial 模擬），但其
+// 非測試消費端（whp_api::boot_vm 等）為 #[cfg(windows)]。非 Windows 上僅供單元
+// 測試使用，故對 bin build 標 dead_code 容許（與 vmm-backend 的 vz_util/whp_util 同模式）。
+#[cfg_attr(not(windows), allow(dead_code))]
 mod bzimage;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod pic;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod serial;
 
 use std::path::PathBuf;
@@ -179,7 +185,7 @@ mod whp_api {
 
     // exception context 欄位偏移（union 從 offset 48 開始）
     // InstructionByteCount(1)+Rsvd(3)+InstructionBytes(16)+ExceptionInfo(4)+ExceptionType(1)+Rsvd(3)+ErrorCode(4)+ExceptionParameter(8)
-    const EC_EXC_TYPE: usize = 48 + 24;  // ExceptionType (u8)
+    const EC_EXC_TYPE: usize = 48 + 24; // ExceptionType (u8)
     const EC_EXC_ERROR: usize = 48 + 28; // ErrorCode (u32)
     const EC_EXC_PARAM: usize = 48 + 32; // ExceptionParameter (u64, = CR2 for #PF)
 
@@ -193,11 +199,11 @@ mod whp_api {
     // union 從 offset 48 開始
     // IoPortAccessContext: InstrByteCount(1)+Rsvd(3)+InstrBytes(16) = 20 bytes, 然後:
     const EC_IO_ACCESS_INFO: usize = 48 + 20; // = 68
-    const EC_IO_PORT: usize = 48 + 24;        // = 72
+    const EC_IO_PORT: usize = 48 + 24; // = 72
     // Rsvd2[3] (6 bytes) at 74
-    const EC_IO_RAX: usize = 48 + 32;         // = 80
+    const EC_IO_RAX: usize = 48 + 32; // = 80
     // MemoryAccessContext: InstrByteCount(1)+Rsvd(3)+InstrBytes(16)+AccessInfo(4) = 24, 然後:
-    const EC_MEM_GPA: usize = 48 + 24;        // = 72
+    const EC_MEM_GPA: usize = 48 + 24; // = 72
 
     // ── Console markers ──
 
@@ -277,15 +283,7 @@ mod whp_api {
             let vector: u32 = 0x20; // PIT IRQ0 → vector 0x20
             let pending: u64 = 1 | ((vector as u64) << 16);
             let value = [pending.to_le_bytes(), [0u8; 8]];
-            let hr = unsafe {
-                (self.set_regs)(
-                    partition,
-                    0,
-                    &reg_name,
-                    1,
-                    value.as_ptr().cast(),
-                )
-            };
+            let hr = unsafe { (self.set_regs)(partition, 0, &reg_name, 1, value.as_ptr().cast()) };
             if hr < 0 {
                 return Err(format!("inject timer IRQ failed: 0x{hr:08X}"));
             }
@@ -392,7 +390,13 @@ mod whp_api {
         }
 
         let hr = unsafe {
-            (api.map_gpa)(partition, host_page, 0, PAGE_SIZE as u64, WHV_MAP_GPA_RANGE_FLAGS_RWX)
+            (api.map_gpa)(
+                partition,
+                host_page,
+                0,
+                PAGE_SIZE as u64,
+                WHV_MAP_GPA_RANGE_FLAGS_RWX,
+            )
         };
         if hr < 0 {
             unsafe {
@@ -466,7 +470,10 @@ mod whp_api {
         // 4. 載入 WHP API + 建立 partition
         let api = WhpApi::load()?;
         let mut partition: *mut c_void = std::ptr::null_mut();
-        check_hr(unsafe { (api.create)(&mut partition) }, "WHvCreatePartition")?;
+        check_hr(
+            unsafe { (api.create)(&mut partition) },
+            "WHvCreatePartition",
+        )?;
 
         let cpu_count = req.cpus as u32;
         let hr = unsafe {
@@ -569,7 +576,13 @@ mod whp_api {
             lapic[0xF0..0xF4].copy_from_slice(&0x0000_01FFu32.to_le_bytes());
 
             let hr = unsafe {
-                (api.map_gpa)(partition, lapic_page, GPA_LAPIC, 4096, WHV_MAP_GPA_RANGE_FLAGS_RWX)
+                (api.map_gpa)(
+                    partition,
+                    lapic_page,
+                    GPA_LAPIC,
+                    4096,
+                    WHV_MAP_GPA_RANGE_FLAGS_RWX,
+                )
             };
             if hr < 0 {
                 eprintln!("Warning: LAPIC page map failed (0x{hr:08X})");
@@ -686,8 +699,8 @@ mod whp_api {
         // 最後才開 CR0.PG 進入 long mode。
         let names: [u32; 20] = [
             REG_CR0, REG_CR3, REG_CR4, REG_RFLAGS, REG_RIP, REG_RSP, REG_RSI, REG_RBP, REG_RDI,
-            REG_RBX, REG_CS, REG_DS, REG_ES, REG_FS, REG_GS, REG_SS, REG_LDTR, REG_TR,
-            REG_IDTR, REG_GDTR,
+            REG_RBX, REG_CS, REG_DS, REG_ES, REG_FS, REG_GS, REG_SS, REG_LDTR, REG_TR, REG_IDTR,
+            REG_GDTR,
         ];
 
         // segment attributes（VMX 格式）
@@ -696,25 +709,25 @@ mod whp_api {
         const TR_ATTRS: u16 = 0x008B;
 
         let values: [[u8; 16]; 20] = [
-            reg_u64(0x0000_0031),                              // CR0: PE + NE + ET, NO PG
-            reg_u64(0),                                        // CR3: 0 (paging off)
-            reg_u64(0),                                        // CR4: 0 (kernel sets PAE)
-            reg_u64(0x0000_0002),                              // RFLAGS: reserved bit 1
-            reg_u64(info.code32_start as u64),                 // RIP: kernel entry
-            reg_u64(bzimage::GPA_STACK_TOP),                   // RSP
-            reg_u64(bzimage::GPA_BOOT_PARAMS),                 // RSI: boot_params address
-            reg_u64(0),                                        // RBP: 0
-            reg_u64(0),                                        // RDI: 0
-            reg_u64(0),                                        // RBX: 0
-            reg_seg(0, 0xFFFF_FFFF, 0x10, CS_ATTRS),          // CS: __BOOT_CS
-            reg_seg(0, 0xFFFF_FFFF, 0x18, DS_ATTRS),          // DS: __BOOT_DS
-            reg_seg(0, 0xFFFF_FFFF, 0x18, DS_ATTRS),          // ES
-            reg_seg(0, 0xFFFF_FFFF, 0x18, DS_ATTRS),          // FS
-            reg_seg(0, 0xFFFF_FFFF, 0x18, DS_ATTRS),          // GS
-            reg_seg(0, 0xFFFF_FFFF, 0x18, DS_ATTRS),          // SS
-            reg_seg(0, 0, 0, 0),                               // LDTR: not present
-            reg_seg(0, 0x0000_0067, 0x28, TR_ATTRS),          // TR: selector=0x28, busy TSS
-            reg_table(0, 0xFFFF),                              // IDTR: full range, base 0
+            reg_u64(0x0000_0031),                    // CR0: PE + NE + ET, NO PG
+            reg_u64(0),                              // CR3: 0 (paging off)
+            reg_u64(0),                              // CR4: 0 (kernel sets PAE)
+            reg_u64(0x0000_0002),                    // RFLAGS: reserved bit 1
+            reg_u64(info.code32_start as u64),       // RIP: kernel entry
+            reg_u64(bzimage::GPA_STACK_TOP),         // RSP
+            reg_u64(bzimage::GPA_BOOT_PARAMS),       // RSI: boot_params address
+            reg_u64(0),                              // RBP: 0
+            reg_u64(0),                              // RDI: 0
+            reg_u64(0),                              // RBX: 0
+            reg_seg(0, 0xFFFF_FFFF, 0x10, CS_ATTRS), // CS: __BOOT_CS
+            reg_seg(0, 0xFFFF_FFFF, 0x18, DS_ATTRS), // DS: __BOOT_DS
+            reg_seg(0, 0xFFFF_FFFF, 0x18, DS_ATTRS), // ES
+            reg_seg(0, 0xFFFF_FFFF, 0x18, DS_ATTRS), // FS
+            reg_seg(0, 0xFFFF_FFFF, 0x18, DS_ATTRS), // GS
+            reg_seg(0, 0xFFFF_FFFF, 0x18, DS_ATTRS), // SS
+            reg_seg(0, 0, 0, 0),                     // LDTR: not present
+            reg_seg(0, 0x0000_0067, 0x28, TR_ATTRS), // TR: selector=0x28, busy TSS
+            reg_table(0, 0xFFFF),                    // IDTR: full range, base 0
             reg_table(bzimage::GPA_GDT, bzimage::GDT_SIZE as u16 - 1), // GDTR
         ];
 
@@ -763,11 +776,17 @@ mod whp_api {
             };
             check_hr(hr, "WHvRunVirtualProcessor")?;
 
-            let reason = u32::from_le_bytes(exit_ctx[EC_EXIT_REASON..EC_EXIT_REASON + 4].try_into().unwrap());
+            let reason = u32::from_le_bytes(
+                exit_ctx[EC_EXIT_REASON..EC_EXIT_REASON + 4]
+                    .try_into()
+                    .unwrap(),
+            );
 
             match reason {
                 EXIT_IO_PORT => {
-                    handle_io_exit(api, partition, &exit_ctx, serial, cmos_addr, pic1, pic2, pit)?;
+                    handle_io_exit(
+                        api, partition, &exit_ctx, serial, cmos_addr, pic1, pic2, pit,
+                    )?;
                     flush_serial(serial, last_printed);
                 }
                 EXIT_HALT | EXIT_NONE | EXIT_CANCELED => {
@@ -784,9 +803,8 @@ mod whp_api {
                     }
                     // RFLAGS.IF 檢查：如果 guest 在 IF=0（interrupts disabled）時 halt，
                     // 代表 kernel 已完成 shutdown（cli; hlt loop）
-                    let rflags = u64::from_le_bytes(
-                        exit_ctx[EC_RFLAGS..EC_RFLAGS + 8].try_into().unwrap(),
-                    );
+                    let rflags =
+                        u64::from_le_bytes(exit_ctx[EC_RFLAGS..EC_RFLAGS + 8].try_into().unwrap());
                     if rflags & 0x200 == 0 && reason == EXIT_HALT {
                         // IF=0 + HLT = kernel shutdown（reboot/halt/poweroff）
                         if output.contains("System halted") || output.contains("Power down") {
@@ -802,17 +820,13 @@ mod whp_api {
                     let gpa = u64::from_le_bytes(
                         exit_ctx[EC_MEM_GPA..EC_MEM_GPA + 8].try_into().unwrap(),
                     );
-                    let rip = u64::from_le_bytes(
-                        exit_ctx[EC_RIP..EC_RIP + 8].try_into().unwrap(),
-                    );
+                    let rip = u64::from_le_bytes(exit_ctx[EC_RIP..EC_RIP + 8].try_into().unwrap());
                     return Err(format!(
                         "Memory access fault at GPA 0x{gpa:016X} (RIP=0x{rip:016X})"
                     ));
                 }
                 EXIT_EXCEPTION => {
-                    let rip = u64::from_le_bytes(
-                        exit_ctx[EC_RIP..EC_RIP + 8].try_into().unwrap(),
-                    );
+                    let rip = u64::from_le_bytes(exit_ctx[EC_RIP..EC_RIP + 8].try_into().unwrap());
                     let exc_type = exit_ctx[EC_EXC_TYPE];
                     let error_code = u32::from_le_bytes(
                         exit_ctx[EC_EXC_ERROR..EC_EXC_ERROR + 4].try_into().unwrap(),
@@ -840,25 +854,17 @@ mod whp_api {
                     if exc_type == 0x0E {
                         eprintln!("  Page fault at address 0x{exc_param:016X}");
                     }
-                    return Err(format!(
-                        "Guest exception {name} at RIP=0x{rip:016X}"
-                    ));
+                    return Err(format!("Guest exception {name} at RIP=0x{rip:016X}"));
                 }
                 EXIT_UNRECOVERABLE => {
-                    let rip = u64::from_le_bytes(
-                        exit_ctx[EC_RIP..EC_RIP + 8].try_into().unwrap(),
-                    );
+                    let rip = u64::from_le_bytes(exit_ctx[EC_RIP..EC_RIP + 8].try_into().unwrap());
                     return Err(format!(
                         "Unrecoverable exception (triple fault) at RIP=0x{rip:016X}"
                     ));
                 }
                 EXIT_INVALID_VP_STATE => {
-                    let rip = u64::from_le_bytes(
-                        exit_ctx[EC_RIP..EC_RIP + 8].try_into().unwrap(),
-                    );
-                    return Err(format!(
-                        "Invalid VP register state at RIP=0x{rip:016X}"
-                    ));
+                    let rip = u64::from_le_bytes(exit_ctx[EC_RIP..EC_RIP + 8].try_into().unwrap());
+                    return Err(format!("Invalid VP register state at RIP=0x{rip:016X}"));
                 }
                 other => {
                     return Err(format!("Unhandled VM exit reason 0x{other:04X}"));
@@ -880,8 +886,11 @@ mod whp_api {
     ) -> Result<(), String> {
         let instr_len = (ctx[EC_INSTR_LEN] & 0x0F) as u64;
         let rip = u64::from_le_bytes(ctx[EC_RIP..EC_RIP + 8].try_into().unwrap());
-        let access_info =
-            u32::from_le_bytes(ctx[EC_IO_ACCESS_INFO..EC_IO_ACCESS_INFO + 4].try_into().unwrap());
+        let access_info = u32::from_le_bytes(
+            ctx[EC_IO_ACCESS_INFO..EC_IO_ACCESS_INFO + 4]
+                .try_into()
+                .unwrap(),
+        );
         let is_write = access_info & 1 != 0;
         let access_size = ((access_info >> 1) & 0x7) as u8;
         let port = u16::from_le_bytes(ctx[EC_IO_PORT..EC_IO_PORT + 2].try_into().unwrap());
@@ -950,9 +959,7 @@ mod whp_api {
         // 推進 RIP + 更新 RAX
         let names = [REG_RIP, REG_RAX];
         let values = [reg_u64(rip + instr_len), reg_u64(new_rax)];
-        let hr = unsafe {
-            (api.set_regs)(partition, 0, names.as_ptr(), 2, values.as_ptr().cast())
-        };
+        let hr = unsafe { (api.set_regs)(partition, 0, names.as_ptr(), 2, values.as_ptr().cast()) };
         check_hr(hr, "WHvSetVirtualProcessorRegisters(advance RIP)")
     }
 
@@ -998,7 +1005,10 @@ mod whp_api {
         fn reg_seg_layout() {
             let v = reg_seg(0x1000, 0xFFFF_FFFF, 0x10, 0xC09B);
             assert_eq!(u64::from_le_bytes(v[..8].try_into().unwrap()), 0x1000); // base
-            assert_eq!(u32::from_le_bytes(v[8..12].try_into().unwrap()), 0xFFFF_FFFF); // limit
+            assert_eq!(
+                u32::from_le_bytes(v[8..12].try_into().unwrap()),
+                0xFFFF_FFFF
+            ); // limit
             assert_eq!(u16::from_le_bytes(v[12..14].try_into().unwrap()), 0x10); // selector
             assert_eq!(u16::from_le_bytes(v[14..16].try_into().unwrap()), 0xC09B); // attrs
         }
@@ -1014,10 +1024,7 @@ mod whp_api {
         fn parse_guest_exit_code() {
             assert_eq!(parse_guest_exit("CHEFER_GUEST_EXIT=0"), Some(0));
             assert_eq!(parse_guest_exit("CHEFER_GUEST_EXIT=42"), Some(42));
-            assert_eq!(
-                parse_guest_exit("boot log\nCHEFER_GUEST_EXIT=1\n"),
-                Some(1)
-            );
+            assert_eq!(parse_guest_exit("boot log\nCHEFER_GUEST_EXIT=1\n"), Some(1));
             assert_eq!(parse_guest_exit("no marker here"), None);
         }
     }

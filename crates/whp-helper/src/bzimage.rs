@@ -63,9 +63,7 @@ pub fn parse(image: &[u8]) -> Result<BzImageInfo, String> {
 
     let magic = le_u32(image, HDR_HEADER);
     if magic != HDRS_MAGIC {
-        return Err(format!(
-            "Missing 'HdrS' magic at 0x202: got 0x{magic:08X}"
-        ));
+        return Err(format!("Missing 'HdrS' magic at 0x202: got 0x{magic:08X}"));
     }
 
     let version = le_u16(image, HDR_VERSION);
@@ -89,12 +87,7 @@ pub fn parse(image: &[u8]) -> Result<BzImageInfo, String> {
 
     let code32_start = le_u32(image, HDR_CODE32_START);
 
-    let header_end = if version >= 0x020A {
-        0x268
-    } else {
-        0x260
-    }
-    .min(image.len());
+    let header_end = if version >= 0x020A { 0x268 } else { 0x260 }.min(image.len());
 
     let setup_header_raw = image[HDR_SETUP_SECTS..header_end].to_vec();
 
@@ -157,7 +150,13 @@ pub fn write_boot_params(
 
     write_e820(mem, e820 + n as usize * 20, 0, 0xA_0000, E820_RAM);
     n += 1;
-    write_e820(mem, e820 + n as usize * 20, 0xA_0000, 0x6_0000, E820_RESERVED);
+    write_e820(
+        mem,
+        e820 + n as usize * 20,
+        0xA_0000,
+        0x6_0000,
+        E820_RESERVED,
+    );
     n += 1;
     let high = total_memory.saturating_sub(0x10_0000);
     if high > 0 {
@@ -239,8 +238,7 @@ mod tests {
         // loadflags: LOADED_HIGH
         img[HDR_LOADFLAGS] = 0x01;
         // code32_start
-        img[HDR_CODE32_START..HDR_CODE32_START + 4]
-            .copy_from_slice(&0x0010_0000u32.to_le_bytes());
+        img[HDR_CODE32_START..HDR_CODE32_START + 4].copy_from_slice(&0x0010_0000u32.to_le_bytes());
 
         img
     }
@@ -299,8 +297,15 @@ mod tests {
         let initrd_addr: u64 = 0x20_0000;
         let initrd_size: u64 = 4096;
 
-        write_boot_params(&mut mem, &info, "console=ttyS0", initrd_addr, initrd_size, total_mem)
-            .unwrap();
+        write_boot_params(
+            &mut mem,
+            &info,
+            "console=ttyS0",
+            initrd_addr,
+            initrd_size,
+            total_mem,
+        )
+        .unwrap();
 
         let bp = GPA_BOOT_PARAMS as usize;
         // type_of_loader = 0xFF
@@ -343,5 +348,4 @@ mod tests {
         assert_eq!(initrd_gpa(0x1000), GPA_KERNEL + 0x1000);
         assert_eq!(initrd_gpa(0x1001), GPA_KERNEL + 0x2000);
     }
-
 }

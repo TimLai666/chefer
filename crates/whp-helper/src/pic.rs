@@ -44,11 +44,7 @@ impl Pic {
     }
 
     pub fn read_cmd(&self) -> u8 {
-        if self.read_isr {
-            self.isr
-        } else {
-            self.irr
-        }
+        if self.read_isr { self.isr } else { self.irr }
     }
 
     pub fn read_data(&self) -> u8 {
