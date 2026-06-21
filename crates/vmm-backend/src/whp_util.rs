@@ -44,12 +44,14 @@ pub fn helper_in_bundle(bundle_dir: &Path, host_arch: &str) -> PathBuf {
         .join(chefer_bundle::layout::whp_helper_name(host_arch))
 }
 
-/// kernel command line：序列埠 console + 由 initramfs 解讀的 chefer 參數。
+/// kernel command line：序列埠 console + WHP 專屬參數 + chefer appliance 參數。
 ///
-/// `console=ttyS0` 是 WHP helper contract 的占位 serial console 名稱；真正 device
-/// model 實作時若選不同 console，需同步更新 DESIGN 與測試。
+/// WHP 專屬：`nolapic`（LAPIC emulation 不完整，由 host 注入 timer）、
+/// `lpj=1000000`（跳過 calibration）、`notsc clocksource=jiffies`（TSC 不可靠）。
 pub fn kernel_command_line(keep_rootfs: bool) -> String {
-    let mut s = String::from("console=ttyS0 quiet ip=dhcp panic=-1");
+    let mut s = String::from(
+        "console=ttyS0 quiet ip=dhcp panic=-1 nolapic lpj=1000000 notsc clocksource=jiffies",
+    );
     s.push_str(&format!(
         " chefer.bundle_tag={SHARE_TAG_BUNDLE} chefer.data_tag={SHARE_TAG_DATA}"
     ));
@@ -72,12 +74,13 @@ pub struct HelperInvocation {
     pub bundle_dir: PathBuf,
     pub data_dir: PathBuf,
     pub resources: VmResources,
+    pub timeout_secs: u64,
 }
 
 impl HelperInvocation {
     /// 完整開機模式的 CLI 參數。
     pub fn args(&self) -> Vec<OsString> {
-        vec![
+        let mut v = vec![
             "--kernel".into(),
             self.kernel.as_os_str().to_owned(),
             "--initramfs".into(),
@@ -92,7 +95,12 @@ impl HelperInvocation {
             self.resources.cpu_count.to_string().into(),
             "--memory-mib".into(),
             self.resources.memory_mib.to_string().into(),
-        ]
+        ];
+        if self.timeout_secs != 300 {
+            v.push("--timeout".into());
+            v.push(self.timeout_secs.to_string().into());
+        }
+        v
     }
 
     /// `--preflight` 模式的 CLI 參數（用來在開機前驗證 WHP API partition 生命週期）。
@@ -161,6 +169,10 @@ pub fn helper_invocation(
     host_cpus: usize,
     mem_override_mib: Option<u64>,
 ) -> Result<HelperInvocation, BundlePreflight> {
+    let timeout_secs = std::env::var("CHEFER_WHP_TIMEOUT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300);
     match bundle_preflight(bundle_dir, host_arch) {
         BundlePreflight::Ready { helper, appliance } => Ok(HelperInvocation {
             helper,
@@ -170,6 +182,7 @@ pub fn helper_invocation(
             bundle_dir: bundle_dir.to_path_buf(),
             data_dir: data_dir.to_path_buf(),
             resources: VmResources::compute(host_cpus, mem_override_mib),
+            timeout_secs,
         }),
         other => Err(other),
     }
@@ -191,6 +204,10 @@ mod tests {
         let cmdline = kernel_command_line(true);
 
         assert!(cmdline.contains("console=ttyS0"));
+        assert!(cmdline.contains("nolapic"));
+        assert!(cmdline.contains("lpj=1000000"));
+        assert!(cmdline.contains("notsc"));
+        assert!(cmdline.contains("clocksource=jiffies"));
         assert!(cmdline.contains("chefer.bundle_tag=chefer-bundle"));
         assert!(cmdline.contains("chefer.data_dir=/mnt/data"));
         assert!(cmdline.contains("chefer.keep_rootfs=1"));

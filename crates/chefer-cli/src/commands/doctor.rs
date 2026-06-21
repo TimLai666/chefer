@@ -167,7 +167,7 @@ fn check_whp_status() -> DoctorCheck {
         vmm_backend::Availability::Unavailable(reason) => DoctorCheck::warn(
             "WHP backend",
             reason,
-            "Use the WSL2 backend today; WHP will become the non-WSL Windows backend after the VM boot shim is implemented.",
+            "Enable the Windows Hypervisor Platform optional feature and hardware virtualization, then reboot.",
         ),
     }
 }
@@ -603,17 +603,19 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_backend_checks_include_whp_preflight() {
+    fn windows_backend_checks_include_whp() {
         let checks = check_backend_prerequisites();
         assert!(checks.iter().any(|check| check.name == "WSL2 backend"));
 
         let whp = checks
             .iter()
             .find(|check| check.name == "WHP backend")
-            .expect("Windows diagnostics should mention the planned WHP backend");
-        assert_eq!(whp.status, DoctorStatus::Warn);
-        assert!(whp.detail.contains("WHP"));
-        assert!(whp.detail.contains("not implemented"));
+            .expect("Windows diagnostics should include WHP backend check");
+        assert!(
+            whp.status == DoctorStatus::Pass || whp.status == DoctorStatus::Warn,
+            "WHP should be Pass (hypervisor present) or Warn (absent/unavailable)"
+        );
+        assert!(whp.detail.contains("WHP") || whp.detail.contains("Hypervisor"));
     }
 
     #[test]

@@ -96,11 +96,10 @@ pub fn backends() -> Vec<Box<dyn ExecBackend>> {
     }
 }
 
-/// Report the host state of the planned Windows Hypervisor Platform backend.
+/// Report the host-level WHP capability (no bundle context).
 ///
-/// This lets diagnostics mention WHP without presenting it as a supported
-/// runtime path before the VM boot shim exists. It intentionally has no bundle
-/// context; [`ExecBackend::availability`] performs bundle-specific checks.
+/// Returns `Available` when the WHP API and hypervisor are present.
+/// [`ExecBackend::availability`] adds bundle-specific checks (helper + appliance).
 pub fn whp_availability() -> Availability {
     #[cfg(target_os = "windows")]
     {
@@ -195,17 +194,18 @@ mod tests {
     }
 
     #[test]
-    fn whp_availability_is_truthful_scaffold() {
-        let reason = match whp_availability() {
+    fn whp_availability_reports_host_state() {
+        match whp_availability() {
             Availability::Available => {
-                panic!("whp must stay unavailable until the host shim exists")
+                // WHP API + hypervisor 可用——合理（Windows + 虛擬化已啟用）
             }
-            Availability::Unavailable(reason) => reason,
-        };
-        #[cfg(target_os = "windows")]
-        assert!(reason.contains("not implemented"));
-        #[cfg(not(target_os = "windows"))]
-        assert!(reason.contains("only applies on Windows"));
+            Availability::Unavailable(reason) => {
+                #[cfg(target_os = "windows")]
+                assert!(reason.contains("WHP"));
+                #[cfg(not(target_os = "windows"))]
+                assert!(reason.contains("only applies on Windows"));
+            }
+        }
     }
 
     fn backend_names(list: &[Box<dyn ExecBackend>]) -> Vec<&'static str> {
