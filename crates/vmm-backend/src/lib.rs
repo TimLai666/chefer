@@ -115,6 +115,10 @@ pub fn whp_availability() -> Availability {
 }
 
 /// 取第一個可用的後端執行 app；全部不可用時彙整每個後端的名稱與原因報錯。
+///
+/// `CHEFER_BACKEND` 環境變數可強制只用某個後端（例如 `CHEFER_BACKEND=whp`）：用於在
+/// 同時裝了 WSL2 的機器上驗證 `whp` 路徑（否則 wsl2 排在前面會先被選中）。值需對應某個
+/// 本平台候選後端名（namespaces/wsl2/whp/vz）；不認得的值或該後端在本平台不存在 → 明確錯誤。
 pub fn run_app(ctx: &AppRunContext) -> Result<i32> {
     let list = backends();
     if list.is_empty() {
@@ -124,6 +128,21 @@ pub fn run_app(ctx: &AppRunContext) -> Result<i32> {
             std::env::consts::OS
         );
     }
+
+    // 後端覆寫：只試指定的後端，方便在有 WSL 的機器上驗證 whp 等替代後端。
+    let forced = std::env::var("CHEFER_BACKEND")
+        .ok()
+        .filter(|s| !s.is_empty());
+    if let Some(name) = forced.as_deref() {
+        let backend = resolve_forced_backend(&list, name)?;
+        return match backend.availability(ctx) {
+            Availability::Available => backend.run(ctx),
+            Availability::Unavailable(reason) => anyhow::bail!(
+                "CHEFER_BACKEND forced the `{name}` backend, but it is unavailable: {reason}"
+            ),
+        };
+    }
+
     let mut reasons: Vec<String> = Vec::new();
     for backend in &list {
         match backend.availability(ctx) {
@@ -137,6 +156,25 @@ pub fn run_app(ctx: &AppRunContext) -> Result<i32> {
         "No execution backend is available. Tried the following:\n{}",
         reasons.join("\n")
     )
+}
+
+/// 依名稱在候選後端清單中找出指定後端；找不到時回傳列出可用名稱的可行動錯誤。
+fn resolve_forced_backend<'a>(
+    list: &'a [Box<dyn ExecBackend>],
+    name: &str,
+) -> Result<&'a dyn ExecBackend> {
+    list.iter()
+        .find(|b| b.name() == name)
+        .map(|b| b.as_ref())
+        .ok_or_else(|| {
+            let names: Vec<&str> = list.iter().map(|b| b.name()).collect();
+            anyhow::anyhow!(
+                "CHEFER_BACKEND=\"{name}\" is not a valid backend on this platform ({}). \
+                 Available: {}.",
+                std::env::consts::OS,
+                names.join(", ")
+            )
+        })
 }
 
 /// Spawn a WHP helper binary with `--preflight` and return a one-line summary.
@@ -191,6 +229,35 @@ mod tests {
             assert_eq!(backend_names(&list), vec!["vz"]);
         }
         let _ = list;
+    }
+
+    #[test]
+    fn resolve_forced_backend_rejects_unknown_name() {
+        let list = backends();
+        // 空清單平台（非 linux/windows/macos）此測試無意義，跳過。
+        if list.is_empty() {
+            return;
+        }
+        // 不能用 unwrap_err()：Ok 型別是 &dyn ExecBackend（trait object 無 Debug）。
+        let err = match resolve_forced_backend(&list, "bogus-backend") {
+            Ok(_) => panic!("bogus name should not resolve"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("is not a valid backend"), "got: {msg}");
+        // 錯誤訊息要列出真實可用後端名，方便使用者修正。
+        assert!(msg.contains(list[0].name()), "got: {msg}");
+    }
+
+    #[test]
+    fn resolve_forced_backend_accepts_real_name() {
+        let list = backends();
+        if list.is_empty() {
+            return;
+        }
+        let name = list[0].name();
+        let picked = resolve_forced_backend(&list, name).expect("real name should resolve");
+        assert_eq!(picked.name(), name);
     }
 
     #[test]

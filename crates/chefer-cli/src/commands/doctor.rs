@@ -427,7 +427,7 @@ fn check_whp_helper(kit_dirs: &[PathBuf], arch: &str) -> DoctorCheck {
                 "{} was not found.",
                 chefer_bundle::layout::whp_helper_name(arch)
             ),
-            "Windows without WSL2 will need the WHP helper after the VM boot shim is implemented.",
+            "Windows without WSL2 needs the WHP helper to boot the micro-VM. Set CHEFER_BACKEND=whp to force this backend.",
         ),
     }
 }
