@@ -37,7 +37,7 @@ jobs:
       release_tag: ${{ steps.tag.outputs.release_tag }}
       linux_ref: ${{ steps.tag.outputs.linux_ref }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -86,7 +86,7 @@ jobs:
           - { runner: macos-latest,   target: aarch64-apple-darwin,        cross: false, agent: false }
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.preflight.outputs.checkout_ref }}
 
@@ -165,7 +165,7 @@ jobs:
       matrix:
         arch: [x86_64, aarch64]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.preflight.outputs.checkout_ref }}
 
@@ -194,7 +194,7 @@ jobs:
       matrix:
         arch: [x86_64, aarch64]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.preflight.outputs.checkout_ref }}
 
@@ -231,7 +231,7 @@ jobs:
           - aarch64-apple-darwin
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.preflight.outputs.checkout_ref }}
 
