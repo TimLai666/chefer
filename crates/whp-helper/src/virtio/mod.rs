@@ -8,6 +8,7 @@
 //! guest 實體記憶體以 [`GuestMemory`] trait 抽象：boot loop 端用 host-mapped 的
 //! VirtualAlloc 區（[`SliceMem`]）實作；單元測試用同一個 [`SliceMem`] 包一塊 Vec。
 
+pub mod blk;
 pub mod mmio;
 pub mod queue;
 
