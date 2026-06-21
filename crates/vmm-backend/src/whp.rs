@@ -48,10 +48,7 @@ impl ExecBackend for WhpBackend {
             (WhpHostCapability::HypervisorPresent, whp_util::BundlePreflight::Ready { .. }) => {
                 Availability::Available
             }
-            _ => Availability::Unavailable(availability_reason_for(
-                capability,
-                Some(&bundle),
-            )),
+            _ => Availability::Unavailable(availability_reason_for(capability, Some(&bundle))),
         }
     }
 
@@ -114,9 +111,7 @@ impl ExecBackend for WhpBackend {
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
             println!("{line}");
-            if !forwards_started
-                && let Some(ip) = vz_util::parse_guest_ip(&line)
-            {
+            if !forwards_started && let Some(ip) = vz_util::parse_guest_ip(&line) {
                 start_port_forwards(ip, &forwards);
                 forwards_started = true;
             }
@@ -125,9 +120,7 @@ impl ExecBackend for WhpBackend {
             }
         }
 
-        let status = child
-            .wait()
-            .context("failed to wait for the WHP helper")?;
+        let status = child.wait().context("failed to wait for the WHP helper")?;
         if let Some(code) = guest_exit {
             return Ok(code);
         }
