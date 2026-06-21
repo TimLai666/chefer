@@ -3138,6 +3138,8 @@ dependencies = [
 name = "whp-helper"
 version = "0.1.3"
 dependencies = [
+ "tar",
+ "tempfile",
  "windows-sys 0.61.2",
 ]
 

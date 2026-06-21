@@ -9,6 +9,7 @@
 //! VirtualAlloc 區（[`SliceMem`]）實作；單元測試用同一個 [`SliceMem`] 包一塊 Vec。
 
 pub mod blk;
+pub mod image;
 pub mod mmio;
 pub mod queue;
 

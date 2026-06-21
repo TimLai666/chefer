@@ -7,5 +7,12 @@ edition = "2024"
 name = "chefer-whp-helper"
 path = "src/main.rs"
 
+[dependencies]
+# bundle/data 目錄 ↔ sector 對齊 tar image 轉換（virtio-blk backing；對齊生態 0.4.46）。
+tar = "0.4.46"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
 [target."cfg(windows)".dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_Memory"] }
