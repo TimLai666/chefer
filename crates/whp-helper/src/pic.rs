@@ -104,6 +104,30 @@ impl Pic {
             }
         }
     }
+
+    /// 讓外部裝置提出一條 PIC IRQ 線。
+    pub fn request_irq(&mut self, irq: u8) {
+        if irq < 8 {
+            self.irr |= 1 << irq;
+        }
+    }
+
+    /// 取出一條可遞送的 pending IRQ，並進入 in-service 狀態。
+    pub fn take_pending_vector(&mut self) -> Option<u8> {
+        let pending = self.irr & !self.imr;
+        if pending == 0 {
+            return None;
+        }
+        for irq in 0..8 {
+            let bit = 1 << irq;
+            if pending & bit != 0 && self.isr & bit == 0 {
+                self.irr &= !bit;
+                self.isr |= bit;
+                return Some(self.vector_offset.wrapping_add(irq as u8));
+            }
+        }
+        None
+    }
 }
 
 /// PIT (8254 Programmable Interval Timer) 基本 stub。
@@ -343,5 +367,20 @@ mod tests {
         pit.write(0, 0x00); // lo
         pit.write(0, 0x10); // hi
         assert_eq!(pit.counters[0], 0x1000);
+    }
+
+    #[test]
+    fn pic_pending_irq_uses_mask_and_vector_offset() {
+        let mut pic = Pic::new();
+        pic.write_cmd(0x11);
+        pic.write_data(0x20);
+        pic.write_data(0x04);
+        pic.write_data(0x01);
+        pic.write_data(0xDF); // unmask IRQ5 only
+
+        pic.request_irq(5);
+        assert_eq!(pic.take_pending_vector(), Some(0x25));
+        assert_eq!(pic.take_pending_vector(), None);
+        assert_eq!(pic.isr, 1 << 5);
     }
 }
