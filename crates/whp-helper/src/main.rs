@@ -240,6 +240,8 @@ mod whp_api {
     type TranslateGvaFn =
         unsafe extern "system" fn(*mut c_void, u32, u64, u32, *mut c_void, *mut u64) -> i32;
     type CancelRunVpFn = unsafe extern "system" fn(*mut c_void, u32, u32) -> i32;
+    type RequestInterruptFn =
+        unsafe extern "system" fn(*mut c_void, *const WhvInterruptControl, u32) -> i32;
     type CreateEmulatorFn =
         unsafe extern "system" fn(*const WhvEmulatorCallbacks, *mut *mut c_void) -> i32;
     type DestroyEmulatorFn = unsafe extern "system" fn(*mut c_void) -> i32;
@@ -328,6 +330,14 @@ mod whp_api {
         set_regs: SetRegsFn,
         translate_gva: TranslateGvaFn,
         cancel_run_vp: CancelRunVpFn,
+        request_interrupt: RequestInterruptFn,
+    }
+
+    #[repr(C)]
+    struct WhvInterruptControl {
+        control: u64,
+        destination: u32,
+        vector: u32,
     }
 
     struct WhpEmulator<'a> {
@@ -385,22 +395,25 @@ mod whp_api {
                 set_regs: resolve(module, b"WHvSetVirtualProcessorRegisters\0")?,
                 translate_gva: resolve(module, b"WHvTranslateGva\0")?,
                 cancel_run_vp: resolve(module, b"WHvCancelRunVirtualProcessor\0")?,
+                request_interrupt: resolve(module, b"WHvRequestInterrupt\0")?,
             })
         }
 
-        fn inject_timer_irq(&self, partition: *mut c_void) -> Result<(), String> {
-            // 直接設定 PendingInterruption register（繞過 LAPIC）
-            // WHvRegisterPendingInterruption = 0x80000000
-            // Layout: bit0=Pending, bits1-3=Type(0=External), bits16-31=Vector
-            let reg_name: u32 = 0x8000_0000;
-            let vector: u32 = 0x20; // PIT IRQ0 → vector 0x20
-            let pending: u64 = 1 | ((vector as u64) << 16);
-            let value = [pending.to_le_bytes(), [0u8; 8]];
-            let hr = unsafe { (self.set_regs)(partition, 0, &reg_name, 1, value.as_ptr().cast()) };
-            if hr < 0 {
-                return Err(format!("inject timer IRQ failed: 0x{hr:08X}"));
-            }
-            Ok(())
+        fn request_external_interrupt(
+            &self,
+            partition: *mut c_void,
+            destination: u32,
+            vector: u32,
+        ) -> Result<(), String> {
+            let ctl = WhvInterruptControl {
+                control: 0,
+                destination,
+                vector,
+            };
+            let hr = unsafe {
+                (self.request_interrupt)(partition, &ctl, size_of::<WhvInterruptControl>() as u32)
+            };
+            check_hr(hr, "WHvRequestInterrupt")
         }
     }
 
@@ -770,11 +783,7 @@ mod whp_api {
         let Some(vector) = pic1.take_pending_vector() else {
             return Ok(());
         };
-        let reg_name: u32 = 0x8000_0000;
-        let pending: u64 = 1 | ((vector as u64) << 16);
-        let value = [pending.to_le_bytes(), [0u8; 8]];
-        let hr = unsafe { (api.set_regs)(partition, 0, &reg_name, 1, value.as_ptr().cast()) };
-        check_hr(hr, "WHvSetVirtualProcessorRegisters(PendingInterruption)")
+        api.request_external_interrupt(partition, 0, vector as u32)
     }
 
     // ── WHV_REGISTER_VALUE helpers (16-byte union) ──
@@ -923,7 +932,8 @@ mod whp_api {
 
         // 3. 計算 layout
         let mem_size = req.memory_mib as usize * 1024 * 1024;
-        let initrd_gpa = bzimage::initrd_gpa(info.kernel_size);
+        let initrd_gpa =
+            bzimage::initrd_gpa(info.kernel_size, initramfs_data.len(), mem_size as u64);
         let initrd_end = initrd_gpa as usize + initramfs_data.len();
         if initrd_end > mem_size {
             return Err(format!(
@@ -1229,15 +1239,48 @@ mod whp_api {
         last_printed: &mut usize,
         timeout: std::time::Duration,
     ) -> Result<(), String> {
+        #[derive(Default)]
+        struct ExitStats {
+            none: u64,
+            mem: u64,
+            io: u64,
+            halt: u64,
+            canceled: u64,
+            other: u64,
+        }
+
+        fn exit_reason_name(reason: u32) -> &'static str {
+            match reason {
+                EXIT_NONE => "none",
+                EXIT_MEM_ACCESS => "memory-access",
+                EXIT_IO_PORT => "io-port",
+                EXIT_UNRECOVERABLE => "unrecoverable",
+                EXIT_INVALID_VP_STATE => "invalid-vp-state",
+                EXIT_HALT => "halt",
+                EXIT_EXCEPTION => "exception",
+                EXIT_CANCELED => "canceled",
+                _ => "other",
+            }
+        }
+
         let mut exit_ctx = [0u8; 4096];
         let start = std::time::Instant::now();
+        let mut exit_stats = ExitStats::default();
+        let mut last_reason = EXIT_NONE;
+        let mut last_rip = 0u64;
 
         loop {
             if start.elapsed() > timeout {
                 flush_serial(serial, last_printed);
                 return Err(format!(
-                    "Guest boot timed out after {} seconds",
-                    timeout.as_secs()
+                    "Guest boot timed out after {} seconds (last exit={} 0x{last_reason:04X}, RIP=0x{last_rip:016X}, counts: io={} mem={} halt={} canceled={} other={})",
+                    timeout.as_secs(),
+                    exit_reason_name(last_reason),
+                    exit_stats.io,
+                    exit_stats.mem,
+                    exit_stats.halt,
+                    exit_stats.canceled,
+                    exit_stats.other
                 ));
             }
             let hr = unsafe {
@@ -1255,9 +1298,13 @@ mod whp_api {
                     .try_into()
                     .unwrap(),
             );
+            let rip = u64::from_le_bytes(exit_ctx[EC_RIP..EC_RIP + 8].try_into().unwrap());
+            last_reason = reason;
+            last_rip = rip;
 
             match reason {
                 EXIT_IO_PORT => {
+                    exit_stats.io += 1;
                     handle_io_exit(
                         api, partition, &exit_ctx, serial, cmos_addr, pic1, pic2, pit,
                     )?;
@@ -1269,6 +1316,12 @@ mod whp_api {
                     flush_serial(serial, last_printed);
                 }
                 EXIT_HALT | EXIT_NONE | EXIT_CANCELED => {
+                    match reason {
+                        EXIT_HALT => exit_stats.halt += 1,
+                        EXIT_NONE => exit_stats.none += 1,
+                        EXIT_CANCELED => exit_stats.canceled += 1,
+                        _ => {}
+                    }
                     flush_serial(serial, last_printed);
                     let output = serial.output_str();
                     if let Some(code) = parse_guest_exit(&output) {
@@ -1292,10 +1345,12 @@ mod whp_api {
                         return Err("Guest halted with interrupts disabled".to_string());
                     }
                     if rflags & 0x200 != 0 {
-                        let _ = api.inject_timer_irq(partition);
+                        pic1.request_irq(0);
+                        let _ = deliver_pending_pic_irq(api, partition, pic1);
                     }
                 }
                 EXIT_MEM_ACCESS => {
+                    exit_stats.mem += 1;
                     let gpa = u64::from_le_bytes(
                         exit_ctx[EC_MEM_GPA..EC_MEM_GPA + 8].try_into().unwrap(),
                     );
@@ -1343,7 +1398,6 @@ mod whp_api {
                     }
                 }
                 EXIT_EXCEPTION => {
-                    let rip = u64::from_le_bytes(exit_ctx[EC_RIP..EC_RIP + 8].try_into().unwrap());
                     let exc_type = exit_ctx[EC_EXC_TYPE];
                     let error_code = u32::from_le_bytes(
                         exit_ctx[EC_EXC_ERROR..EC_EXC_ERROR + 4].try_into().unwrap(),
@@ -1374,13 +1428,11 @@ mod whp_api {
                     return Err(format!("Guest exception {name} at RIP=0x{rip:016X}"));
                 }
                 EXIT_UNRECOVERABLE => {
-                    let rip = u64::from_le_bytes(exit_ctx[EC_RIP..EC_RIP + 8].try_into().unwrap());
                     return Err(format!(
                         "Unrecoverable exception (triple fault) at RIP=0x{rip:016X}"
                     ));
                 }
                 EXIT_INVALID_VP_STATE => {
-                    let rip = u64::from_le_bytes(exit_ctx[EC_RIP..EC_RIP + 8].try_into().unwrap());
                     return Err(format!("Invalid VP register state at RIP=0x{rip:016X}"));
                 }
                 other => {
