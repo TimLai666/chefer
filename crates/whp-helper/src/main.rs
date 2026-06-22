@@ -240,8 +240,6 @@ mod whp_api {
     type TranslateGvaFn =
         unsafe extern "system" fn(*mut c_void, u32, u64, u32, *mut c_void, *mut u64) -> i32;
     type CancelRunVpFn = unsafe extern "system" fn(*mut c_void, u32, u32) -> i32;
-    type RequestInterruptFn =
-        unsafe extern "system" fn(*mut c_void, *const WhvInterruptControl, u32) -> i32;
     type CreateEmulatorFn =
         unsafe extern "system" fn(*const WhvEmulatorCallbacks, *mut *mut c_void) -> i32;
     type DestroyEmulatorFn = unsafe extern "system" fn(*mut c_void) -> i32;
@@ -330,14 +328,6 @@ mod whp_api {
         set_regs: SetRegsFn,
         translate_gva: TranslateGvaFn,
         cancel_run_vp: CancelRunVpFn,
-        request_interrupt: RequestInterruptFn,
-    }
-
-    #[repr(C)]
-    struct WhvInterruptControl {
-        control: u64,
-        destination: u32,
-        vector: u32,
     }
 
     struct WhpEmulator<'a> {
@@ -395,25 +385,7 @@ mod whp_api {
                 set_regs: resolve(module, b"WHvSetVirtualProcessorRegisters\0")?,
                 translate_gva: resolve(module, b"WHvTranslateGva\0")?,
                 cancel_run_vp: resolve(module, b"WHvCancelRunVirtualProcessor\0")?,
-                request_interrupt: resolve(module, b"WHvRequestInterrupt\0")?,
             })
-        }
-
-        fn request_external_interrupt(
-            &self,
-            partition: *mut c_void,
-            destination: u32,
-            vector: u32,
-        ) -> Result<(), String> {
-            let ctl = WhvInterruptControl {
-                control: 0,
-                destination,
-                vector,
-            };
-            let hr = unsafe {
-                (self.request_interrupt)(partition, &ctl, size_of::<WhvInterruptControl>() as u32)
-            };
-            check_hr(hr, "WHvRequestInterrupt")
         }
     }
 
@@ -783,7 +755,23 @@ mod whp_api {
         let Some(vector) = pic1.take_pending_vector() else {
             return Ok(());
         };
-        api.request_external_interrupt(partition, 0, vector as u32)
+        // WHP 在 nolapic + dummy LAPIC 頁的設定下，無法經 LAPIC（WHvRequestInterrupt）
+        // 把中斷遞送到 guest；必須用 WHvRegisterPendingInterruption register 直接注入
+        // vector（繞過 LAPIC，CPU 在下個 instruction boundary 接受）。見 docs/DESIGN.md §4。
+        // PendingInterruption layout：bit0=Pending、bits1-3=Type(0=external)、bits16-31=Vector。
+        const REG_PENDING_INTERRUPTION: u32 = 0x8000_0000;
+        let pending: u64 = 1 | ((vector as u64) << 16);
+        let value = reg_u64(pending);
+        let hr = unsafe {
+            (api.set_regs)(
+                partition,
+                0,
+                &REG_PENDING_INTERRUPTION,
+                1,
+                value.as_ptr().cast(),
+            )
+        };
+        check_hr(hr, "WHvSetVirtualProcessorRegisters(PendingInterruption)")
     }
 
     // ── WHV_REGISTER_VALUE helpers (16-byte union) ──
