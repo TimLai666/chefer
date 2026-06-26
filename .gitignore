@@ -14,3 +14,6 @@ crates/whp-helper/test-init/Cargo.lock
 
 # codex/實機除錯的暫存工作目錄
 tmp/
+
+# end-to-end 驗證用的本機 kit（build 產物複製）
+kit/
