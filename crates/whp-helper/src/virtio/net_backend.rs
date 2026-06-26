@@ -13,9 +13,14 @@
 //! virtio-net rx queue 填回 guest。
 
 use std::collections::VecDeque;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 
+use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
+use smoltcp::socket::tcp;
 use smoltcp::time::Instant;
+use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
 /// 乙太網 MTU（virtio-net 預設）。
 pub const MTU: usize = 1500;
@@ -92,6 +97,142 @@ impl Device for VirtioNetPhy {
     }
 }
 
+/// host 端網路 gateway + host→guest 埠轉發：以 smoltcp 當 guest 的 gateway，
+/// 對每個宣告的埠在 host 開一個 TCP listener，accept 後以 smoltcp TCP socket 連到
+/// guest 的服務埠，雙向搬 bytes。接線層在每次 virtio-net notify / timer tick 呼叫
+/// [`NetBackend::poll`]，由它驅動 smoltcp（讀 phy.rx 產 phy.tx）與連線搬運。
+pub struct NetBackend {
+    iface: Interface,
+    sockets: SocketSet<'static>,
+    guest_ip: Ipv4Address,
+    forwards: Vec<(TcpListener, u16)>,
+    conns: Vec<Conn>,
+    next_local_port: u16,
+}
+
+struct Conn {
+    host: TcpStream,
+    handle: SocketHandle,
+}
+
+impl NetBackend {
+    /// 以 gateway MAC/IP 與 guest IP 建立 smoltcp interface（綁在給定 phy 上）。
+    pub fn new(
+        gateway_mac: [u8; 6],
+        gateway_ip: Ipv4Address,
+        guest_ip: Ipv4Address,
+        phy: &mut VirtioNetPhy,
+    ) -> Self {
+        let config = Config::new(HardwareAddress::Ethernet(EthernetAddress(gateway_mac)));
+        let mut iface = Interface::new(config, phy, Instant::from_millis(0));
+        iface.update_ip_addrs(|addrs| {
+            let _ = addrs.push(IpCidr::new(gateway_ip.into(), 24));
+        });
+        Self {
+            iface,
+            sockets: SocketSet::new(vec![]),
+            guest_ip,
+            forwards: Vec::new(),
+            conns: Vec::new(),
+            next_local_port: 49152,
+        }
+    }
+
+    /// 新增 host→guest 埠轉發：host `127.0.0.1:host_port` → guest `:guest_port`。
+    /// 回傳實際綁定的 host port（傳 0 由 OS 配，方便測試）。
+    pub fn add_forward(&mut self, host_port: u16, guest_port: u16) -> std::io::Result<u16> {
+        let listener = TcpListener::bind(("127.0.0.1", host_port))?;
+        listener.set_nonblocking(true)?;
+        let actual = listener.local_addr()?.port();
+        self.forwards.push((listener, guest_port));
+        Ok(actual)
+    }
+
+    fn alloc_local_port(&mut self) -> u16 {
+        let p = self.next_local_port;
+        self.next_local_port = if p >= 65534 { 49152 } else { p + 1 };
+        p
+    }
+
+    /// 驅動 smoltcp + 搬 host↔guest bytes。`phy` 為與 virtio-net 橋接的 device
+    /// （guest 送來的 frame 已 push 進去；產出的 frame 之後由接線層 pop 給 guest）。
+    pub fn poll(&mut self, phy: &mut VirtioNetPhy, now: Instant) {
+        self.iface.poll(now, phy, &mut self.sockets);
+        self.accept_new();
+        self.pump();
+        self.iface.poll(now, phy, &mut self.sockets);
+    }
+
+    fn accept_new(&mut self) {
+        // 先收集 accepted（釋放 forwards 借用）再開 smoltcp socket。
+        let mut accepted: Vec<(TcpStream, u16)> = Vec::new();
+        for (listener, guest_port) in &self.forwards {
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => accepted.push((stream, *guest_port)),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+        for (stream, guest_port) in accepted {
+            let _ = stream.set_nonblocking(true);
+            let local = self.alloc_local_port();
+            let mut sock = tcp::Socket::new(
+                tcp::SocketBuffer::new(vec![0u8; 65536]),
+                tcp::SocketBuffer::new(vec![0u8; 65536]),
+            );
+            let connected = sock
+                .connect(
+                    self.iface.context(),
+                    (IpAddress::Ipv4(self.guest_ip), guest_port),
+                    local,
+                )
+                .is_ok();
+            if connected {
+                let handle = self.sockets.add(sock);
+                self.conns.push(Conn {
+                    host: stream,
+                    handle,
+                });
+            }
+        }
+    }
+
+    fn pump(&mut self) {
+        let mut closed = Vec::new();
+        for (i, conn) in self.conns.iter_mut().enumerate() {
+            let sock = self.sockets.get_mut::<tcp::Socket>(conn.handle);
+            // guest → host：把 guest 回應寫到 host socket。
+            if sock.can_recv() {
+                let _ = sock.recv(|data| {
+                    let n = conn.host.write(data).unwrap_or(0);
+                    (n, ())
+                });
+            }
+            // host → guest：把 host 來的 bytes 送進 guest。
+            if sock.can_send() {
+                let mut buf = [0u8; 4096];
+                match conn.host.read(&mut buf) {
+                    Ok(0) => sock.close(), // host 端關閉
+                    Ok(n) => {
+                        let _ = sock.send_slice(&buf[..n]);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => sock.close(),
+                }
+            }
+            if sock.state() == tcp::State::Closed {
+                closed.push(i);
+            }
+        }
+        for i in closed.into_iter().rev() {
+            let conn = self.conns.remove(i);
+            self.sockets.remove(conn.handle);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,5 +292,39 @@ mod tests {
         assert_eq!(&reply[12..14], &[0x08, 0x06], "回應應為 ARP");
         // ARP opcode @ ethernet(14)+6 = offset 20..22 應為 reply(2)
         assert_eq!(&reply[20..22], &[0x00, 0x02], "ARP opcode 應為 reply");
+    }
+
+    #[test]
+    fn forward_initiates_connection_to_guest() {
+        // host 連到轉發埠後，NetBackend 應對 guest 發起連線（先 ARP 找 guest MAC）——
+        // 證明 host→guest 埠轉發的發起端可行（完整握手需 guest 回應，留實機驗證）。
+        let mut phy = VirtioNetPhy::new();
+        let gw_ip = Ipv4Address::new(10, 0, 2, 2);
+        let guest_ip = Ipv4Address::new(10, 0, 2, 15);
+        let mut backend = NetBackend::new(
+            [0x52, 0x54, 0x00, 0x00, 0x00, 0x02],
+            gw_ip,
+            guest_ip,
+            &mut phy,
+        );
+        let host_port = backend.add_forward(0, 6379).unwrap();
+
+        // host 端連線（loopback，立即進 listener backlog）。
+        let _client = std::net::TcpStream::connect(("127.0.0.1", host_port)).unwrap();
+        for ms in 0..50 {
+            backend.poll(&mut phy, Instant::from_millis(ms));
+        }
+
+        // device tx 應有一個 ARP request：who-has guest_ip（target protocol addr @ 38..42）。
+        let mut found = false;
+        while let Some(frame) = phy.pop_to_guest() {
+            if frame.len() >= 42
+                && frame[12..14] == [0x08, 0x06]
+                && frame[38..42] == guest_ip.octets()
+            {
+                found = true;
+            }
+        }
+        assert!(found, "NetBackend 應對 guest 發 ARP（埠轉發發起）");
     }
 }
