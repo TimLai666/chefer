@@ -114,7 +114,7 @@ main() {
     -v "$root:/src:ro" \
     -v "$out_dir:/out" \
     "$image" \
-    bash /src/scripts/appliance/build-inside-container.sh
+    sh -lc "sed 's/\r$//' /src/scripts/appliance/build-inside-container.sh | bash"
 
   note "appliance 已輸出到 ${out_dir}"
 }

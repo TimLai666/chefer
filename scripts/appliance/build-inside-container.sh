@@ -75,7 +75,9 @@ build_initramfs() {
   rm -rf "$root"
   mkdir -p "$root"/{bin,dev,proc,sys,run,tmp,mnt,dev/pts,dev/shm}
   cp /bin/busybox "$root/bin/busybox"
-  cp /src/scripts/appliance/init "$root/init"
+  # Windows checkout 可能把 /init 轉成 CRLF；kernel 解析 shebang 時會把 \r
+  # 當成 interpreter 路徑的一部分，導致 PID 1 以 127 直接結束。
+  sed 's/\r$//' /src/scripts/appliance/init >"$root/init"
   chmod 0755 "$root/init" "$root/bin/busybox"
 
   # 這些 device node 讓極早期 init 也能輸出診斷；devtmpfs 掛上後會覆蓋。

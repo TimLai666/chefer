@@ -134,7 +134,12 @@ fn run_boot(_request: HelperRequest) -> Result<(), String> {
 #[cfg(windows)]
 mod whp_api {
     use std::ffi::c_void;
+    use std::io::Write as _;
     use std::mem::size_of;
+    use std::sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    };
 
     use windows_sys::Win32::Foundation::FreeLibrary;
     use windows_sys::Win32::System::LibraryLoader::{
@@ -145,7 +150,18 @@ mod whp_api {
     };
 
     const WIN_HV_PLATFORM_DLL: &[u8] = b"WinHvPlatform.dll\0";
+    const WIN_HV_EMULATION_DLL: &[u8] = b"WinHvEmulation.dll\0";
     const PAGE_SIZE: usize = 4096;
+    const E_FAIL: i32 = 0x8000_4005u32 as i32;
+    const VIRTIO_MMIO_BASE: u64 = 0xD000_0000;
+    const VIRTIO_MMIO_SIZE: u64 = 0x200;
+    const VIRTIO_MMIO_IRQ: u8 = 5;
+    const VIRTIO_MMIO_CMDLINE: &str = "virtio_mmio.device=0x200@0xd0000000:5";
+    const EMULATOR_DIRECTION_WRITE: u8 = 1;
+    static MMIO_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
+    static PLATFORM_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
+    static MMIO_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
+    static PLATFORM_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
 
     // ── WHP property codes ──
 
@@ -206,8 +222,10 @@ mod whp_api {
     const EC_IO_PORT: usize = 48 + 24; // = 72
     // Rsvd2[3] (6 bytes) at 74
     const EC_IO_RAX: usize = 48 + 32; // = 80
+    const EC_MEM_ACCESS_INFO: usize = 48 + 20; // = 68
     // MemoryAccessContext: InstrByteCount(1)+Rsvd(3)+InstrBytes(16)+AccessInfo(4) = 24, 然後:
     const EC_MEM_GPA: usize = 48 + 24; // = 72
+    const EC_MEM_GVA: usize = 48 + 32; // = 80
 
     // ── Console markers ──
 
@@ -226,9 +244,128 @@ mod whp_api {
     type CreateVpFn = unsafe extern "system" fn(*mut c_void, u32, u32) -> i32;
     type DeleteVpFn = unsafe extern "system" fn(*mut c_void, u32) -> i32;
     type RunVpFn = unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32) -> i32;
-    type SetRegsFn =
-        unsafe extern "system" fn(*mut c_void, u32, *const u32, u32, *const c_void) -> i32;
+    type SetRegsFn = unsafe extern "system" fn(
+        *mut c_void,
+        u32,
+        *const u32,
+        u32,
+        *const WhvRegisterValue,
+    ) -> i32;
+    type GetRegsFn =
+        unsafe extern "system" fn(*mut c_void, u32, *const u32, u32, *mut WhvRegisterValue) -> i32;
+    type TranslateGvaFn =
+        unsafe extern "system" fn(*mut c_void, u32, u64, u32, *mut c_void, *mut u64) -> i32;
     type CancelRunVpFn = unsafe extern "system" fn(*mut c_void, u32, u32) -> i32;
+    type CreateEmulatorFn =
+        unsafe extern "system" fn(*const WhvEmulatorCallbacks, *mut *mut c_void) -> i32;
+    type DestroyEmulatorFn = unsafe extern "system" fn(*mut c_void) -> i32;
+    type TryMmioEmulationFn = unsafe extern "system" fn(
+        *mut c_void,
+        *mut c_void,
+        *const c_void,
+        *const c_void,
+        *mut WhvEmulatorStatus,
+    ) -> i32;
+
+    type EmulatorIoPortCallback =
+        unsafe extern "system" fn(*mut c_void, *mut WhvEmulatorIoAccessInfo) -> i32;
+    type EmulatorMemoryCallback =
+        unsafe extern "system" fn(*mut c_void, *mut WhvEmulatorMemoryAccessInfo) -> i32;
+    type EmulatorGetRegsCallback =
+        unsafe extern "system" fn(*mut c_void, *const u32, u32, *mut WhvRegisterValue) -> i32;
+    type EmulatorSetRegsCallback =
+        unsafe extern "system" fn(*mut c_void, *const u32, u32, *const WhvRegisterValue) -> i32;
+    type EmulatorTranslateGvaPageCallback =
+        unsafe extern "system" fn(*mut c_void, u64, u32, *mut u32, *mut u64) -> i32;
+
+    #[repr(C)]
+    struct WhvEmulatorMemoryAccessInfo {
+        gpa_address: u64,
+        direction: u8,
+        access_size: u8,
+        data: [u8; 8],
+    }
+
+    #[repr(C)]
+    struct WhvEmulatorIoAccessInfo {
+        direction: u8,
+        port: u16,
+        access_size: u16,
+        data: u32,
+    }
+
+    #[repr(C)]
+    struct WhvEmulatorCallbacks {
+        size: u32,
+        reserved: u32,
+        io_port: EmulatorIoPortCallback,
+        memory: EmulatorMemoryCallback,
+        get_regs: EmulatorGetRegsCallback,
+        set_regs: EmulatorSetRegsCallback,
+        translate_gva_page: EmulatorTranslateGvaPageCallback,
+    }
+
+    #[repr(C, align(16))]
+    #[derive(Copy, Clone)]
+    union WhvRegisterValue {
+        reg64: u64,
+        bytes: [u8; 16],
+    }
+
+    impl WhvRegisterValue {
+        fn zeroed() -> Self {
+            Self { bytes: [0u8; 16] }
+        }
+
+        fn from_u64(v: u64) -> Self {
+            let mut bytes = [0u8; 16];
+            bytes[..8].copy_from_slice(&v.to_le_bytes());
+            Self { bytes }
+        }
+
+        fn from_segment(base: u64, limit: u32, sel: u16, attrs: u16) -> Self {
+            let mut bytes = [0u8; 16];
+            bytes[..8].copy_from_slice(&base.to_le_bytes());
+            bytes[8..12].copy_from_slice(&limit.to_le_bytes());
+            bytes[12..14].copy_from_slice(&sel.to_le_bytes());
+            bytes[14..16].copy_from_slice(&attrs.to_le_bytes());
+            Self { bytes }
+        }
+
+        fn from_table(base: u64, limit: u16) -> Self {
+            let mut bytes = [0u8; 16];
+            bytes[6..8].copy_from_slice(&limit.to_le_bytes());
+            bytes[8..16].copy_from_slice(&base.to_le_bytes());
+            Self { bytes }
+        }
+
+        fn low64(self) -> u64 {
+            unsafe { self.reg64 }
+        }
+
+        #[cfg(test)]
+        fn bytes(self) -> [u8; 16] {
+            unsafe { self.bytes }
+        }
+    }
+
+    #[repr(C)]
+    struct WhvEmulatorStatus {
+        as_uint32: u32,
+    }
+
+    impl WhvEmulatorStatus {
+        fn emulation_successful(&self) -> bool {
+            self.as_uint32 & 1 != 0
+        }
+    }
+
+    struct WhpEmulationApi {
+        module: *mut c_void,
+        create_emulator: CreateEmulatorFn,
+        destroy_emulator: DestroyEmulatorFn,
+        try_mmio_emulation: TryMmioEmulationFn,
+    }
 
     struct WhpApi {
         module: *mut c_void,
@@ -241,8 +378,36 @@ mod whp_api {
         create_vp: CreateVpFn,
         delete_vp: DeleteVpFn,
         run_vp: RunVpFn,
+        get_regs: GetRegsFn,
         set_regs: SetRegsFn,
+        translate_gva: TranslateGvaFn,
         cancel_run_vp: CancelRunVpFn,
+    }
+
+    struct WhpEmulator<'a> {
+        api: &'a WhpEmulationApi,
+        handle: *mut c_void,
+    }
+
+    struct VirtioMmioDevice {
+        base: u64,
+        irq: u8,
+        mmio: super::virtio::mmio::Mmio,
+        blk: super::virtio::blk::BlkDevice,
+        last_avail_idx: u16,
+    }
+
+    struct VmEmulationContext {
+        api: *const WhpApi,
+        partition: *mut c_void,
+        host_mem: *mut u8,
+        host_mem_len: usize,
+        virtio: *mut VirtioMmioDevice,
+        pic1: *mut super::pic::Pic,
+        trace_seq: u64,
+        exit_rip: u64,
+        exit_gva: u64,
+        exit_access_type: u32,
     }
 
     unsafe impl Send for WhpApi {}
@@ -274,24 +439,32 @@ mod whp_api {
                 create_vp: resolve(module, b"WHvCreateVirtualProcessor\0")?,
                 delete_vp: resolve(module, b"WHvDeleteVirtualProcessor\0")?,
                 run_vp: resolve(module, b"WHvRunVirtualProcessor\0")?,
+                get_regs: resolve(module, b"WHvGetVirtualProcessorRegisters\0")?,
                 set_regs: resolve(module, b"WHvSetVirtualProcessorRegisters\0")?,
+                translate_gva: resolve(module, b"WHvTranslateGva\0")?,
                 cancel_run_vp: resolve(module, b"WHvCancelRunVirtualProcessor\0")?,
             })
         }
+    }
 
-        fn inject_timer_irq(&self, partition: *mut c_void) -> Result<(), String> {
-            // 直接設定 PendingInterruption register（繞過 LAPIC）
-            // WHvRegisterPendingInterruption = 0x80000000
-            // Layout: bit0=Pending, bits1-3=Type(0=External), bits16-31=Vector
-            let reg_name: u32 = 0x8000_0000;
-            let vector: u32 = 0x20; // PIT IRQ0 → vector 0x20
-            let pending: u64 = 1 | ((vector as u64) << 16);
-            let value = [pending.to_le_bytes(), [0u8; 8]];
-            let hr = unsafe { (self.set_regs)(partition, 0, &reg_name, 1, value.as_ptr().cast()) };
-            if hr < 0 {
-                return Err(format!("inject timer IRQ failed: 0x{hr:08X}"));
+    impl WhpEmulationApi {
+        fn load() -> Result<Self, String> {
+            let module = unsafe {
+                LoadLibraryExA(
+                    WIN_HV_EMULATION_DLL.as_ptr(),
+                    std::ptr::null_mut(),
+                    LOAD_LIBRARY_SEARCH_SYSTEM32,
+                )
+            };
+            if module.is_null() {
+                return Err("WinHvEmulation.dll could not be loaded.".to_string());
             }
-            Ok(())
+            Ok(Self {
+                module,
+                create_emulator: resolve(module, b"WHvEmulatorCreateEmulator\0")?,
+                destroy_emulator: resolve(module, b"WHvEmulatorDestroyEmulator\0")?,
+                try_mmio_emulation: resolve(module, b"WHvEmulatorTryMmioEmulation\0")?,
+            })
         }
     }
 
@@ -299,6 +472,40 @@ mod whp_api {
         fn drop(&mut self) {
             unsafe {
                 FreeLibrary(self.module);
+            }
+        }
+    }
+
+    impl Drop for WhpEmulationApi {
+        fn drop(&mut self) {
+            unsafe {
+                FreeLibrary(self.module);
+            }
+        }
+    }
+
+    impl<'a> WhpEmulator<'a> {
+        fn new(api: &'a WhpEmulationApi) -> Result<Self, String> {
+            let callbacks = WhvEmulatorCallbacks {
+                size: size_of::<WhvEmulatorCallbacks>() as u32,
+                reserved: 0,
+                io_port: emulator_io_port_callback,
+                memory: emulator_memory_callback,
+                get_regs: emulator_get_regs_callback,
+                set_regs: emulator_set_regs_callback,
+                translate_gva_page: emulator_translate_gva_page_callback,
+            };
+            let mut handle = std::ptr::null_mut();
+            let hr = unsafe { (api.create_emulator)(&callbacks, &mut handle) };
+            check_hr(hr, "WHvEmulatorCreateEmulator")?;
+            Ok(Self { api, handle })
+        }
+    }
+
+    impl Drop for WhpEmulator<'_> {
+        fn drop(&mut self) {
+            unsafe {
+                (self.api.destroy_emulator)(self.handle);
             }
         }
     }
@@ -323,29 +530,468 @@ mod whp_api {
         }
     }
 
+    fn access_type_name(access_type: u32) -> &'static str {
+        match access_type {
+            0 => "read",
+            1 => "write",
+            2 => "execute",
+            _ => "unknown",
+        }
+    }
+
+    fn env_trace_enabled(name: &str) -> bool {
+        matches!(std::env::var(name), Ok(value) if !value.is_empty() && value != "0")
+    }
+
+    fn trace_mmio_enabled() -> bool {
+        *MMIO_TRACE_ENABLED.get_or_init(|| env_trace_enabled("CHEFER_WHP_TRACE_MMIO"))
+    }
+
+    fn trace_platform_enabled() -> bool {
+        *PLATFORM_TRACE_ENABLED.get_or_init(|| env_trace_enabled("CHEFER_WHP_TRACE_PLATFORM"))
+    }
+
+    fn trace_mmio(seq: u64, stage: &str, gpa: u64, gva: u64, rip: u64, detail: &str) {
+        if !trace_mmio_enabled() {
+            return;
+        }
+        eprintln!(
+            "[mmio {seq}] {stage}: GPA=0x{gpa:016X} GVA=0x{gva:016X} RIP=0x{rip:016X} {detail}"
+        );
+        let mut stderr = std::io::stderr();
+        let _ = stderr.flush();
+    }
+
+    fn trace_platform(stage: &str, detail: &str) {
+        if !trace_platform_enabled() {
+            return;
+        }
+        let seq = PLATFORM_TRACE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+        eprintln!("[platform {seq}] {stage}: {detail}");
+        let mut stderr = std::io::stderr();
+        let _ = stderr.flush();
+    }
+
+    fn append_virtio_mmio_cmdline(cmdline: &str) -> String {
+        if cmdline.contains("virtio_mmio.device=") {
+            cmdline.to_string()
+        } else if cmdline.trim().is_empty() {
+            VIRTIO_MMIO_CMDLINE.to_string()
+        } else {
+            format!("{cmdline} {VIRTIO_MMIO_CMDLINE}")
+        }
+    }
+
+    impl VirtioMmioDevice {
+        fn new(backing: Vec<u8>) -> Self {
+            Self {
+                base: VIRTIO_MMIO_BASE,
+                irq: VIRTIO_MMIO_IRQ,
+                mmio: super::virtio::mmio::Mmio::new(
+                    super::virtio::DEVICE_ID_BLK,
+                    super::virtio::VIRTIO_F_VERSION_1,
+                    1,
+                    256,
+                ),
+                blk: super::virtio::blk::BlkDevice::new(backing, true, "chefer-bundle"),
+                last_avail_idx: 0,
+            }
+        }
+
+        fn contains(&self, gpa: u64) -> bool {
+            (self.base..self.base + VIRTIO_MMIO_SIZE).contains(&gpa)
+        }
+
+        fn read_bytes(&self, offset: u64, len: usize) -> Result<[u8; 8], String> {
+            if len == 0 || len > 8 {
+                return Err(format!("unsupported MMIO read size {len}"));
+            }
+            let mut out = [0u8; 8];
+            for (i, slot) in out.iter_mut().enumerate().take(len) {
+                let cur = offset + i as u64;
+                let aligned = cur & !0x3;
+                let word = if aligned >= 0x100 {
+                    self.blk.config_read(aligned - 0x100, 4)
+                } else {
+                    self.mmio.read(aligned)
+                };
+                *slot = word.to_le_bytes()[(cur - aligned) as usize];
+            }
+            Ok(out)
+        }
+
+        fn write_bytes(
+            &mut self,
+            offset: u64,
+            data: &[u8],
+            host_mem: &mut [u8],
+            pic1: &mut super::pic::Pic,
+        ) -> Result<(), String> {
+            if data.is_empty() || data.len() > 4 {
+                return Err(format!("unsupported MMIO write size {}", data.len()));
+            }
+            let aligned = offset & !0x3;
+            let byte_off = (offset - aligned) as usize;
+            if byte_off + data.len() > 4 {
+                return Err(format!(
+                    "cross-register MMIO write is unsupported: offset=0x{offset:X} len={}",
+                    data.len()
+                ));
+            }
+            let mut merged = if data.len() == 4 && byte_off == 0 {
+                [0u8; 4]
+            } else if aligned >= 0x100 {
+                self.blk.config_read(aligned - 0x100, 4).to_le_bytes()
+            } else {
+                self.mmio.read(aligned).to_le_bytes()
+            };
+            merged[byte_off..byte_off + data.len()].copy_from_slice(data);
+            let action = self.mmio.write(aligned, u32::from_le_bytes(merged));
+            self.handle_action(action, host_mem, pic1)
+        }
+
+        fn handle_action(
+            &mut self,
+            action: super::virtio::mmio::MmioAction,
+            host_mem: &mut [u8],
+            pic1: &mut super::pic::Pic,
+        ) -> Result<(), String> {
+            match action {
+                super::virtio::mmio::MmioAction::None => Ok(()),
+                super::virtio::mmio::MmioAction::Reset => {
+                    self.last_avail_idx = 0;
+                    Ok(())
+                }
+                super::virtio::mmio::MmioAction::QueueNotify(queue) => {
+                    self.process_queue(queue, host_mem, pic1)
+                }
+                super::virtio::mmio::MmioAction::ConfigRead { .. } => Ok(()),
+                super::virtio::mmio::MmioAction::ConfigWrite { .. } => Ok(()),
+            }
+        }
+
+        fn process_queue(
+            &mut self,
+            queue: u32,
+            host_mem: &mut [u8],
+            pic1: &mut super::pic::Pic,
+        ) -> Result<(), String> {
+            let Some(cfg) = self.mmio.queue(queue as usize).copied() else {
+                return Err(format!("virtio queue {queue} does not exist"));
+            };
+            let mut mem = super::virtio::SliceMem::new(0, host_mem);
+            let mut idx = self.last_avail_idx;
+            let mut used_any = false;
+            loop {
+                // 取一條 chain：split 僅在此 scope 內借 mem，取完即釋放，
+                // 讓接下來的 process_chain 能再借 mem（避免 E0499）。
+                let chain = {
+                    let mut split = super::virtio::queue::SplitQueue::new(cfg, &mut mem, idx);
+                    let chain = split.pop_avail()?;
+                    idx = split.last_avail_idx();
+                    chain
+                };
+                let Some(chain) = chain else { break };
+                let written = self.blk.process_chain(&chain, &mut mem)?;
+                // 回填 used ring：再借一次 mem（push_used 從 used ring 自身讀 idx，
+                // 不依賴 last_avail_idx，故重建 split 安全）。
+                {
+                    let mut split = super::virtio::queue::SplitQueue::new(cfg, &mut mem, idx);
+                    split.push_used(chain.head, written)?;
+                }
+                self.mmio.signal_used();
+                used_any = true;
+            }
+            self.last_avail_idx = idx;
+            if used_any {
+                pic1.request_irq(self.irq);
+            }
+            Ok(())
+        }
+    }
+
+    unsafe extern "system" fn emulator_io_port_callback(
+        _context: *mut c_void,
+        _io_access: *mut WhvEmulatorIoAccessInfo,
+    ) -> i32 {
+        E_FAIL
+    }
+
+    unsafe extern "system" fn emulator_memory_callback(
+        context: *mut c_void,
+        memory_access: *mut WhvEmulatorMemoryAccessInfo,
+    ) -> i32 {
+        unsafe {
+            let ctx = &mut *(context as *mut VmEmulationContext);
+            let access = &mut *memory_access;
+            let len = access.access_size as usize;
+            if len == 0 || len > access.data.len() {
+                trace_mmio(
+                    ctx.trace_seq,
+                    "callback-invalid-len",
+                    access.gpa_address,
+                    ctx.exit_gva,
+                    ctx.exit_rip,
+                    &format!(
+                        "exit_access={} callback_len={len}",
+                        access_type_name(ctx.exit_access_type)
+                    ),
+                );
+                return E_FAIL;
+            }
+
+            let direction = if access.direction == EMULATOR_DIRECTION_WRITE {
+                "write"
+            } else {
+                "read"
+            };
+            trace_mmio(
+                ctx.trace_seq,
+                "callback-enter",
+                access.gpa_address,
+                ctx.exit_gva,
+                ctx.exit_rip,
+                &format!(
+                    "exit_access={} callback_access={direction} len={len}",
+                    access_type_name(ctx.exit_access_type)
+                ),
+            );
+
+            // 直接從 ctx 的各獨立 raw pointer 欄位 deref（disjoint field borrow），
+            // 避免透過 &mut self helper 重複借用整個 *ctx（E0499）。virtio / host_mem /
+            // pic1 指向三個不同物件，分別 deref 不會 alias。
+            let virtio = &mut *ctx.virtio;
+            if virtio.contains(access.gpa_address) {
+                let offset = access.gpa_address - virtio.base;
+                if access.direction == EMULATOR_DIRECTION_WRITE {
+                    let host = std::slice::from_raw_parts_mut(ctx.host_mem, ctx.host_mem_len);
+                    let pic1 = &mut *ctx.pic1;
+                    if let Err(err) = virtio.write_bytes(offset, &access.data[..len], host, pic1) {
+                        eprintln!(
+                            "virtio-mmio write failed at 0x{:X}: {err}",
+                            access.gpa_address
+                        );
+                        trace_mmio(
+                            ctx.trace_seq,
+                            "callback-virtio-write-fail",
+                            access.gpa_address,
+                            ctx.exit_gva,
+                            ctx.exit_rip,
+                            &format!("offset=0x{offset:X} len={len} err={err}"),
+                        );
+                        return E_FAIL;
+                    }
+                } else {
+                    match virtio.read_bytes(offset, len) {
+                        Ok(bytes) => access.data[..len].copy_from_slice(&bytes[..len]),
+                        Err(err) => {
+                            eprintln!(
+                                "virtio-mmio read failed at 0x{:X}: {err}",
+                                access.gpa_address
+                            );
+                            trace_mmio(
+                                ctx.trace_seq,
+                                "callback-virtio-read-fail",
+                                access.gpa_address,
+                                ctx.exit_gva,
+                                ctx.exit_rip,
+                                &format!("offset=0x{offset:X} len={len} err={err}"),
+                            );
+                            return E_FAIL;
+                        }
+                    }
+                }
+                trace_mmio(
+                    ctx.trace_seq,
+                    "callback-virtio-ok",
+                    access.gpa_address,
+                    ctx.exit_gva,
+                    ctx.exit_rip,
+                    &format!("access={direction} len={len} offset=0x{offset:X}"),
+                );
+                return 0;
+            }
+
+            let Some(end) = access.gpa_address.checked_add(len as u64) else {
+                trace_mmio(
+                    ctx.trace_seq,
+                    "callback-hostmem-overflow",
+                    access.gpa_address,
+                    ctx.exit_gva,
+                    ctx.exit_rip,
+                    &format!("access={direction} len={len}"),
+                );
+                return E_FAIL;
+            };
+            if end > ctx.host_mem_len as u64 {
+                trace_mmio(
+                    ctx.trace_seq,
+                    "callback-hostmem-oob",
+                    access.gpa_address,
+                    ctx.exit_gva,
+                    ctx.exit_rip,
+                    &format!(
+                        "access={direction} len={len} host_mem_len=0x{:X}",
+                        ctx.host_mem_len
+                    ),
+                );
+                return E_FAIL;
+            }
+            let off = access.gpa_address as usize;
+            let host = std::slice::from_raw_parts_mut(ctx.host_mem, ctx.host_mem_len);
+            if access.direction == EMULATOR_DIRECTION_WRITE {
+                host[off..off + len].copy_from_slice(&access.data[..len]);
+            } else {
+                access.data[..len].copy_from_slice(&host[off..off + len]);
+            }
+            trace_mmio(
+                ctx.trace_seq,
+                "callback-hostmem-ok",
+                access.gpa_address,
+                ctx.exit_gva,
+                ctx.exit_rip,
+                &format!("access={direction} len={len} off=0x{off:X}"),
+            );
+            0
+        }
+    }
+
+    unsafe extern "system" fn emulator_get_regs_callback(
+        context: *mut c_void,
+        register_names: *const u32,
+        register_count: u32,
+        register_values: *mut WhvRegisterValue,
+    ) -> i32 {
+        unsafe {
+            let ctx = &*(context as *mut VmEmulationContext);
+            ((*ctx.api).get_regs)(
+                ctx.partition,
+                0,
+                register_names,
+                register_count,
+                register_values,
+            )
+        }
+    }
+
+    unsafe extern "system" fn emulator_set_regs_callback(
+        context: *mut c_void,
+        register_names: *const u32,
+        register_count: u32,
+        register_values: *const WhvRegisterValue,
+    ) -> i32 {
+        unsafe {
+            let ctx = &*(context as *mut VmEmulationContext);
+            ((*ctx.api).set_regs)(
+                ctx.partition,
+                0,
+                register_names,
+                register_count,
+                register_values,
+            )
+        }
+    }
+
+    unsafe extern "system" fn emulator_translate_gva_page_callback(
+        context: *mut c_void,
+        gva: u64,
+        translate_flags: u32,
+        translation_result: *mut u32,
+        gpa: *mut u64,
+    ) -> i32 {
+        unsafe {
+            #[repr(C)]
+            struct WhvTranslateGvaResult {
+                result_code: u32,
+                reserved: u32,
+            }
+
+            let ctx = &*(context as *mut VmEmulationContext);
+            let mut result = WhvTranslateGvaResult {
+                result_code: 0,
+                reserved: 0,
+            };
+            let hr = ((*ctx.api).translate_gva)(
+                ctx.partition,
+                0,
+                gva,
+                translate_flags,
+                (&mut result as *mut WhvTranslateGvaResult).cast(),
+                gpa,
+            );
+            if hr >= 0 {
+                *translation_result = result.result_code;
+            }
+            hr
+        }
+    }
+
+    fn deliver_pending_pic_irq(
+        api: &WhpApi,
+        partition: *mut c_void,
+        pic1: &mut super::pic::Pic,
+    ) -> Result<(), String> {
+        if !external_interrupt_deliverable(api, partition)? {
+            trace_platform("pending-irq-deferred", "guest not deliverable yet");
+            return Ok(());
+        }
+        let Some(vector) = pic1.take_pending_vector() else {
+            return Ok(());
+        };
+        trace_platform("pending-irq-enter", &format!("vector=0x{vector:02X}"));
+        // WHP 在 nolapic + dummy LAPIC 頁的設定下，無法經 LAPIC（WHvRequestInterrupt）
+        // 把中斷遞送到 guest；必須用 WHvRegisterPendingInterruption register 直接注入
+        // vector（繞過 LAPIC，CPU 在下個 instruction boundary 接受）。見 docs/DESIGN.md §4。
+        // PendingInterruption layout：bit0=Pending、bits1-3=Type(0=external)、bits16-31=Vector。
+        const REG_PENDING_INTERRUPTION: u32 = 0x8000_0000;
+        let pending: u64 = 1 | ((vector as u64) << 16);
+        let value = reg_u64(pending);
+        let hr = unsafe { (api.set_regs)(partition, 0, &REG_PENDING_INTERRUPTION, 1, &value) };
+        trace_platform(
+            "pending-irq-return",
+            &format!("vector=0x{vector:02X} hr=0x{:08X}", hr as u32),
+        );
+        check_hr(hr, "WHvSetVirtualProcessorRegisters(PendingInterruption)")
+    }
+
+    fn external_interrupt_deliverable(
+        api: &WhpApi,
+        partition: *mut c_void,
+    ) -> Result<bool, String> {
+        const REG_PENDING_INTERRUPTION: u32 = 0x8000_0000;
+        const REG_INTERRUPT_STATE: u32 = 0x8000_0001;
+        let regs = [REG_PENDING_INTERRUPTION, REG_INTERRUPT_STATE];
+        let mut values = [WhvRegisterValue::zeroed(); 2];
+        let hr = unsafe {
+            (api.get_regs)(
+                partition,
+                0,
+                regs.as_ptr(),
+                regs.len() as u32,
+                values.as_mut_ptr(),
+            )
+        };
+        check_hr(
+            hr,
+            "WHvGetVirtualProcessorRegisters(InterruptDeliveryState)",
+        )?;
+        let pending = values[0].low64();
+        let interrupt_state = values[1].low64();
+        Ok((pending & 1) == 0 && (interrupt_state & 1) == 0)
+    }
+
     // ── WHV_REGISTER_VALUE helpers (16-byte union) ──
 
-    fn reg_u64(v: u64) -> [u8; 16] {
-        let mut b = [0u8; 16];
-        b[..8].copy_from_slice(&v.to_le_bytes());
-        b
+    fn reg_u64(v: u64) -> WhvRegisterValue {
+        WhvRegisterValue::from_u64(v)
     }
 
-    fn reg_seg(base: u64, limit: u32, sel: u16, attrs: u16) -> [u8; 16] {
-        let mut b = [0u8; 16];
-        b[..8].copy_from_slice(&base.to_le_bytes());
-        b[8..12].copy_from_slice(&limit.to_le_bytes());
-        b[12..14].copy_from_slice(&sel.to_le_bytes());
-        b[14..16].copy_from_slice(&attrs.to_le_bytes());
-        b
+    fn reg_seg(base: u64, limit: u32, sel: u16, attrs: u16) -> WhvRegisterValue {
+        WhvRegisterValue::from_segment(base, limit, sel, attrs)
     }
 
-    fn reg_table(base: u64, limit: u16) -> [u8; 16] {
-        let mut b = [0u8; 16];
-        // WHV_X64_TABLE_REGISTER: Pad[3] (6 bytes) | Limit (u16) | Base (u64)
-        b[6..8].copy_from_slice(&limit.to_le_bytes());
-        b[8..16].copy_from_slice(&base.to_le_bytes());
-        b
+    fn reg_table(base: u64, limit: u16) -> WhvRegisterValue {
+        WhvRegisterValue::from_table(base, limit)
     }
 
     // ── Preflight ──
@@ -449,6 +1095,13 @@ mod whp_api {
             .map_err(|e| format!("Failed to read kernel {}: {e}", req.kernel.display()))?;
         let initramfs_data = std::fs::read(&req.initramfs)
             .map_err(|e| format!("Failed to read initramfs {}: {e}", req.initramfs.display()))?;
+        let cmdline = append_virtio_mmio_cmdline(&req.cmdline);
+        let bundle_image = super::virtio::image::pack_dir(&req.bundle_dir).map_err(|e| {
+            format!(
+                "Failed to pack bundle dir {}: {e}",
+                req.bundle_dir.display()
+            )
+        })?;
 
         // 2. 解析 bzImage
         let info = bzimage::parse(&kernel_data)?;
@@ -462,7 +1115,8 @@ mod whp_api {
 
         // 3. 計算 layout
         let mem_size = req.memory_mib as usize * 1024 * 1024;
-        let initrd_gpa = bzimage::initrd_gpa(info.kernel_size);
+        let initrd_gpa =
+            bzimage::initrd_gpa(info.kernel_size, initramfs_data.len(), mem_size as u64);
         let initrd_end = initrd_gpa as usize + initramfs_data.len();
         if initrd_end > mem_size {
             return Err(format!(
@@ -473,6 +1127,7 @@ mod whp_api {
 
         // 4. 載入 WHP API + 建立 partition
         let api = WhpApi::load()?;
+        let emulation = WhpEmulationApi::load()?;
         let mut partition: *mut c_void = std::ptr::null_mut();
         check_hr(
             unsafe { (api.create)(&mut partition) },
@@ -560,6 +1215,8 @@ mod whp_api {
 
         let mem: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(host_mem as *mut u8, mem_size) };
+        let mut virtio_blk = VirtioMmioDevice::new(bundle_image);
+        let emulator = WhpEmulator::new(&emulation)?;
 
         // 5b. 映射 LAPIC MMIO 頁面（GPA 0xFEE00000, 4KB）
         // WHP LAPIC emulation 在此平台不攔截 MMIO，改用 dummy 記憶體頁
@@ -607,7 +1264,7 @@ mod whp_api {
         bzimage::write_boot_params(
             mem,
             &info,
-            &req.cmdline,
+            &cmdline,
             initrd_gpa,
             initramfs_data.len() as u64,
             mem_size as u64,
@@ -640,13 +1297,17 @@ mod whp_api {
         // 11. 啟動 timer 執行緒（每 10ms cancel VP → run loop 注入 timer IRQ）
         let stop_timer = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_flag = stop_timer.clone();
+        let vp_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let vp_running_flag = vp_running.clone();
         let part_ptr = partition as usize;
         let cancel_fn = api.cancel_run_vp;
         let timer_thread = std::thread::spawn(move || {
             let partition = part_ptr as *mut c_void;
             while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_millis(10));
-                if !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                if !stop_flag.load(std::sync::atomic::Ordering::Relaxed)
+                    && vp_running_flag.load(std::sync::atomic::Ordering::Relaxed)
+                {
                     unsafe { cancel_fn(partition, 0, 0) };
                 }
             }
@@ -663,12 +1324,16 @@ mod whp_api {
         let result = run_loop(
             &api,
             partition,
+            &emulator,
+            mem,
+            &mut virtio_blk,
             &mut serial_port,
             &mut cmos_addr,
             &mut pic1,
             &mut pic2,
             &mut pit,
             &mut last_printed,
+            vp_running.as_ref(),
             std::time::Duration::from_secs(req.timeout_secs),
         );
 
@@ -712,7 +1377,7 @@ mod whp_api {
         const DS_ATTRS: u16 = 0xC093;
         const TR_ATTRS: u16 = 0x008B;
 
-        let values: [[u8; 16]; 20] = [
+        let values: [WhvRegisterValue; 20] = [
             reg_u64(0x0000_0031),                    // CR0: PE + NE + ET, NO PG
             reg_u64(0),                              // CR3: 0 (paging off)
             reg_u64(0),                              // CR4: 0 (kernel sets PAE)
@@ -741,7 +1406,7 @@ mod whp_api {
                 0,
                 names.as_ptr(),
                 names.len() as u32,
-                values.as_ptr().cast(),
+                values.as_ptr(),
             )
         };
         check_hr(hr, "WHvSetVirtualProcessorRegisters(initial)")
@@ -751,25 +1416,64 @@ mod whp_api {
     fn run_loop(
         api: &WhpApi,
         partition: *mut c_void,
+        emulator: &WhpEmulator<'_>,
+        host_mem: &mut [u8],
+        virtio_blk: &mut VirtioMmioDevice,
         serial: &mut super::serial::SerialPort,
         cmos_addr: &mut u8,
         pic1: &mut super::pic::Pic,
         pic2: &mut super::pic::Pic,
         pit: &mut super::pic::Pit,
         last_printed: &mut usize,
+        vp_running: &std::sync::atomic::AtomicBool,
         timeout: std::time::Duration,
     ) -> Result<(), String> {
+        #[derive(Default)]
+        struct ExitStats {
+            none: u64,
+            mem: u64,
+            io: u64,
+            halt: u64,
+            canceled: u64,
+            other: u64,
+        }
+
+        fn exit_reason_name(reason: u32) -> &'static str {
+            match reason {
+                EXIT_NONE => "none",
+                EXIT_MEM_ACCESS => "memory-access",
+                EXIT_IO_PORT => "io-port",
+                EXIT_UNRECOVERABLE => "unrecoverable",
+                EXIT_INVALID_VP_STATE => "invalid-vp-state",
+                EXIT_HALT => "halt",
+                EXIT_EXCEPTION => "exception",
+                EXIT_CANCELED => "canceled",
+                _ => "other",
+            }
+        }
+
         let mut exit_ctx = [0u8; 4096];
         let start = std::time::Instant::now();
+        let mut exit_stats = ExitStats::default();
+        let mut last_reason = EXIT_NONE;
+        let mut last_rip = 0u64;
+        let mut exit_trace_seq = 0u64;
 
         loop {
             if start.elapsed() > timeout {
                 flush_serial(serial, last_printed);
                 return Err(format!(
-                    "Guest boot timed out after {} seconds",
-                    timeout.as_secs()
+                    "Guest boot timed out after {} seconds (last exit={} 0x{last_reason:04X}, RIP=0x{last_rip:016X}, counts: io={} mem={} halt={} canceled={} other={})",
+                    timeout.as_secs(),
+                    exit_reason_name(last_reason),
+                    exit_stats.io,
+                    exit_stats.mem,
+                    exit_stats.halt,
+                    exit_stats.canceled,
+                    exit_stats.other
                 ));
             }
+            vp_running.store(true, Ordering::Relaxed);
             let hr = unsafe {
                 (api.run_vp)(
                     partition,
@@ -778,6 +1482,7 @@ mod whp_api {
                     exit_ctx.len() as u32,
                 )
             };
+            vp_running.store(false, Ordering::Relaxed);
             check_hr(hr, "WHvRunVirtualProcessor")?;
 
             let reason = u32::from_le_bytes(
@@ -785,15 +1490,51 @@ mod whp_api {
                     .try_into()
                     .unwrap(),
             );
+            let rip = u64::from_le_bytes(exit_ctx[EC_RIP..EC_RIP + 8].try_into().unwrap());
+            last_reason = reason;
+            last_rip = rip;
+            exit_trace_seq += 1;
+            if trace_platform_enabled() && exit_trace_seq <= 256 {
+                eprintln!(
+                    "[vm-exit {exit_trace_seq}] reason={} (0x{reason:04X}) RIP=0x{rip:016X}",
+                    exit_reason_name(reason)
+                );
+                let mut stderr = std::io::stderr();
+                let _ = stderr.flush();
+            }
 
             match reason {
                 EXIT_IO_PORT => {
+                    exit_stats.io += 1;
                     handle_io_exit(
                         api, partition, &exit_ctx, serial, cmos_addr, pic1, pic2, pit,
                     )?;
+                    if exit_trace_seq <= 256 {
+                        trace_platform(
+                            "io-exit-handled",
+                            &format!("seq={exit_trace_seq} rip=0x{rip:016X}"),
+                        );
+                    }
+                    let rflags =
+                        u64::from_le_bytes(exit_ctx[EC_RFLAGS..EC_RFLAGS + 8].try_into().unwrap());
+                    if rflags & 0x200 != 0 {
+                        let _ = deliver_pending_pic_irq(api, partition, pic1);
+                    }
+                    if exit_trace_seq <= 256 {
+                        trace_platform(
+                            "io-exit-finished",
+                            &format!("seq={exit_trace_seq} rip=0x{rip:016X}"),
+                        );
+                    }
                     flush_serial(serial, last_printed);
                 }
                 EXIT_HALT | EXIT_NONE | EXIT_CANCELED => {
+                    match reason {
+                        EXIT_HALT => exit_stats.halt += 1,
+                        EXIT_NONE => exit_stats.none += 1,
+                        EXIT_CANCELED => exit_stats.canceled += 1,
+                        _ => {}
+                    }
                     flush_serial(serial, last_printed);
                     let output = serial.output_str();
                     if let Some(code) = parse_guest_exit(&output) {
@@ -817,20 +1558,85 @@ mod whp_api {
                         return Err("Guest halted with interrupts disabled".to_string());
                     }
                     if rflags & 0x200 != 0 {
-                        let _ = api.inject_timer_irq(partition);
+                        pic1.request_irq(0);
+                        let _ = deliver_pending_pic_irq(api, partition, pic1);
                     }
                 }
                 EXIT_MEM_ACCESS => {
+                    exit_stats.mem += 1;
+                    let trace_seq = MMIO_TRACE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+                    let access_info = u32::from_le_bytes(
+                        exit_ctx[EC_MEM_ACCESS_INFO..EC_MEM_ACCESS_INFO + 4]
+                            .try_into()
+                            .unwrap(),
+                    );
                     let gpa = u64::from_le_bytes(
                         exit_ctx[EC_MEM_GPA..EC_MEM_GPA + 8].try_into().unwrap(),
                     );
-                    let rip = u64::from_le_bytes(exit_ctx[EC_RIP..EC_RIP + 8].try_into().unwrap());
-                    return Err(format!(
-                        "Memory access fault at GPA 0x{gpa:016X} (RIP=0x{rip:016X})"
-                    ));
+                    let gva = u64::from_le_bytes(
+                        exit_ctx[EC_MEM_GVA..EC_MEM_GVA + 8].try_into().unwrap(),
+                    );
+                    let access_type = access_info & 0x3;
+                    trace_mmio(
+                        trace_seq,
+                        "exit-mem",
+                        gpa,
+                        gva,
+                        rip,
+                        &format!("exit_access={}", access_type_name(access_type)),
+                    );
+                    if !virtio_blk.contains(gpa) {
+                        return Err(format!(
+                            "Memory access fault at GPA 0x{gpa:016X} (RIP=0x{rip:016X})"
+                        ));
+                    }
+
+                    let vp_ctx = &exit_ctx[8..8 + 40];
+                    let mmio_ctx = &exit_ctx[48..48 + 40];
+                    let mut emu_ctx = VmEmulationContext {
+                        api: api as *const WhpApi,
+                        partition,
+                        host_mem: host_mem.as_mut_ptr(),
+                        host_mem_len: host_mem.len(),
+                        virtio: virtio_blk as *mut VirtioMmioDevice,
+                        pic1: pic1 as *mut super::pic::Pic,
+                        trace_seq,
+                        exit_rip: rip,
+                        exit_gva: gva,
+                        exit_access_type: access_type,
+                    };
+                    let mut status = WhvEmulatorStatus { as_uint32: 0 };
+                    let hr = unsafe {
+                        (emulator.api.try_mmio_emulation)(
+                            emulator.handle,
+                            (&mut emu_ctx as *mut VmEmulationContext).cast(),
+                            vp_ctx.as_ptr().cast(),
+                            mmio_ctx.as_ptr().cast(),
+                            &mut status,
+                        )
+                    };
+                    trace_mmio(
+                        trace_seq,
+                        "exit-mem-return",
+                        gpa,
+                        gva,
+                        rip,
+                        &format!("hr=0x{:08X} status=0x{:08X}", hr as u32, status.as_uint32),
+                    );
+                    check_hr(hr, "WHvEmulatorTryMmioEmulation")?;
+                    if !status.emulation_successful() {
+                        return Err(format!(
+                            "MMIO emulation failed at GPA 0x{gpa:016X} (RIP=0x{rip:016X}, status=0x{:08X})",
+                            status.as_uint32
+                        ));
+                    }
+                    let rflags =
+                        u64::from_le_bytes(exit_ctx[EC_RFLAGS..EC_RFLAGS + 8].try_into().unwrap());
+                    if rflags & 0x200 != 0 {
+                        let _ = deliver_pending_pic_irq(api, partition, pic1);
+                    }
                 }
                 EXIT_EXCEPTION => {
-                    let rip = u64::from_le_bytes(exit_ctx[EC_RIP..EC_RIP + 8].try_into().unwrap());
                     let exc_type = exit_ctx[EC_EXC_TYPE];
                     let error_code = u32::from_le_bytes(
                         exit_ctx[EC_EXC_ERROR..EC_EXC_ERROR + 4].try_into().unwrap(),
@@ -861,13 +1667,11 @@ mod whp_api {
                     return Err(format!("Guest exception {name} at RIP=0x{rip:016X}"));
                 }
                 EXIT_UNRECOVERABLE => {
-                    let rip = u64::from_le_bytes(exit_ctx[EC_RIP..EC_RIP + 8].try_into().unwrap());
                     return Err(format!(
                         "Unrecoverable exception (triple fault) at RIP=0x{rip:016X}"
                     ));
                 }
                 EXIT_INVALID_VP_STATE => {
-                    let rip = u64::from_le_bytes(exit_ctx[EC_RIP..EC_RIP + 8].try_into().unwrap());
                     return Err(format!("Invalid VP register state at RIP=0x{rip:016X}"));
                 }
                 other => {
@@ -963,7 +1767,7 @@ mod whp_api {
         // 推進 RIP + 更新 RAX
         let names = [REG_RIP, REG_RAX];
         let values = [reg_u64(rip + instr_len), reg_u64(new_rax)];
-        let hr = unsafe { (api.set_regs)(partition, 0, names.as_ptr(), 2, values.as_ptr().cast()) };
+        let hr = unsafe { (api.set_regs)(partition, 0, names.as_ptr(), 2, values.as_ptr()) };
         check_hr(hr, "WHvSetVirtualProcessorRegisters(advance RIP)")
     }
 
@@ -998,30 +1802,42 @@ mod whp_api {
         #[test]
         fn reg_u64_layout() {
             let v = reg_u64(0x1234_5678_9ABC_DEF0);
+            let bytes = v.bytes();
             assert_eq!(
-                u64::from_le_bytes(v[..8].try_into().unwrap()),
+                u64::from_le_bytes(bytes[..8].try_into().unwrap()),
                 0x1234_5678_9ABC_DEF0
             );
-            assert_eq!(u64::from_le_bytes(v[8..16].try_into().unwrap()), 0);
+            assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), 0);
         }
 
         #[test]
         fn reg_seg_layout() {
             let v = reg_seg(0x1000, 0xFFFF_FFFF, 0x10, 0xC09B);
-            assert_eq!(u64::from_le_bytes(v[..8].try_into().unwrap()), 0x1000); // base
+            let bytes = v.bytes();
+            assert_eq!(u64::from_le_bytes(bytes[..8].try_into().unwrap()), 0x1000); // base
             assert_eq!(
-                u32::from_le_bytes(v[8..12].try_into().unwrap()),
+                u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
                 0xFFFF_FFFF
             ); // limit
-            assert_eq!(u16::from_le_bytes(v[12..14].try_into().unwrap()), 0x10); // selector
-            assert_eq!(u16::from_le_bytes(v[14..16].try_into().unwrap()), 0xC09B); // attrs
+            assert_eq!(u16::from_le_bytes(bytes[12..14].try_into().unwrap()), 0x10); // selector
+            assert_eq!(
+                u16::from_le_bytes(bytes[14..16].try_into().unwrap()),
+                0xC09B
+            ); // attrs
         }
 
         #[test]
         fn reg_table_layout() {
             let v = reg_table(0x1000, 31);
-            assert_eq!(u16::from_le_bytes(v[6..8].try_into().unwrap()), 31); // limit
-            assert_eq!(u64::from_le_bytes(v[8..16].try_into().unwrap()), 0x1000); // base
+            let bytes = v.bytes();
+            assert_eq!(u16::from_le_bytes(bytes[6..8].try_into().unwrap()), 31); // limit
+            assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), 0x1000); // base
+        }
+
+        #[test]
+        fn whv_register_value_matches_sdk_alignment() {
+            assert_eq!(std::mem::size_of::<WhvRegisterValue>(), 16);
+            assert_eq!(std::mem::align_of::<WhvRegisterValue>(), 16);
         }
 
         #[test]

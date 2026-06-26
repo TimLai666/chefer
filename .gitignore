@@ -11,3 +11,6 @@ test-initramfs*.cpio
 # test-init crate 的編譯產物（源碼保留，build artifacts 不追蹤）
 crates/whp-helper/test-init/target/
 crates/whp-helper/test-init/Cargo.lock
+
+# codex/實機除錯的暫存工作目錄
+tmp/

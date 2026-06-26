@@ -8,14 +8,28 @@ mountpoint() {
   grep -qs " $1 " /proc/mounts
 }
 
+report() {
+  msg="$1"
+  if [ -w /dev/kmsg ]; then
+    # `quiet` 會壓低 console_loglevel；用高優先序 kmsg 確保關鍵標記仍會出現在 console。
+    printf '<0>%s\n' "$msg" >/dev/kmsg 2>/dev/null || printf '%s\n' "$msg"
+  else
+    printf '%s\n' "$msg"
+  fi
+}
+
 log() {
-  echo "[chefer-init] $*"
+  report "[chefer-init] $*"
+}
+
+emit_exit() {
+  report "CHEFER_GUEST_EXIT=$1"
 }
 
 fail() {
   code="${2:-1}"
   log "錯誤：$1"
-  echo "CHEFER_GUEST_EXIT=${code}"
+  emit_exit "$code"
   sync
   poweroff -f >/dev/null 2>&1 || halt -f >/dev/null 2>&1 || true
   while true; do sleep 3600; done
@@ -53,18 +67,33 @@ bundle_dir="$(cmd_arg chefer.bundle_dir || true)"
 data_dir="$(cmd_arg chefer.data_dir || true)"
 keep_rootfs="$(cmd_arg chefer.keep_rootfs || true)"
 
-[ -n "$bundle_tag" ] || fail "kernel cmdline 缺 chefer.bundle_tag" 125
-[ -n "$data_tag" ] || fail "kernel cmdline 缺 chefer.data_tag" 125
 [ -n "$bundle_dir" ] || fail "kernel cmdline 缺 chefer.bundle_dir" 125
 [ -n "$data_dir" ] || fail "kernel cmdline 缺 chefer.data_dir" 125
 
 mkdir -p "$bundle_dir" "$data_dir"
-log "掛載 bundle virtiofs tag=${bundle_tag} -> ${bundle_dir}"
-mount -t virtiofs -o ro "$bundle_tag" "$bundle_dir" \
-  || fail "無法掛載唯讀 bundle virtiofs（tag=${bundle_tag}）；請確認 QEMU/VZ 已提供共享目錄" 126
-log "掛載 data virtiofs tag=${data_tag} -> ${data_dir}"
-mount -t virtiofs "$data_tag" "$data_dir" \
-  || fail "無法掛載可寫 data virtiofs（tag=${data_tag}）；請確認 QEMU/VZ 已提供共享目錄" 126
+if [ -e /dev/hvc0 ]; then
+  [ -n "$bundle_tag" ] || fail "kernel cmdline 缺 chefer.bundle_tag" 125
+  [ -n "$data_tag" ] || fail "kernel cmdline 缺 chefer.data_tag" 125
+  log "掛載 bundle virtiofs tag=${bundle_tag} -> ${bundle_dir}"
+  mount -t virtiofs -o ro "$bundle_tag" "$bundle_dir" \
+    || fail "無法掛載唯讀 bundle virtiofs（tag=${bundle_tag}）；請確認 QEMU/VZ 已提供共享目錄" 126
+  log "掛載 data virtiofs tag=${data_tag} -> ${data_dir}"
+  mount -t virtiofs "$data_tag" "$data_dir" \
+    || fail "無法掛載可寫 data virtiofs（tag=${data_tag}）；請確認 QEMU/VZ 已提供共享目錄" 126
+else
+  [ -b /dev/vda ] || fail "WHP 路徑缺少 /dev/vda；請確認 helper 已提供 bundle virtio-blk" 126
+  log "WHP 路徑：從 /dev/vda 解開 bundle tar -> ${bundle_dir}"
+  dd if=/dev/vda bs=64k 2>/dev/null | tar -C "$bundle_dir" -xf - \
+    || fail "無法從 /dev/vda 展開 bundle image；請確認 helper 的 bundle virtio-blk 內容有效" 126
+  if [ -b /dev/vdb ]; then
+    log "WHP 路徑：從 /dev/vdb 解開 data tar -> ${data_dir}"
+    dd if=/dev/vdb bs=64k 2>/dev/null | tar -C "$data_dir" -xf - \
+      || fail "無法從 /dev/vdb 展開 data image；請確認 helper 的 data virtio-blk 內容有效" 126
+    log "注意：WHP data image 目前尚未實作關機回寫 host，data 仍為暫時性"
+  else
+    log "WHP 路徑：未提供 /dev/vdb，先使用 ephemeral data dir ${data_dir}"
+  fi
+fi
 
 machine="$(uname -m)"
 case "$machine" in
@@ -93,7 +122,7 @@ mkdir -p "$cache_dir"
 # 或無宣告埠時無妨）。QEMU 走 slirp hostfwd 不需這個，但印出來也無害、且可被 e2e 驗證。
 guest_ip="$(/run/chefer/guest-agent vmip 2>/dev/null || true)"
 if [ -n "$guest_ip" ]; then
-  echo "CHEFER_GUEST_IP=${guest_ip}"
+  report "CHEFER_GUEST_IP=${guest_ip}"
 fi
 
 # --udp-bridge：VM 內補起 UDP 埠的 eth0→loopback 橋接（無 UDP 埠時為 no-op）。
@@ -108,7 +137,7 @@ code="$?"
 set -e
 
 log "guest-agent 結束，exit=${code}"
-echo "CHEFER_GUEST_EXIT=${code}"
+emit_exit "$code"
 sync
 poweroff -f >/dev/null 2>&1 || halt -f >/dev/null 2>&1 || true
 while true; do sleep 3600; done

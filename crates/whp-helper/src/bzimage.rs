@@ -108,10 +108,19 @@ pub fn parse(image: &[u8]) -> Result<BzImageInfo, String> {
     })
 }
 
-/// 計算 initramfs 的 GPA（kernel 後方，對齊 4 KB）。
-pub fn initrd_gpa(kernel_size: usize) -> u64 {
-    let after = GPA_KERNEL + kernel_size as u64;
-    (after + 0xFFF) & !0xFFF
+/// 計算 initramfs 的 GPA。
+///
+/// **必須放在 guest RAM 高位**：bzImage 載入低位（GPA_KERNEL=1MB）後，開機時會
+/// 自解壓並展開到遠大於壓縮檔的區域；若 initramfs 緊接在壓縮 kernel 後方（低位），
+/// 會被解壓過程覆蓋，導致 kernel 報「junk within compressed archive / unpacking failed」。
+/// 故放在 RAM 高處、對齊 4 KB 下取，但不超過舊式 boot protocol 的 initrd 定址上限
+/// （~896MB，INITRD_ADDR_MAX）；保底不與 kernel 低位載入區重疊。
+pub fn initrd_gpa(kernel_size: usize, initrd_size: usize, total_memory: u64) -> u64 {
+    const INITRD_ADDR_MAX: u64 = 0x3800_0000;
+    let top = total_memory.min(INITRD_ADDR_MAX);
+    let high = top.saturating_sub(initrd_size as u64) & !0xFFF;
+    let kernel_end = (GPA_KERNEL + kernel_size as u64 + 0xFFF) & !0xFFF;
+    high.max(kernel_end)
 }
 
 /// 將 boot_params (zero page)、command line 寫入 guest 記憶體。
@@ -342,10 +351,20 @@ mod tests {
     }
 
     #[test]
-    fn initrd_gpa_aligned() {
-        assert_eq!(initrd_gpa(0), GPA_KERNEL);
-        assert_eq!(initrd_gpa(1), GPA_KERNEL + 0x1000);
-        assert_eq!(initrd_gpa(0x1000), GPA_KERNEL + 0x1000);
-        assert_eq!(initrd_gpa(0x1001), GPA_KERNEL + 0x2000);
+    fn initrd_gpa_high_placement() {
+        // 1GB RAM、1MB initrd：放在高位、對齊 4KB，遠離 kernel 低位區。
+        let g = initrd_gpa(0x10_0000, 0x10_0000, 0x4000_0000);
+        assert_eq!(g & 0xFFF, 0, "必須 4KB 對齊");
+        assert!(g >= GPA_KERNEL + 0x10_0000, "不得與 kernel 載入區重疊");
+        // 受 INITRD_ADDR_MAX(~896MB) 上限約束：1GB RAM 時頂點被夾到 0x38000000。
+        assert_eq!(g, (0x3800_0000 - 0x10_0000) & !0xFFF);
+    }
+
+    #[test]
+    fn initrd_gpa_small_ram_falls_back_above_kernel() {
+        // RAM 極小時不得 underflow，且至少落在 kernel 後方。
+        let g = initrd_gpa(0x10_0000, 0x20_0000, 0x100_0000); // 16MB RAM, 2MB initrd
+        assert!(g >= GPA_KERNEL + 0x10_0000);
+        assert_eq!(g & 0xFFF, 0);
     }
 }
