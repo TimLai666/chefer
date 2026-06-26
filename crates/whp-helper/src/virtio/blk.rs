@@ -7,6 +7,7 @@
 
 use super::GuestMemory;
 use super::queue::DescChain;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 區塊大小（virtio-blk 固定 512 bytes/sector）。
 pub const SECTOR_SIZE: u64 = 512;
@@ -24,6 +25,18 @@ const VIRTIO_BLK_S_UNSUPP: u8 = 2;
 
 const HDR_LEN: u32 = 16; // type(4) + reserved(4) + sector(8)
 const BLK_ID_BYTES: usize = 20; // GET_ID 回傳的裝置 id 長度
+static BLK_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn trace_blk(req: &str, sector: u64, bytes: u64, segs: usize) {
+    if std::env::var_os("CHEFER_WHP_TRACE_BLK").is_none() {
+        return;
+    }
+    let seq = BLK_TRACE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+    if seq > 128 {
+        return;
+    }
+    eprintln!("[virtio-blk {seq}] {req}: sector={sector} bytes={bytes} segs={segs}");
+}
 
 /// virtio-blk 裝置：以 `Vec<u8>` 為 backing image。
 pub struct BlkDevice {
@@ -116,11 +129,12 @@ impl BlkDevice {
         sector: u64,
     ) -> Result<(u8, u32), String> {
         let data_segs = &chain.writable[..chain.writable.len() - 1];
+        let total: u64 = data_segs.iter().map(|&(_, l)| l as u64).sum();
+        trace_blk("in", sector, total, data_segs.len());
         let mut off = match sector.checked_mul(SECTOR_SIZE) {
             Some(v) => v as usize,
             None => return Ok((VIRTIO_BLK_S_IOERR, 0)),
         };
-        let total: u64 = data_segs.iter().map(|&(_, l)| l as u64).sum();
         if off as u64 + total > self.backing.len() as u64 {
             return Ok((VIRTIO_BLK_S_IOERR, 0));
         }
@@ -145,11 +159,12 @@ impl BlkDevice {
             return Ok((VIRTIO_BLK_S_IOERR, 0));
         }
         let data_segs = &chain.readable[1..];
+        let total: u64 = data_segs.iter().map(|&(_, l)| l as u64).sum();
+        trace_blk("out", sector, total, data_segs.len());
         let mut off = match sector.checked_mul(SECTOR_SIZE) {
             Some(v) => v as usize,
             None => return Ok((VIRTIO_BLK_S_IOERR, 0)),
         };
-        let total: u64 = data_segs.iter().map(|&(_, l)| l as u64).sum();
         if off as u64 + total > self.backing.len() as u64 {
             return Ok((VIRTIO_BLK_S_IOERR, 0));
         }

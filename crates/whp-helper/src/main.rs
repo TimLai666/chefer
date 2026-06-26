@@ -134,7 +134,12 @@ fn run_boot(_request: HelperRequest) -> Result<(), String> {
 #[cfg(windows)]
 mod whp_api {
     use std::ffi::c_void;
+    use std::io::Write as _;
     use std::mem::size_of;
+    use std::sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    };
 
     use windows_sys::Win32::Foundation::FreeLibrary;
     use windows_sys::Win32::System::LibraryLoader::{
@@ -153,6 +158,10 @@ mod whp_api {
     const VIRTIO_MMIO_IRQ: u8 = 5;
     const VIRTIO_MMIO_CMDLINE: &str = "virtio_mmio.device=0x200@0xd0000000:5";
     const EMULATOR_DIRECTION_WRITE: u8 = 1;
+    static MMIO_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
+    static PLATFORM_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
+    static MMIO_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
+    static PLATFORM_TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
 
     // ── WHP property codes ──
 
@@ -213,8 +222,10 @@ mod whp_api {
     const EC_IO_PORT: usize = 48 + 24; // = 72
     // Rsvd2[3] (6 bytes) at 74
     const EC_IO_RAX: usize = 48 + 32; // = 80
+    const EC_MEM_ACCESS_INFO: usize = 48 + 20; // = 68
     // MemoryAccessContext: InstrByteCount(1)+Rsvd(3)+InstrBytes(16)+AccessInfo(4) = 24, 然後:
     const EC_MEM_GPA: usize = 48 + 24; // = 72
+    const EC_MEM_GVA: usize = 48 + 32; // = 80
 
     // ── Console markers ──
 
@@ -233,10 +244,15 @@ mod whp_api {
     type CreateVpFn = unsafe extern "system" fn(*mut c_void, u32, u32) -> i32;
     type DeleteVpFn = unsafe extern "system" fn(*mut c_void, u32) -> i32;
     type RunVpFn = unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32) -> i32;
-    type SetRegsFn =
-        unsafe extern "system" fn(*mut c_void, u32, *const u32, u32, *const c_void) -> i32;
+    type SetRegsFn = unsafe extern "system" fn(
+        *mut c_void,
+        u32,
+        *const u32,
+        u32,
+        *const WhvRegisterValue,
+    ) -> i32;
     type GetRegsFn =
-        unsafe extern "system" fn(*mut c_void, u32, *const u32, u32, *mut c_void) -> i32;
+        unsafe extern "system" fn(*mut c_void, u32, *const u32, u32, *mut WhvRegisterValue) -> i32;
     type TranslateGvaFn =
         unsafe extern "system" fn(*mut c_void, u32, u64, u32, *mut c_void, *mut u64) -> i32;
     type CancelRunVpFn = unsafe extern "system" fn(*mut c_void, u32, u32) -> i32;
@@ -289,10 +305,48 @@ mod whp_api {
         translate_gva_page: EmulatorTranslateGvaPageCallback,
     }
 
-    #[repr(C)]
+    #[repr(C, align(16))]
+    #[derive(Copy, Clone)]
     union WhvRegisterValue {
         reg64: u64,
         bytes: [u8; 16],
+    }
+
+    impl WhvRegisterValue {
+        fn zeroed() -> Self {
+            Self { bytes: [0u8; 16] }
+        }
+
+        fn from_u64(v: u64) -> Self {
+            let mut bytes = [0u8; 16];
+            bytes[..8].copy_from_slice(&v.to_le_bytes());
+            Self { bytes }
+        }
+
+        fn from_segment(base: u64, limit: u32, sel: u16, attrs: u16) -> Self {
+            let mut bytes = [0u8; 16];
+            bytes[..8].copy_from_slice(&base.to_le_bytes());
+            bytes[8..12].copy_from_slice(&limit.to_le_bytes());
+            bytes[12..14].copy_from_slice(&sel.to_le_bytes());
+            bytes[14..16].copy_from_slice(&attrs.to_le_bytes());
+            Self { bytes }
+        }
+
+        fn from_table(base: u64, limit: u16) -> Self {
+            let mut bytes = [0u8; 16];
+            bytes[6..8].copy_from_slice(&limit.to_le_bytes());
+            bytes[8..16].copy_from_slice(&base.to_le_bytes());
+            Self { bytes }
+        }
+
+        fn low64(self) -> u64 {
+            unsafe { self.reg64 }
+        }
+
+        #[cfg(test)]
+        fn bytes(self) -> [u8; 16] {
+            unsafe { self.bytes }
+        }
     }
 
     #[repr(C)]
@@ -350,6 +404,10 @@ mod whp_api {
         host_mem_len: usize,
         virtio: *mut VirtioMmioDevice,
         pic1: *mut super::pic::Pic,
+        trace_seq: u64,
+        exit_rip: u64,
+        exit_gva: u64,
+        exit_access_type: u32,
     }
 
     unsafe impl Send for WhpApi {}
@@ -470,6 +528,48 @@ mod whp_api {
         } else {
             Ok(())
         }
+    }
+
+    fn access_type_name(access_type: u32) -> &'static str {
+        match access_type {
+            0 => "read",
+            1 => "write",
+            2 => "execute",
+            _ => "unknown",
+        }
+    }
+
+    fn env_trace_enabled(name: &str) -> bool {
+        matches!(std::env::var(name), Ok(value) if !value.is_empty() && value != "0")
+    }
+
+    fn trace_mmio_enabled() -> bool {
+        *MMIO_TRACE_ENABLED.get_or_init(|| env_trace_enabled("CHEFER_WHP_TRACE_MMIO"))
+    }
+
+    fn trace_platform_enabled() -> bool {
+        *PLATFORM_TRACE_ENABLED.get_or_init(|| env_trace_enabled("CHEFER_WHP_TRACE_PLATFORM"))
+    }
+
+    fn trace_mmio(seq: u64, stage: &str, gpa: u64, gva: u64, rip: u64, detail: &str) {
+        if !trace_mmio_enabled() {
+            return;
+        }
+        eprintln!(
+            "[mmio {seq}] {stage}: GPA=0x{gpa:016X} GVA=0x{gva:016X} RIP=0x{rip:016X} {detail}"
+        );
+        let mut stderr = std::io::stderr();
+        let _ = stderr.flush();
+    }
+
+    fn trace_platform(stage: &str, detail: &str) {
+        if !trace_platform_enabled() {
+            return;
+        }
+        let seq = PLATFORM_TRACE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+        eprintln!("[platform {seq}] {stage}: {detail}");
+        let mut stderr = std::io::stderr();
+        let _ = stderr.flush();
     }
 
     fn append_virtio_mmio_cmdline(cmdline: &str) -> String {
@@ -626,8 +726,36 @@ mod whp_api {
             let access = &mut *memory_access;
             let len = access.access_size as usize;
             if len == 0 || len > access.data.len() {
+                trace_mmio(
+                    ctx.trace_seq,
+                    "callback-invalid-len",
+                    access.gpa_address,
+                    ctx.exit_gva,
+                    ctx.exit_rip,
+                    &format!(
+                        "exit_access={} callback_len={len}",
+                        access_type_name(ctx.exit_access_type)
+                    ),
+                );
                 return E_FAIL;
             }
+
+            let direction = if access.direction == EMULATOR_DIRECTION_WRITE {
+                "write"
+            } else {
+                "read"
+            };
+            trace_mmio(
+                ctx.trace_seq,
+                "callback-enter",
+                access.gpa_address,
+                ctx.exit_gva,
+                ctx.exit_rip,
+                &format!(
+                    "exit_access={} callback_access={direction} len={len}",
+                    access_type_name(ctx.exit_access_type)
+                ),
+            );
 
             // 直接從 ctx 的各獨立 raw pointer 欄位 deref（disjoint field borrow），
             // 避免透過 &mut self helper 重複借用整個 *ctx（E0499）。virtio / host_mem /
@@ -643,6 +771,14 @@ mod whp_api {
                             "virtio-mmio write failed at 0x{:X}: {err}",
                             access.gpa_address
                         );
+                        trace_mmio(
+                            ctx.trace_seq,
+                            "callback-virtio-write-fail",
+                            access.gpa_address,
+                            ctx.exit_gva,
+                            ctx.exit_rip,
+                            &format!("offset=0x{offset:X} len={len} err={err}"),
+                        );
                         return E_FAIL;
                     }
                 } else {
@@ -653,17 +789,52 @@ mod whp_api {
                                 "virtio-mmio read failed at 0x{:X}: {err}",
                                 access.gpa_address
                             );
+                            trace_mmio(
+                                ctx.trace_seq,
+                                "callback-virtio-read-fail",
+                                access.gpa_address,
+                                ctx.exit_gva,
+                                ctx.exit_rip,
+                                &format!("offset=0x{offset:X} len={len} err={err}"),
+                            );
                             return E_FAIL;
                         }
                     }
                 }
+                trace_mmio(
+                    ctx.trace_seq,
+                    "callback-virtio-ok",
+                    access.gpa_address,
+                    ctx.exit_gva,
+                    ctx.exit_rip,
+                    &format!("access={direction} len={len} offset=0x{offset:X}"),
+                );
                 return 0;
             }
 
             let Some(end) = access.gpa_address.checked_add(len as u64) else {
+                trace_mmio(
+                    ctx.trace_seq,
+                    "callback-hostmem-overflow",
+                    access.gpa_address,
+                    ctx.exit_gva,
+                    ctx.exit_rip,
+                    &format!("access={direction} len={len}"),
+                );
                 return E_FAIL;
             };
             if end > ctx.host_mem_len as u64 {
+                trace_mmio(
+                    ctx.trace_seq,
+                    "callback-hostmem-oob",
+                    access.gpa_address,
+                    ctx.exit_gva,
+                    ctx.exit_rip,
+                    &format!(
+                        "access={direction} len={len} host_mem_len=0x{:X}",
+                        ctx.host_mem_len
+                    ),
+                );
                 return E_FAIL;
             }
             let off = access.gpa_address as usize;
@@ -673,6 +844,14 @@ mod whp_api {
             } else {
                 access.data[..len].copy_from_slice(&host[off..off + len]);
             }
+            trace_mmio(
+                ctx.trace_seq,
+                "callback-hostmem-ok",
+                access.gpa_address,
+                ctx.exit_gva,
+                ctx.exit_rip,
+                &format!("access={direction} len={len} off=0x{off:X}"),
+            );
             0
         }
     }
@@ -690,7 +869,7 @@ mod whp_api {
                 0,
                 register_names,
                 register_count,
-                register_values.cast(),
+                register_values,
             )
         }
     }
@@ -708,7 +887,7 @@ mod whp_api {
                 0,
                 register_names,
                 register_count,
-                register_values.cast(),
+                register_values,
             )
         }
     }
@@ -752,9 +931,14 @@ mod whp_api {
         partition: *mut c_void,
         pic1: &mut super::pic::Pic,
     ) -> Result<(), String> {
+        if !external_interrupt_deliverable(api, partition)? {
+            trace_platform("pending-irq-deferred", "guest not deliverable yet");
+            return Ok(());
+        }
         let Some(vector) = pic1.take_pending_vector() else {
             return Ok(());
         };
+        trace_platform("pending-irq-enter", &format!("vector=0x{vector:02X}"));
         // WHP 在 nolapic + dummy LAPIC 頁的設定下，無法經 LAPIC（WHvRequestInterrupt）
         // 把中斷遞送到 guest；必須用 WHvRegisterPendingInterruption register 直接注入
         // vector（繞過 LAPIC，CPU 在下個 instruction boundary 接受）。見 docs/DESIGN.md §4。
@@ -762,41 +946,52 @@ mod whp_api {
         const REG_PENDING_INTERRUPTION: u32 = 0x8000_0000;
         let pending: u64 = 1 | ((vector as u64) << 16);
         let value = reg_u64(pending);
+        let hr = unsafe { (api.set_regs)(partition, 0, &REG_PENDING_INTERRUPTION, 1, &value) };
+        trace_platform(
+            "pending-irq-return",
+            &format!("vector=0x{vector:02X} hr=0x{:08X}", hr as u32),
+        );
+        check_hr(hr, "WHvSetVirtualProcessorRegisters(PendingInterruption)")
+    }
+
+    fn external_interrupt_deliverable(
+        api: &WhpApi,
+        partition: *mut c_void,
+    ) -> Result<bool, String> {
+        const REG_PENDING_INTERRUPTION: u32 = 0x8000_0000;
+        const REG_INTERRUPT_STATE: u32 = 0x8000_0001;
+        let regs = [REG_PENDING_INTERRUPTION, REG_INTERRUPT_STATE];
+        let mut values = [WhvRegisterValue::zeroed(); 2];
         let hr = unsafe {
-            (api.set_regs)(
+            (api.get_regs)(
                 partition,
                 0,
-                &REG_PENDING_INTERRUPTION,
-                1,
-                value.as_ptr().cast(),
+                regs.as_ptr(),
+                regs.len() as u32,
+                values.as_mut_ptr(),
             )
         };
-        check_hr(hr, "WHvSetVirtualProcessorRegisters(PendingInterruption)")
+        check_hr(
+            hr,
+            "WHvGetVirtualProcessorRegisters(InterruptDeliveryState)",
+        )?;
+        let pending = values[0].low64();
+        let interrupt_state = values[1].low64();
+        Ok((pending & 1) == 0 && (interrupt_state & 1) == 0)
     }
 
     // ── WHV_REGISTER_VALUE helpers (16-byte union) ──
 
-    fn reg_u64(v: u64) -> [u8; 16] {
-        let mut b = [0u8; 16];
-        b[..8].copy_from_slice(&v.to_le_bytes());
-        b
+    fn reg_u64(v: u64) -> WhvRegisterValue {
+        WhvRegisterValue::from_u64(v)
     }
 
-    fn reg_seg(base: u64, limit: u32, sel: u16, attrs: u16) -> [u8; 16] {
-        let mut b = [0u8; 16];
-        b[..8].copy_from_slice(&base.to_le_bytes());
-        b[8..12].copy_from_slice(&limit.to_le_bytes());
-        b[12..14].copy_from_slice(&sel.to_le_bytes());
-        b[14..16].copy_from_slice(&attrs.to_le_bytes());
-        b
+    fn reg_seg(base: u64, limit: u32, sel: u16, attrs: u16) -> WhvRegisterValue {
+        WhvRegisterValue::from_segment(base, limit, sel, attrs)
     }
 
-    fn reg_table(base: u64, limit: u16) -> [u8; 16] {
-        let mut b = [0u8; 16];
-        // WHV_X64_TABLE_REGISTER: Pad[3] (6 bytes) | Limit (u16) | Base (u64)
-        b[6..8].copy_from_slice(&limit.to_le_bytes());
-        b[8..16].copy_from_slice(&base.to_le_bytes());
-        b
+    fn reg_table(base: u64, limit: u16) -> WhvRegisterValue {
+        WhvRegisterValue::from_table(base, limit)
     }
 
     // ── Preflight ──
@@ -1102,13 +1297,17 @@ mod whp_api {
         // 11. 啟動 timer 執行緒（每 10ms cancel VP → run loop 注入 timer IRQ）
         let stop_timer = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_flag = stop_timer.clone();
+        let vp_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let vp_running_flag = vp_running.clone();
         let part_ptr = partition as usize;
         let cancel_fn = api.cancel_run_vp;
         let timer_thread = std::thread::spawn(move || {
             let partition = part_ptr as *mut c_void;
             while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_millis(10));
-                if !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                if !stop_flag.load(std::sync::atomic::Ordering::Relaxed)
+                    && vp_running_flag.load(std::sync::atomic::Ordering::Relaxed)
+                {
                     unsafe { cancel_fn(partition, 0, 0) };
                 }
             }
@@ -1134,6 +1333,7 @@ mod whp_api {
             &mut pic2,
             &mut pit,
             &mut last_printed,
+            vp_running.as_ref(),
             std::time::Duration::from_secs(req.timeout_secs),
         );
 
@@ -1177,7 +1377,7 @@ mod whp_api {
         const DS_ATTRS: u16 = 0xC093;
         const TR_ATTRS: u16 = 0x008B;
 
-        let values: [[u8; 16]; 20] = [
+        let values: [WhvRegisterValue; 20] = [
             reg_u64(0x0000_0031),                    // CR0: PE + NE + ET, NO PG
             reg_u64(0),                              // CR3: 0 (paging off)
             reg_u64(0),                              // CR4: 0 (kernel sets PAE)
@@ -1206,7 +1406,7 @@ mod whp_api {
                 0,
                 names.as_ptr(),
                 names.len() as u32,
-                values.as_ptr().cast(),
+                values.as_ptr(),
             )
         };
         check_hr(hr, "WHvSetVirtualProcessorRegisters(initial)")
@@ -1225,6 +1425,7 @@ mod whp_api {
         pic2: &mut super::pic::Pic,
         pit: &mut super::pic::Pit,
         last_printed: &mut usize,
+        vp_running: &std::sync::atomic::AtomicBool,
         timeout: std::time::Duration,
     ) -> Result<(), String> {
         #[derive(Default)]
@@ -1256,6 +1457,7 @@ mod whp_api {
         let mut exit_stats = ExitStats::default();
         let mut last_reason = EXIT_NONE;
         let mut last_rip = 0u64;
+        let mut exit_trace_seq = 0u64;
 
         loop {
             if start.elapsed() > timeout {
@@ -1271,6 +1473,7 @@ mod whp_api {
                     exit_stats.other
                 ));
             }
+            vp_running.store(true, Ordering::Relaxed);
             let hr = unsafe {
                 (api.run_vp)(
                     partition,
@@ -1279,6 +1482,7 @@ mod whp_api {
                     exit_ctx.len() as u32,
                 )
             };
+            vp_running.store(false, Ordering::Relaxed);
             check_hr(hr, "WHvRunVirtualProcessor")?;
 
             let reason = u32::from_le_bytes(
@@ -1289,6 +1493,15 @@ mod whp_api {
             let rip = u64::from_le_bytes(exit_ctx[EC_RIP..EC_RIP + 8].try_into().unwrap());
             last_reason = reason;
             last_rip = rip;
+            exit_trace_seq += 1;
+            if trace_platform_enabled() && exit_trace_seq <= 256 {
+                eprintln!(
+                    "[vm-exit {exit_trace_seq}] reason={} (0x{reason:04X}) RIP=0x{rip:016X}",
+                    exit_reason_name(reason)
+                );
+                let mut stderr = std::io::stderr();
+                let _ = stderr.flush();
+            }
 
             match reason {
                 EXIT_IO_PORT => {
@@ -1296,10 +1509,22 @@ mod whp_api {
                     handle_io_exit(
                         api, partition, &exit_ctx, serial, cmos_addr, pic1, pic2, pit,
                     )?;
+                    if exit_trace_seq <= 256 {
+                        trace_platform(
+                            "io-exit-handled",
+                            &format!("seq={exit_trace_seq} rip=0x{rip:016X}"),
+                        );
+                    }
                     let rflags =
                         u64::from_le_bytes(exit_ctx[EC_RFLAGS..EC_RFLAGS + 8].try_into().unwrap());
                     if rflags & 0x200 != 0 {
                         let _ = deliver_pending_pic_irq(api, partition, pic1);
+                    }
+                    if exit_trace_seq <= 256 {
+                        trace_platform(
+                            "io-exit-finished",
+                            &format!("seq={exit_trace_seq} rip=0x{rip:016X}"),
+                        );
                     }
                     flush_serial(serial, last_printed);
                 }
@@ -1339,12 +1564,28 @@ mod whp_api {
                 }
                 EXIT_MEM_ACCESS => {
                     exit_stats.mem += 1;
+                    let trace_seq = MMIO_TRACE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+                    let access_info = u32::from_le_bytes(
+                        exit_ctx[EC_MEM_ACCESS_INFO..EC_MEM_ACCESS_INFO + 4]
+                            .try_into()
+                            .unwrap(),
+                    );
                     let gpa = u64::from_le_bytes(
                         exit_ctx[EC_MEM_GPA..EC_MEM_GPA + 8].try_into().unwrap(),
                     );
+                    let gva = u64::from_le_bytes(
+                        exit_ctx[EC_MEM_GVA..EC_MEM_GVA + 8].try_into().unwrap(),
+                    );
+                    let access_type = access_info & 0x3;
+                    trace_mmio(
+                        trace_seq,
+                        "exit-mem",
+                        gpa,
+                        gva,
+                        rip,
+                        &format!("exit_access={}", access_type_name(access_type)),
+                    );
                     if !virtio_blk.contains(gpa) {
-                        let rip =
-                            u64::from_le_bytes(exit_ctx[EC_RIP..EC_RIP + 8].try_into().unwrap());
                         return Err(format!(
                             "Memory access fault at GPA 0x{gpa:016X} (RIP=0x{rip:016X})"
                         ));
@@ -1359,6 +1600,10 @@ mod whp_api {
                         host_mem_len: host_mem.len(),
                         virtio: virtio_blk as *mut VirtioMmioDevice,
                         pic1: pic1 as *mut super::pic::Pic,
+                        trace_seq,
+                        exit_rip: rip,
+                        exit_gva: gva,
+                        exit_access_type: access_type,
                     };
                     let mut status = WhvEmulatorStatus { as_uint32: 0 };
                     let hr = unsafe {
@@ -1370,10 +1615,16 @@ mod whp_api {
                             &mut status,
                         )
                     };
+                    trace_mmio(
+                        trace_seq,
+                        "exit-mem-return",
+                        gpa,
+                        gva,
+                        rip,
+                        &format!("hr=0x{:08X} status=0x{:08X}", hr as u32, status.as_uint32),
+                    );
                     check_hr(hr, "WHvEmulatorTryMmioEmulation")?;
                     if !status.emulation_successful() {
-                        let rip =
-                            u64::from_le_bytes(exit_ctx[EC_RIP..EC_RIP + 8].try_into().unwrap());
                         return Err(format!(
                             "MMIO emulation failed at GPA 0x{gpa:016X} (RIP=0x{rip:016X}, status=0x{:08X})",
                             status.as_uint32
@@ -1516,7 +1767,7 @@ mod whp_api {
         // 推進 RIP + 更新 RAX
         let names = [REG_RIP, REG_RAX];
         let values = [reg_u64(rip + instr_len), reg_u64(new_rax)];
-        let hr = unsafe { (api.set_regs)(partition, 0, names.as_ptr(), 2, values.as_ptr().cast()) };
+        let hr = unsafe { (api.set_regs)(partition, 0, names.as_ptr(), 2, values.as_ptr()) };
         check_hr(hr, "WHvSetVirtualProcessorRegisters(advance RIP)")
     }
 
@@ -1551,30 +1802,42 @@ mod whp_api {
         #[test]
         fn reg_u64_layout() {
             let v = reg_u64(0x1234_5678_9ABC_DEF0);
+            let bytes = v.bytes();
             assert_eq!(
-                u64::from_le_bytes(v[..8].try_into().unwrap()),
+                u64::from_le_bytes(bytes[..8].try_into().unwrap()),
                 0x1234_5678_9ABC_DEF0
             );
-            assert_eq!(u64::from_le_bytes(v[8..16].try_into().unwrap()), 0);
+            assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), 0);
         }
 
         #[test]
         fn reg_seg_layout() {
             let v = reg_seg(0x1000, 0xFFFF_FFFF, 0x10, 0xC09B);
-            assert_eq!(u64::from_le_bytes(v[..8].try_into().unwrap()), 0x1000); // base
+            let bytes = v.bytes();
+            assert_eq!(u64::from_le_bytes(bytes[..8].try_into().unwrap()), 0x1000); // base
             assert_eq!(
-                u32::from_le_bytes(v[8..12].try_into().unwrap()),
+                u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
                 0xFFFF_FFFF
             ); // limit
-            assert_eq!(u16::from_le_bytes(v[12..14].try_into().unwrap()), 0x10); // selector
-            assert_eq!(u16::from_le_bytes(v[14..16].try_into().unwrap()), 0xC09B); // attrs
+            assert_eq!(u16::from_le_bytes(bytes[12..14].try_into().unwrap()), 0x10); // selector
+            assert_eq!(
+                u16::from_le_bytes(bytes[14..16].try_into().unwrap()),
+                0xC09B
+            ); // attrs
         }
 
         #[test]
         fn reg_table_layout() {
             let v = reg_table(0x1000, 31);
-            assert_eq!(u16::from_le_bytes(v[6..8].try_into().unwrap()), 31); // limit
-            assert_eq!(u64::from_le_bytes(v[8..16].try_into().unwrap()), 0x1000); // base
+            let bytes = v.bytes();
+            assert_eq!(u16::from_le_bytes(bytes[6..8].try_into().unwrap()), 31); // limit
+            assert_eq!(u64::from_le_bytes(bytes[8..16].try_into().unwrap()), 0x1000); // base
+        }
+
+        #[test]
+        fn whv_register_value_matches_sdk_alignment() {
+            assert_eq!(std::mem::size_of::<WhvRegisterValue>(), 16);
+            assert_eq!(std::mem::align_of::<WhvRegisterValue>(), 16);
         }
 
         #[test]
