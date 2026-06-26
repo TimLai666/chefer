@@ -11,6 +11,7 @@
 pub mod blk;
 pub mod image;
 pub mod mmio;
+pub mod net;
 pub mod queue;
 
 /// virtio device type（virtio spec §5；DeviceID register 0x008）。
