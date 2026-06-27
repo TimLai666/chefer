@@ -761,13 +761,13 @@ mod whp_api {
                 guest_ip,
                 &mut phy,
             );
-            for &(host_port, guest_port) in forwards {
-                match backend.add_forward(host_port, guest_port) {
+            for &(listen_port, guest_port) in forwards {
+                match backend.add_forward(listen_port, guest_port) {
                     Ok(actual) => {
-                        eprintln!("[whp-net] forward 127.0.0.1:{actual} -> guest:{guest_port}")
+                        eprintln!("[whp-net] forward [::1]:{actual} -> guest:{guest_port}")
                     }
                     Err(e) => eprintln!(
-                        "[whp-net] warning: cannot bind host port {host_port} for guest:{guest_port}: {e}"
+                        "[whp-net] warning: cannot bind [::1]:{listen_port} for guest:{guest_port}: {e}"
                     ),
                 }
             }

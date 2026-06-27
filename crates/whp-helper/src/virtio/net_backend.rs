@@ -138,10 +138,15 @@ impl NetBackend {
         }
     }
 
-    /// 新增 host→guest 埠轉發：host `127.0.0.1:host_port` → guest `:guest_port`。
-    /// 回傳實際綁定的 host port（傳 0 由 OS 配，方便測試）。
-    pub fn add_forward(&mut self, host_port: u16, guest_port: u16) -> std::io::Result<u16> {
-        let listener = TcpListener::bind(("127.0.0.1", host_port))?;
+    /// 新增 host→guest 埠轉發：host `[::1]:listen_port` → guest `:guest_port`。
+    /// 回傳實際綁定的 listen port（傳 0 由 OS 配，方便測試）。
+    ///
+    /// 綁 **IPv6 loopback `[::1]`** 是刻意的：chefer-runtime 既有的 host≠guest 埠代理
+    /// （`proxy.rs`）按 WSL2 wslrelay 慣例假設「後端把 guest 埠暴露在 localhost」，且其
+    /// host==guest 的 Windows 補橋會佔 `127.0.0.1:guest`。helper 綁 `[::1]:guest` 正好
+    /// 鏡像 wslrelay，使 runtime 的 v4→v6 fallback 與補橋都接得上、互不搶埠。
+    pub fn add_forward(&mut self, listen_port: u16, guest_port: u16) -> std::io::Result<u16> {
+        let listener = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, listen_port))?;
         listener.set_nonblocking(true)?;
         let actual = listener.local_addr()?.port();
         self.forwards.push((listener, guest_port));
@@ -307,10 +312,11 @@ mod tests {
             guest_ip,
             &mut phy,
         );
-        let host_port = backend.add_forward(0, 6379).unwrap();
+        let listen_port = backend.add_forward(0, 6379).unwrap();
 
-        // host 端連線（loopback，立即進 listener backlog）。
-        let _client = std::net::TcpStream::connect(("127.0.0.1", host_port)).unwrap();
+        // host 端連線（IPv6 loopback，立即進 listener backlog）。
+        let _client =
+            std::net::TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, listen_port)).unwrap();
         for ms in 0..50 {
             backend.poll(&mut phy, Instant::from_millis(ms));
         }
