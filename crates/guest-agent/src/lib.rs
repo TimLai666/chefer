@@ -116,9 +116,11 @@ mod linux_impl {
             }
         };
 
-        // VM 後端：在 VM 內補起 UDP 埠橋接（背景執行緒，等服務先綁好埠的寬限期）。
-        // 原生 Linux（udp_bridge=false）共享 netns，不需也不應綁 LAN IP。
+        // VM 後端：在 VM 內補起 eth0→loopback 的埠橋接（背景執行緒，等服務先綁好埠的寬限期）。
+        // host→guest 流量（WHP smoltcp / vz NAT）落在 eth0，但 inbound relay 綁 loopback，
+        // 故 TCP 與 UDP 都需此橋接。原生 Linux（udp_bridge=false）共享 netns，不需也不應綁 LAN IP。
         if cfg.udp_bridge {
+            crate::udp_bridge::start_vm_tcp_bridges(&manifest);
             crate::udp_bridge::start_vm_udp_bridges(&manifest);
         }
 
