@@ -48,9 +48,14 @@ pub fn helper_in_bundle(bundle_dir: &Path, host_arch: &str) -> PathBuf {
 ///
 /// WHP 專屬：`nolapic`（LAPIC emulation 不完整，由 host 注入 timer）、
 /// `lpj=1000000`（跳過 calibration）、`notsc clocksource=jiffies`（TSC 不可靠）。
+///
+/// 網路：用 kernel IP_PNP **靜態**設定 eth0（`10.0.2.15/24`、gateway `10.0.2.2`），
+/// 不走 DHCP——helper 的 smoltcp gateway 不提供 DHCP server。此 IP 與 gateway 必須與
+/// `whp-helper` 的 `NET_GUEST_IP`／`NET_GATEWAY_IP` 一致（host↔guest 網路契約）。
 pub fn kernel_command_line(keep_rootfs: bool) -> String {
     let mut s = String::from(
-        "console=ttyS0 quiet ip=dhcp panic=-1 nolapic lpj=1000000 notsc clocksource=jiffies",
+        "console=ttyS0 quiet ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off \
+         panic=-1 nolapic lpj=1000000 notsc clocksource=jiffies",
     );
     s.push_str(&format!(
         " chefer.bundle_tag={SHARE_TAG_BUNDLE} chefer.data_tag={SHARE_TAG_DATA}"
@@ -212,6 +217,9 @@ mod tests {
         let cmdline = kernel_command_line(true);
 
         assert!(cmdline.contains("console=ttyS0"));
+        // WHP 用 kernel 靜態 IP（無 DHCP server），IP/gw 對齊 helper 的 net 契約。
+        assert!(cmdline.contains("ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off"));
+        assert!(!cmdline.contains("ip=dhcp"));
         assert!(cmdline.contains("nolapic"));
         assert!(cmdline.contains("lpj=1000000"));
         assert!(cmdline.contains("notsc"));
