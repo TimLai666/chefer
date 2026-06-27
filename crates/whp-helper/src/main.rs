@@ -157,6 +157,15 @@ mod whp_api {
     const VIRTIO_MMIO_SIZE: u64 = 0x200;
     const VIRTIO_MMIO_IRQ: u8 = 5;
     const VIRTIO_MMIO_CMDLINE: &str = "virtio_mmio.device=0x200@0xd0000000:5";
+    // virtio-net 視窗緊接 virtio-blk 之後（base +0x200），配 PIC IRQ 6（見 DESIGN §6 GPA 佈局）。
+    const VIRTIO_NET_MMIO_BASE: u64 = 0xD000_0200;
+    const VIRTIO_NET_MMIO_IRQ: u8 = 6;
+    const VIRTIO_NET_MMIO_CMDLINE: &str = "virtio_mmio.device=0x200@0xd0000200:6";
+    // user-mode 網路：smoltcp gateway 10.0.2.2、guest 靜態 10.0.2.15/24（與 appliance init 約定）。
+    const NET_GATEWAY_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x00, 0x02];
+    const NET_GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
+    const NET_GUEST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+    const NET_GUEST_IP: [u8; 4] = [10, 0, 2, 15];
     const EMULATOR_DIRECTION_WRITE: u8 = 1;
     static MMIO_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
     static PLATFORM_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -403,7 +412,10 @@ mod whp_api {
         host_mem: *mut u8,
         host_mem_len: usize,
         virtio: *mut VirtioMmioDevice,
+        net: *mut VirtioNetMmioDevice,
         pic1: *mut super::pic::Pic,
+        /// 單調毫秒時鐘（boot 起算），供 net backend 的 smoltcp poll。
+        now_ms: u64,
         trace_seq: u64,
         exit_rip: u64,
         exit_gva: u64,
@@ -573,12 +585,14 @@ mod whp_api {
     }
 
     fn append_virtio_mmio_cmdline(cmdline: &str) -> String {
+        // blk（vda/vdb）+ net 兩個 virtio-mmio 裝置，各以 base/IRQ 靜態註冊。
+        let devices = format!("{VIRTIO_MMIO_CMDLINE} {VIRTIO_NET_MMIO_CMDLINE}");
         if cmdline.contains("virtio_mmio.device=") {
             cmdline.to_string()
         } else if cmdline.trim().is_empty() {
-            VIRTIO_MMIO_CMDLINE.to_string()
+            devices
         } else {
-            format!("{cmdline} {VIRTIO_MMIO_CMDLINE}")
+            format!("{cmdline} {devices}")
         }
     }
 
@@ -710,6 +724,225 @@ mod whp_api {
         }
     }
 
+    /// virtio-net 裝置接線：transport（2 queues：0=rx, 1=tx）+ [`NetDevice`] frame 搬運
+    /// + smoltcp gateway（host→guest TCP 埠轉發）。GPA 視窗與 IRQ 與 blk 區隔。
+    ///
+    /// [`NetDevice`]: super::virtio::net::NetDevice
+    struct VirtioNetMmioDevice {
+        base: u64,
+        irq: u8,
+        mmio: super::virtio::mmio::Mmio,
+        net: super::virtio::net::NetDevice,
+        phy: super::virtio::net_backend::VirtioNetPhy,
+        backend: super::virtio::net_backend::NetBackend,
+        /// avail ring 已處理位置：[0]=rx queue、[1]=tx queue。
+        last_avail: [u16; 2],
+    }
+
+    impl VirtioNetMmioDevice {
+        /// `forwards`：host→guest TCP 轉發清單 `(host_port, guest_port)`。
+        fn new(forwards: &[(u16, u16)]) -> Self {
+            let gateway_ip = smoltcp::wire::Ipv4Address::new(
+                NET_GATEWAY_IP[0],
+                NET_GATEWAY_IP[1],
+                NET_GATEWAY_IP[2],
+                NET_GATEWAY_IP[3],
+            );
+            let guest_ip = smoltcp::wire::Ipv4Address::new(
+                NET_GUEST_IP[0],
+                NET_GUEST_IP[1],
+                NET_GUEST_IP[2],
+                NET_GUEST_IP[3],
+            );
+            let mut phy = super::virtio::net_backend::VirtioNetPhy::new();
+            let mut backend = super::virtio::net_backend::NetBackend::new(
+                NET_GATEWAY_MAC,
+                gateway_ip,
+                guest_ip,
+                &mut phy,
+            );
+            for &(host_port, guest_port) in forwards {
+                match backend.add_forward(host_port, guest_port) {
+                    Ok(actual) => {
+                        eprintln!("[whp-net] forward 127.0.0.1:{actual} -> guest:{guest_port}")
+                    }
+                    Err(e) => eprintln!(
+                        "[whp-net] warning: cannot bind host port {host_port} for guest:{guest_port}: {e}"
+                    ),
+                }
+            }
+            Self {
+                base: VIRTIO_NET_MMIO_BASE,
+                irq: VIRTIO_NET_MMIO_IRQ,
+                mmio: super::virtio::mmio::Mmio::new(
+                    super::virtio::DEVICE_ID_NET,
+                    super::virtio::VIRTIO_F_VERSION_1,
+                    2,
+                    256,
+                ),
+                net: super::virtio::net::NetDevice::new(NET_GUEST_MAC),
+                phy,
+                backend,
+                last_avail: [0; 2],
+            }
+        }
+
+        fn contains(&self, gpa: u64) -> bool {
+            (self.base..self.base + VIRTIO_MMIO_SIZE).contains(&gpa)
+        }
+
+        fn read_bytes(&self, offset: u64, len: usize) -> Result<[u8; 8], String> {
+            if len == 0 || len > 8 {
+                return Err(format!("unsupported MMIO read size {len}"));
+            }
+            let mut out = [0u8; 8];
+            for (i, slot) in out.iter_mut().enumerate().take(len) {
+                let cur = offset + i as u64;
+                let aligned = cur & !0x3;
+                let word = if aligned >= 0x100 {
+                    self.net.config_read(aligned - 0x100, 4)
+                } else {
+                    self.mmio.read(aligned)
+                };
+                *slot = word.to_le_bytes()[(cur - aligned) as usize];
+            }
+            Ok(out)
+        }
+
+        fn write_bytes(
+            &mut self,
+            offset: u64,
+            data: &[u8],
+            host_mem: &mut [u8],
+            pic1: &mut super::pic::Pic,
+            now_ms: u64,
+        ) -> Result<(), String> {
+            if data.is_empty() || data.len() > 4 {
+                return Err(format!("unsupported MMIO write size {}", data.len()));
+            }
+            let aligned = offset & !0x3;
+            let byte_off = (offset - aligned) as usize;
+            if byte_off + data.len() > 4 {
+                return Err(format!(
+                    "cross-register MMIO write is unsupported: offset=0x{offset:X} len={}",
+                    data.len()
+                ));
+            }
+            let mut merged = if data.len() == 4 && byte_off == 0 {
+                [0u8; 4]
+            } else if aligned >= 0x100 {
+                self.net.config_read(aligned - 0x100, 4).to_le_bytes()
+            } else {
+                self.mmio.read(aligned).to_le_bytes()
+            };
+            merged[byte_off..byte_off + data.len()].copy_from_slice(data);
+            let action = self.mmio.write(aligned, u32::from_le_bytes(merged));
+            match action {
+                super::virtio::mmio::MmioAction::None
+                | super::virtio::mmio::MmioAction::ConfigRead { .. }
+                | super::virtio::mmio::MmioAction::ConfigWrite { .. } => Ok(()),
+                super::virtio::mmio::MmioAction::Reset => {
+                    self.last_avail = [0; 2];
+                    Ok(())
+                }
+                // 任一 queue 被 notify 都驅動完整 service（tx 取封包、poll、rx 回填）。
+                super::virtio::mmio::MmioAction::QueueNotify(_) => {
+                    self.service(host_mem, pic1, now_ms)
+                }
+            }
+        }
+
+        /// 驅動一輪網路：tx 取 guest 送出的 frame → smoltcp poll（含 host→guest 轉發）→
+        /// rx 把 host 來的 frame 回填 guest。任一 queue 有進度即注入 net IRQ。
+        fn service(
+            &mut self,
+            host_mem: &mut [u8],
+            pic1: &mut super::pic::Pic,
+            now_ms: u64,
+        ) -> Result<(), String> {
+            let mut used_any = self.drain_tx(host_mem)?;
+            // 驅動 smoltcp：消化剛 push 的 guest frame、接受新 host 連線、搬運資料、產生回應 frame。
+            self.backend.poll(
+                &mut self.phy,
+                smoltcp::time::Instant::from_millis(now_ms as i64),
+            );
+            if self.fill_rx(host_mem)? {
+                used_any = true;
+            }
+            if used_any {
+                self.mmio.signal_used();
+                pic1.request_irq(self.irq);
+            }
+            Ok(())
+        }
+
+        /// queue 1（tx，guest → host）：取出 ethernet frame 餵給 smoltcp，回收 buffer。
+        fn drain_tx(&mut self, host_mem: &mut [u8]) -> Result<bool, String> {
+            const TX: usize = 1;
+            let Some(cfg) = self.mmio.queue(TX).copied() else {
+                return Ok(false);
+            };
+            let mut mem = super::virtio::SliceMem::new(0, host_mem);
+            let mut idx = self.last_avail[TX];
+            let mut any = false;
+            loop {
+                let chain = {
+                    let mut split = super::virtio::queue::SplitQueue::new(cfg, &mut mem, idx);
+                    let chain = split.pop_avail()?;
+                    idx = split.last_avail_idx();
+                    chain
+                };
+                let Some(chain) = chain else { break };
+                match self.net.read_tx_frame(&chain, &mem) {
+                    Ok(frame) => self.phy.push_from_guest(frame),
+                    Err(e) => eprintln!("[whp-net] drop malformed tx frame: {e}"),
+                }
+                {
+                    let mut split = super::virtio::queue::SplitQueue::new(cfg, &mut mem, idx);
+                    split.push_used(chain.head, 0)?; // tx buffer 唯讀，裝置寫 0 bytes
+                }
+                any = true;
+            }
+            self.last_avail[TX] = idx;
+            Ok(any)
+        }
+
+        /// queue 0（rx，host → guest）：把 smoltcp 產生的 frame 回填 guest 提供的 buffer。
+        fn fill_rx(&mut self, host_mem: &mut [u8]) -> Result<bool, String> {
+            const RX: usize = 0;
+            let Some(cfg) = self.mmio.queue(RX).copied() else {
+                return Ok(false);
+            };
+            let mut mem = super::virtio::SliceMem::new(0, host_mem);
+            let mut idx = self.last_avail[RX];
+            let mut any = false;
+            while let Some(frame) = self.phy.pop_to_guest() {
+                let chain = {
+                    let mut split = super::virtio::queue::SplitQueue::new(cfg, &mut mem, idx);
+                    let chain = split.pop_avail()?;
+                    idx = split.last_avail_idx();
+                    chain
+                };
+                let Some(chain) = chain else {
+                    // guest 無可用 rx buffer：丟棄此 frame（不採 mergeable buffer，避免阻塞）。
+                    eprintln!(
+                        "[whp-net] drop rx frame: no guest buffer ({} bytes)",
+                        frame.len()
+                    );
+                    break;
+                };
+                let written = self.net.write_rx_frame(&chain, &mut mem, &frame)?;
+                {
+                    let mut split = super::virtio::queue::SplitQueue::new(cfg, &mut mem, idx);
+                    split.push_used(chain.head, written)?;
+                }
+                any = true;
+            }
+            self.last_avail[RX] = idx;
+            Ok(any)
+        }
+    }
+
     unsafe extern "system" fn emulator_io_port_callback(
         _context: *mut c_void,
         _io_access: *mut WhvEmulatorIoAccessInfo,
@@ -804,6 +1037,61 @@ mod whp_api {
                 trace_mmio(
                     ctx.trace_seq,
                     "callback-virtio-ok",
+                    access.gpa_address,
+                    ctx.exit_gva,
+                    ctx.exit_rip,
+                    &format!("access={direction} len={len} offset=0x{offset:X}"),
+                );
+                return 0;
+            }
+
+            // virtio-net 視窗（與 blk 不同物件，disjoint deref）。
+            let net = &mut *ctx.net;
+            if net.contains(access.gpa_address) {
+                let offset = access.gpa_address - net.base;
+                if access.direction == EMULATOR_DIRECTION_WRITE {
+                    let host = std::slice::from_raw_parts_mut(ctx.host_mem, ctx.host_mem_len);
+                    let pic1 = &mut *ctx.pic1;
+                    if let Err(err) =
+                        net.write_bytes(offset, &access.data[..len], host, pic1, ctx.now_ms)
+                    {
+                        eprintln!(
+                            "virtio-net write failed at 0x{:X}: {err}",
+                            access.gpa_address
+                        );
+                        trace_mmio(
+                            ctx.trace_seq,
+                            "callback-net-write-fail",
+                            access.gpa_address,
+                            ctx.exit_gva,
+                            ctx.exit_rip,
+                            &format!("offset=0x{offset:X} len={len} err={err}"),
+                        );
+                        return E_FAIL;
+                    }
+                } else {
+                    match net.read_bytes(offset, len) {
+                        Ok(bytes) => access.data[..len].copy_from_slice(&bytes[..len]),
+                        Err(err) => {
+                            eprintln!(
+                                "virtio-net read failed at 0x{:X}: {err}",
+                                access.gpa_address
+                            );
+                            trace_mmio(
+                                ctx.trace_seq,
+                                "callback-net-read-fail",
+                                access.gpa_address,
+                                ctx.exit_gva,
+                                ctx.exit_rip,
+                                &format!("offset=0x{offset:X} len={len} err={err}"),
+                            );
+                            return E_FAIL;
+                        }
+                    }
+                }
+                trace_mmio(
+                    ctx.trace_seq,
+                    "callback-net-ok",
                     access.gpa_address,
                     ctx.exit_gva,
                     ctx.exit_rip,
@@ -1216,6 +1504,7 @@ mod whp_api {
         let mem: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(host_mem as *mut u8, mem_size) };
         let mut virtio_blk = VirtioMmioDevice::new(bundle_image);
+        let mut virtio_net = VirtioNetMmioDevice::new(&req.forwards);
         let emulator = WhpEmulator::new(&emulation)?;
 
         // 5b. 映射 LAPIC MMIO 頁面（GPA 0xFEE00000, 4KB）
@@ -1327,6 +1616,7 @@ mod whp_api {
             &emulator,
             mem,
             &mut virtio_blk,
+            &mut virtio_net,
             &mut serial_port,
             &mut cmos_addr,
             &mut pic1,
@@ -1419,6 +1709,7 @@ mod whp_api {
         emulator: &WhpEmulator<'_>,
         host_mem: &mut [u8],
         virtio_blk: &mut VirtioMmioDevice,
+        virtio_net: &mut VirtioNetMmioDevice,
         serial: &mut super::serial::SerialPort,
         cmos_addr: &mut u8,
         pic1: &mut super::pic::Pic,
@@ -1557,6 +1848,12 @@ mod whp_api {
                         }
                         return Err("Guest halted with interrupts disabled".to_string());
                     }
+                    // 推進 user-mode 網路：接受新 host 連線、搬運資料、回填 guest rx
+                    // （即使 guest 此刻沒 notify，host→guest 連線與 smoltcp timer 也需進展）。
+                    let now_ms = start.elapsed().as_millis() as u64;
+                    if let Err(e) = virtio_net.service(host_mem, pic1, now_ms) {
+                        return Err(format!("virtio-net service failed: {e}"));
+                    }
                     if rflags & 0x200 != 0 {
                         pic1.request_irq(0);
                         let _ = deliver_pending_pic_irq(api, partition, pic1);
@@ -1585,7 +1882,7 @@ mod whp_api {
                         rip,
                         &format!("exit_access={}", access_type_name(access_type)),
                     );
-                    if !virtio_blk.contains(gpa) {
+                    if !virtio_blk.contains(gpa) && !virtio_net.contains(gpa) {
                         return Err(format!(
                             "Memory access fault at GPA 0x{gpa:016X} (RIP=0x{rip:016X})"
                         ));
@@ -1599,7 +1896,9 @@ mod whp_api {
                         host_mem: host_mem.as_mut_ptr(),
                         host_mem_len: host_mem.len(),
                         virtio: virtio_blk as *mut VirtioMmioDevice,
+                        net: virtio_net as *mut VirtioNetMmioDevice,
                         pic1: pic1 as *mut super::pic::Pic,
+                        now_ms: start.elapsed().as_millis() as u64,
                         trace_seq,
                         exit_rip: rip,
                         exit_gva: gva,
@@ -1847,6 +2146,20 @@ mod whp_api {
             assert_eq!(parse_guest_exit("boot log\nCHEFER_GUEST_EXIT=1\n"), Some(1));
             assert_eq!(parse_guest_exit("no marker here"), None);
         }
+
+        #[test]
+        fn cmdline_appends_both_blk_and_net_devices() {
+            let out = append_virtio_mmio_cmdline("console=ttyS0");
+            assert!(out.starts_with("console=ttyS0 "));
+            assert!(out.contains("virtio_mmio.device=0x200@0xd0000000:5")); // blk
+            assert!(out.contains("virtio_mmio.device=0x200@0xd0000200:6")); // net
+        }
+
+        #[test]
+        fn cmdline_preserves_caller_supplied_devices() {
+            let custom = "virtio_mmio.device=0x200@0xdeadbeef:9";
+            assert_eq!(append_virtio_mmio_cmdline(custom), custom);
+        }
     }
 }
 
@@ -1864,6 +2177,8 @@ struct HelperRequest {
     cpus: u16,
     memory_mib: u64,
     timeout_secs: u64,
+    /// host→guest TCP 埠轉發 `(host_port, guest_port)`（`--forward-tcp host:guest`，可重複）。
+    forwards: Vec<(u16, u16)>,
 }
 
 impl HelperRequest {
@@ -1877,6 +2192,11 @@ impl HelperRequest {
         } else {
             300
         };
+        let mut forwards = Vec::new();
+        while parser.has("--forward-tcp") {
+            let raw = parser.value("--forward-tcp")?;
+            forwards.push(parse_forward(&raw)?);
+        }
         let request = HelperRequest {
             kernel: parser.path("--kernel")?,
             initramfs: parser.path("--initramfs")?,
@@ -1886,6 +2206,7 @@ impl HelperRequest {
             cpus: parse_cpus(&parser.value("--cpus")?)?,
             memory_mib: parse_memory_mib(&parser.value("--memory-mib")?)?,
             timeout_secs,
+            forwards,
         };
         parser.finish()?;
         Ok(request)
@@ -1931,6 +2252,19 @@ impl ArgParser {
             Err(format!("usage: unexpected argument {}", self.args[0]))
         }
     }
+}
+
+fn parse_forward(value: &str) -> Result<(u16, u16), String> {
+    let (host, guest) = value
+        .split_once(':')
+        .ok_or_else(|| format!("usage: --forward-tcp expects host:guest, got {value}"))?;
+    let host = host
+        .parse::<u16>()
+        .map_err(|_| format!("usage: --forward-tcp host port is invalid: {host}"))?;
+    let guest = guest
+        .parse::<u16>()
+        .map_err(|_| format!("usage: --forward-tcp guest port is invalid: {guest}"))?;
+    Ok((host, guest))
 }
 
 fn parse_cpus(value: &str) -> Result<u16, String> {
@@ -2000,6 +2334,33 @@ mod tests {
         args.push("60".to_string());
         let req = HelperRequest::parse(args).unwrap();
         assert_eq!(req.timeout_secs, 60);
+    }
+
+    #[test]
+    fn defaults_to_no_forwards() {
+        let req = HelperRequest::parse(valid_args()).unwrap();
+        assert!(req.forwards.is_empty());
+    }
+
+    #[test]
+    fn parses_repeated_forward_tcp() {
+        let mut args = valid_args();
+        for f in ["--forward-tcp", "8080:80", "--forward-tcp", "16379:6379"] {
+            args.push(f.to_string());
+        }
+        let req = HelperRequest::parse(args).unwrap();
+        assert_eq!(req.forwards, vec![(8080, 80), (16379, 6379)]);
+    }
+
+    #[test]
+    fn rejects_malformed_forward_tcp() {
+        assert!(parse_forward("8080").unwrap_err().contains("host:guest"));
+        assert!(parse_forward("abc:80").unwrap_err().contains("host port"));
+        assert!(
+            parse_forward("8080:xyz")
+                .unwrap_err()
+                .contains("guest port")
+        );
     }
 
     #[test]
