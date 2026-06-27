@@ -8,7 +8,6 @@
 use std::ffi::c_void;
 use std::io::{BufRead, BufReader};
 use std::mem::size_of;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
@@ -19,7 +18,7 @@ use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExA,
 };
 
-use crate::vz_util::{self, PortForward};
+use crate::vz_util;
 use crate::{AppRunContext, Availability, ExecBackend, whp_util};
 
 const WIN_HV_PLATFORM_DLL: &[u8] = b"WinHvPlatform.dll\0";
@@ -60,7 +59,7 @@ impl ExecBackend for WhpBackend {
             .ok()
             .and_then(|s| s.parse::<u64>().ok());
 
-        let invocation = whp_util::helper_invocation(
+        let mut invocation = whp_util::helper_invocation(
             ctx.bundle_dir,
             ctx.data_dir,
             ctx.opts.keep_tmp,
@@ -74,6 +73,22 @@ impl ExecBackend for WhpBackend {
                 bundle_preflight_reason(&pf)
             )
         })?;
+
+        // WHP 的 host→guest 埠轉發由 helper 自身持有（guest IP 為 smoltcp 虛擬位址、
+        // host 無路由可達），故把宣告的 TCP 埠經 CLI 傳給 helper，不在此 relay。
+        // UDP 目前 helper 的 net backend 尚未支援，先略過並告警。
+        let mut tcp_forwards = Vec::new();
+        for f in vz_util::forward_ports(ctx.manifest) {
+            match f.proto {
+                PortProto::Tcp => tcp_forwards.push((f.host, f.guest)),
+                PortProto::Udp => eprintln!(
+                    "[chefer] warning: the WHP backend cannot forward UDP yet \
+                     (127.0.0.1:{} -> guest:{}); skipping",
+                    f.host, f.guest
+                ),
+            }
+        }
+        invocation.forwards = tcp_forwards;
 
         std::fs::create_dir_all(ctx.data_dir).with_context(|| {
             format!(
@@ -104,17 +119,11 @@ impl ExecBackend for WhpBackend {
             .stdout
             .take()
             .expect("child stdout was requested as piped");
-        let forwards = vz_util::forward_ports(ctx.manifest);
-        let mut forwards_started = false;
         let mut guest_exit: Option<i32> = None;
 
         for line in BufReader::new(stdout).lines() {
             let Ok(line) = line else { break };
             println!("{line}");
-            if !forwards_started && let Some(ip) = vz_util::parse_guest_ip(&line) {
-                start_port_forwards(ip, &forwards);
-                forwards_started = true;
-            }
             if let Some(code) = vz_util::parse_guest_exit_code(&line) {
                 guest_exit = Some(code);
             }
@@ -132,45 +141,6 @@ impl ExecBackend for WhpBackend {
             );
         }
         Ok(0)
-    }
-}
-
-fn start_port_forwards(guest_ip: Ipv4Addr, forwards: &[PortForward]) {
-    for f in forwards {
-        match f.proto {
-            PortProto::Tcp => match vz_util::spawn_tcp_forward(guest_ip, f.host, f.guest) {
-                Ok(_) => eprintln!(
-                    "[chefer] TCP port forward 127.0.0.1:{} → {}:{}",
-                    f.host, guest_ip, f.guest
-                ),
-                Err(e) => eprintln!(
-                    "[chefer] warning: TCP port forward 127.0.0.1:{} → {}:{}: {e}",
-                    f.host, guest_ip, f.guest
-                ),
-            },
-            PortProto::Udp => {
-                let dest = SocketAddr::from((guest_ip, f.guest));
-                match UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], f.host))) {
-                    Ok(sock) => {
-                        eprintln!(
-                            "[chefer] UDP port forward 127.0.0.1:{} → {}:{}",
-                            f.host, guest_ip, f.guest
-                        );
-                        std::thread::spawn(move || {
-                            guest_agent::udp_bridge::spawn_udp_relay(sock, move || {
-                                let s = UdpSocket::bind("0.0.0.0:0")?;
-                                s.connect(dest)?;
-                                Ok(s)
-                            });
-                        });
-                    }
-                    Err(e) => eprintln!(
-                        "[chefer] warning: UDP port forward 127.0.0.1:{}: {e}",
-                        f.host
-                    ),
-                }
-            }
-        }
     }
 }
 

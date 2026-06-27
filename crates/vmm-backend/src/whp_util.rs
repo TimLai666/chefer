@@ -48,9 +48,14 @@ pub fn helper_in_bundle(bundle_dir: &Path, host_arch: &str) -> PathBuf {
 ///
 /// WHP 專屬：`nolapic`（LAPIC emulation 不完整，由 host 注入 timer）、
 /// `lpj=1000000`（跳過 calibration）、`notsc clocksource=jiffies`（TSC 不可靠）。
+///
+/// 網路：用 kernel IP_PNP **靜態**設定 eth0（`10.0.2.15/24`、gateway `10.0.2.2`），
+/// 不走 DHCP——helper 的 smoltcp gateway 不提供 DHCP server。此 IP 與 gateway 必須與
+/// `whp-helper` 的 `NET_GUEST_IP`／`NET_GATEWAY_IP` 一致（host↔guest 網路契約）。
 pub fn kernel_command_line(keep_rootfs: bool) -> String {
     let mut s = String::from(
-        "console=ttyS0 quiet ip=dhcp panic=-1 nolapic lpj=1000000 notsc clocksource=jiffies",
+        "console=ttyS0 quiet ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off \
+         panic=-1 nolapic lpj=1000000 notsc clocksource=jiffies",
     );
     s.push_str(&format!(
         " chefer.bundle_tag={SHARE_TAG_BUNDLE} chefer.data_tag={SHARE_TAG_DATA}"
@@ -75,6 +80,9 @@ pub struct HelperInvocation {
     pub data_dir: PathBuf,
     pub resources: VmResources,
     pub timeout_secs: u64,
+    /// host→guest TCP 埠轉發 `(host_port, guest_port)`。WHP 的轉發 listener 由 helper
+    /// 自身持有（guest IP 為 smoltcp 虛擬位址、host 無路由），故經 CLI 傳入。
+    pub forwards: Vec<(u16, u16)>,
 }
 
 impl HelperInvocation {
@@ -99,6 +107,10 @@ impl HelperInvocation {
         if self.timeout_secs != 300 {
             v.push("--timeout".into());
             v.push(self.timeout_secs.to_string().into());
+        }
+        for (host, guest) in &self.forwards {
+            v.push("--forward-tcp".into());
+            v.push(format!("{host}:{guest}").into());
         }
         v
     }
@@ -183,6 +195,7 @@ pub fn helper_invocation(
             data_dir: data_dir.to_path_buf(),
             resources: VmResources::compute(host_cpus, mem_override_mib),
             timeout_secs,
+            forwards: Vec::new(),
         }),
         other => Err(other),
     }
@@ -204,6 +217,9 @@ mod tests {
         let cmdline = kernel_command_line(true);
 
         assert!(cmdline.contains("console=ttyS0"));
+        // WHP 用 kernel 靜態 IP（無 DHCP server），IP/gw 對齊 helper 的 net 契約。
+        assert!(cmdline.contains("ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off"));
+        assert!(!cmdline.contains("ip=dhcp"));
         assert!(cmdline.contains("nolapic"));
         assert!(cmdline.contains("lpj=1000000"));
         assert!(cmdline.contains("notsc"));
@@ -290,6 +306,40 @@ mod tests {
         ));
         assert!(has_arg_pair(&args, "--cpus", "4"));
         assert!(has_arg_pair(&args, "--memory-mib", "2048"));
+    }
+
+    #[test]
+    fn args_emit_repeated_forward_tcp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("bundle");
+        let data = tmp.path().join("data");
+        let vm = chefer_bundle::layout::vm_dir(&bundle);
+        let agents = chefer_bundle::layout::agents_dir(&bundle);
+        std::fs::create_dir_all(&vm).unwrap();
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(vm.join(chefer_bundle::layout::kernel_name("x86_64")), b"k").unwrap();
+        std::fs::write(
+            vm.join(chefer_bundle::layout::initramfs_name("x86_64")),
+            b"i",
+        )
+        .unwrap();
+        std::fs::write(
+            agents.join(chefer_bundle::layout::whp_helper_name("x86_64")),
+            b"h",
+        )
+        .unwrap();
+
+        let mut invocation = helper_invocation(&bundle, &data, false, "x86_64", 16, None).unwrap();
+        invocation.forwards = vec![(8080, 80), (16379, 6379)];
+        let args = invocation
+            .args()
+            .into_iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(has_arg_pair(&args, "--forward-tcp", "8080:80"));
+        assert!(has_arg_pair(&args, "--forward-tcp", "16379:6379"));
+        assert_eq!(args.iter().filter(|a| *a == "--forward-tcp").count(), 2);
     }
 
     #[test]
