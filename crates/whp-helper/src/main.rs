@@ -761,13 +761,13 @@ mod whp_api {
                 guest_ip,
                 &mut phy,
             );
-            for &(host_port, guest_port) in forwards {
-                match backend.add_forward(host_port, guest_port) {
+            for &(listen_port, guest_port) in forwards {
+                match backend.add_forward(listen_port, guest_port) {
                     Ok(actual) => {
-                        eprintln!("[whp-net] forward 127.0.0.1:{actual} -> guest:{guest_port}")
+                        eprintln!("[whp-net] forward [::1]:{actual} -> guest:{guest_port}")
                     }
                     Err(e) => eprintln!(
-                        "[whp-net] warning: cannot bind host port {host_port} for guest:{guest_port}: {e}"
+                        "[whp-net] warning: cannot bind [::1]:{listen_port} for guest:{guest_port}: {e}"
                     ),
                 }
             }
@@ -894,7 +894,26 @@ mod whp_api {
                 };
                 let Some(chain) = chain else { break };
                 match self.net.read_tx_frame(&chain, &mem) {
-                    Ok(frame) => self.phy.push_from_guest(frame),
+                    Ok(frame) => {
+                        if super::virtio::net_backend::net_trace_enabled() {
+                            let et = if frame.len() >= 14 {
+                                u16::from_be_bytes([frame[12], frame[13]])
+                            } else {
+                                0
+                            };
+                            let kind = match et {
+                                0x0806 => "ARP",
+                                0x0800 => "IPv4",
+                                0x86dd => "IPv6",
+                                _ => "?",
+                            };
+                            eprintln!(
+                                "[whp-net-trace] guest TX frame len={} ethertype=0x{et:04x} ({kind})",
+                                frame.len()
+                            );
+                        }
+                        self.phy.push_from_guest(frame);
+                    }
                     Err(e) => eprintln!("[whp-net] drop malformed tx frame: {e}"),
                 }
                 {
@@ -931,6 +950,17 @@ mod whp_api {
                     );
                     break;
                 };
+                if super::virtio::net_backend::net_trace_enabled() {
+                    let et = if frame.len() >= 14 {
+                        u16::from_be_bytes([frame[12], frame[13]])
+                    } else {
+                        0
+                    };
+                    eprintln!(
+                        "[whp-net-trace] guest RX frame len={} ethertype=0x{et:04x}",
+                        frame.len()
+                    );
+                }
                 let written = self.net.write_rx_frame(&chain, &mut mem, &frame)?;
                 {
                     let mut split = super::virtio::queue::SplitQueue::new(cfg, &mut mem, idx);

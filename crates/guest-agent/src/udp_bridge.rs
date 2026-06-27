@@ -15,7 +15,8 @@
 //! `detect_primary_ipv4` 另供 `guest-agent vmip` 子命令使用。
 
 use std::collections::{BTreeSet, HashMap};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -86,6 +87,91 @@ pub fn start_vm_udp_bridges(manifest: &Manifest) {
             }
         }
     });
+}
+
+/// 依 manifest 啟動所有 TCP 埠的 VM 內橋接（VM 後端專用）：把 VM 對外網卡（eth0）上的
+/// `<vm_ip>:guest` 轉到服務（或 per-app netns inbound relay）監聽的 `127.0.0.1:guest`。
+///
+/// 背景：WHP 的 smoltcp gateway 與 macOS vz 的 NAT 都把 host→guest 的 TCP 流量送到 VM 的
+/// **eth0 IP**，但 `netns::relay` 的 inbound relay（與多數只綁 loopback 的服務）綁的是
+/// `127.0.0.1:guest`——eth0 進來的封包到不了 loopback socket。故 VM 內需此橋接（與 UDP 版
+/// 對稱）。WSL2 靠 wslrelay 鏡射 loopback TCP，本橋接對它多餘但無害（eth0 與 loopback 是
+/// 不同位址、不搶埠；服務若已直接綁 `0.0.0.0:guest` 則 bind EADDRINUSE 自然略過）。
+///
+/// 非阻塞：spawn 背景執行緒，等 [`BRIDGE_GRACE`] 讓服務先綁好埠後再綁各 `<vm_ip>:guest`。
+pub fn start_vm_tcp_bridges(manifest: &Manifest) {
+    let tcp_guest_ports: BTreeSet<u16> = manifest
+        .services
+        .iter()
+        .flat_map(|s| &s.ports)
+        .filter(|p| p.proto == PortProto::Tcp)
+        .map(|p| p.guest)
+        .collect();
+    if tcp_guest_ports.is_empty() {
+        return;
+    }
+
+    thread::spawn(move || {
+        thread::sleep(BRIDGE_GRACE);
+
+        let Some(vm_ip) = detect_primary_ipv4() else {
+            eprintln!(
+                "[guest-agent] could not find the VM's outbound IPv4, skipping TCP bridge; \
+                 host-side TCP ports may be unreachable (if the service binds 0.0.0.0 it can still be hit via the VM IP)"
+            );
+            return;
+        };
+
+        for gp in tcp_guest_ports {
+            match TcpListener::bind((vm_ip, gp)) {
+                Ok(listener) => {
+                    thread::spawn(move || tcp_bridge_loop(listener, gp));
+                    eprintln!("[guest-agent] TCP bridge started: {vm_ip}:{gp} → 127.0.0.1:{gp}");
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    // 服務已綁 0.0.0.0:gp（含 eth0）→ host 直接命中，不需橋接。
+                    eprintln!(
+                        "[guest-agent] TCP {gp} is already listening on eth0 (bound by the service directly), skipping bridge"
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[guest-agent] TCP bridge failed to bind {vm_ip}:{gp}: {e}");
+                }
+            }
+        }
+    });
+}
+
+/// eth0 TCP 橋接的 accept 迴圈：每個連入向 `127.0.0.1:gp`（loopback relay/服務）開 upstream 後雙向搬運。
+fn tcp_bridge_loop(listener: TcpListener, gp: u16) {
+    for conn in listener.incoming() {
+        let Ok(client) = conn else { continue };
+        thread::spawn(move || {
+            let Ok(upstream) = TcpStream::connect((Ipv4Addr::LOCALHOST, gp)) else {
+                return; // loopback relay/服務尚未就緒 → 關閉此連線（host client 自會重試）
+            };
+            tcp_bridge_bidir(client, upstream);
+        });
+    }
+}
+
+/// 雙向搬運 client↔upstream 的位元組，一端 EOF 即半關對端寫方向。
+fn tcp_bridge_bidir(client: TcpStream, upstream: TcpStream) {
+    let (Ok(mut c_rd), Ok(mut u_wr), Ok(mut u_rd), Ok(mut c_wr)) = (
+        client.try_clone(),
+        upstream.try_clone(),
+        upstream.try_clone(),
+        client.try_clone(),
+    ) else {
+        return;
+    };
+    let h = thread::spawn(move || {
+        let _ = io::copy(&mut c_rd, &mut u_wr);
+        let _ = u_wr.shutdown(std::net::Shutdown::Write);
+    });
+    let _ = io::copy(&mut u_rd, &mut c_wr);
+    let _ = c_wr.shutdown(std::net::Shutdown::Write);
+    let _ = h.join();
 }
 
 /// 通用的 per-client session UDP relay：`listen` 收到封包後，依來源位址各維護一條
@@ -176,6 +262,50 @@ mod tests {
             assert!(!ip.is_loopback(), "偵測到的 IP 不應是 loopback：{ip}");
             assert!(!ip.is_unspecified(), "偵測到的 IP 不應是 0.0.0.0：{ip}");
         }
+    }
+
+    /// TCP 橋接的雙向搬運：client→upstream→（大寫 echo）→client，且 EOF 後收尾。
+    #[test]
+    fn tcp_bridge_bidir_proxies_both_directions() {
+        use std::io::{Read, Write};
+
+        // upstream = 把收到內容轉大寫回送的 echo server（模擬 loopback relay/服務）
+        let echo = TcpListener::bind("127.0.0.1:0").unwrap();
+        let echo_addr = echo.local_addr().unwrap();
+        thread::spawn(move || {
+            if let Ok((mut s, _)) = echo.accept() {
+                let mut buf = [0u8; 64];
+                loop {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let up: Vec<u8> =
+                                buf[..n].iter().map(|b| b.to_ascii_uppercase()).collect();
+                            if s.write_all(&up).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let upstream = TcpStream::connect(echo_addr).unwrap();
+
+        // client 側：用 loopback listener 造一對相連的 stream
+        let front = TcpListener::bind("127.0.0.1:0").unwrap();
+        let front_addr = front.local_addr().unwrap();
+        let mut client_local = TcpStream::connect(front_addr).unwrap();
+        let (client_remote, _) = front.accept().unwrap();
+
+        thread::spawn(move || tcp_bridge_bidir(client_remote, upstream));
+
+        client_local.write_all(b"ping").unwrap();
+        client_local
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut got = [0u8; 4];
+        client_local.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"PING", "雙向轉發後應收到 upstream 的回應");
     }
 
     /// session relay：兩個不同來源同時打同一 relay，回程不應互蓋。

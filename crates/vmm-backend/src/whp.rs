@@ -75,12 +75,18 @@ impl ExecBackend for WhpBackend {
         })?;
 
         // WHP 的 host→guest 埠轉發由 helper 自身持有（guest IP 為 smoltcp 虛擬位址、
-        // host 無路由可達），故把宣告的 TCP 埠經 CLI 傳給 helper，不在此 relay。
+        // host 無路由可達）。helper 把每個 guest 埠暴露在 host `[::1]:guest`（鏡像 WSL2
+        // wslrelay），host≠guest 的對外 remap 仍由 runtime 既有的埠代理負責——故這裡只需
+        // 把要暴露的 guest 埠（去重）傳給 helper，bind 用 guest 埠、不是使用者的 host 埠。
         // UDP 目前 helper 的 net backend 尚未支援，先略過並告警。
-        let mut tcp_forwards = Vec::new();
+        let mut tcp_forwards: Vec<(u16, u16)> = Vec::new();
         for f in vz_util::forward_ports(ctx.manifest) {
             match f.proto {
-                PortProto::Tcp => tcp_forwards.push((f.host, f.guest)),
+                PortProto::Tcp => {
+                    if !tcp_forwards.iter().any(|(_, g)| *g == f.guest) {
+                        tcp_forwards.push((f.guest, f.guest));
+                    }
+                }
                 PortProto::Udp => eprintln!(
                     "[chefer] warning: the WHP backend cannot forward UDP yet \
                      (127.0.0.1:{} -> guest:{}); skipping",

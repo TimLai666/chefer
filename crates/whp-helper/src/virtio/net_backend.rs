@@ -25,6 +25,14 @@ use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Add
 /// 乙太網 MTU（virtio-net 預設）。
 pub const MTU: usize = 1500;
 
+/// 是否開啟 net 封包追蹤（環境變數 `CHEFER_WHP_NET_TRACE` 非空）。診斷 host↔guest
+/// 封包流用：印 smoltcp connect/狀態轉移、guest tx/rx frame——接線層（main.rs）共用。
+pub fn net_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static NET_TRACE: OnceLock<bool> = OnceLock::new();
+    *NET_TRACE.get_or_init(|| std::env::var_os("CHEFER_WHP_NET_TRACE").is_some())
+}
+
 /// smoltcp phy device：以兩個 frame 佇列橋接 WHP 的 virtio-net。
 #[derive(Default)]
 pub struct VirtioNetPhy {
@@ -113,6 +121,7 @@ pub struct NetBackend {
 struct Conn {
     host: TcpStream,
     handle: SocketHandle,
+    last_state: tcp::State,
 }
 
 impl NetBackend {
@@ -138,10 +147,15 @@ impl NetBackend {
         }
     }
 
-    /// 新增 host→guest 埠轉發：host `127.0.0.1:host_port` → guest `:guest_port`。
-    /// 回傳實際綁定的 host port（傳 0 由 OS 配，方便測試）。
-    pub fn add_forward(&mut self, host_port: u16, guest_port: u16) -> std::io::Result<u16> {
-        let listener = TcpListener::bind(("127.0.0.1", host_port))?;
+    /// 新增 host→guest 埠轉發：host `[::1]:listen_port` → guest `:guest_port`。
+    /// 回傳實際綁定的 listen port（傳 0 由 OS 配，方便測試）。
+    ///
+    /// 綁 **IPv6 loopback `[::1]`** 是刻意的：chefer-runtime 既有的 host≠guest 埠代理
+    /// （`proxy.rs`）按 WSL2 wslrelay 慣例假設「後端把 guest 埠暴露在 localhost」，且其
+    /// host==guest 的 Windows 補橋會佔 `127.0.0.1:guest`。helper 綁 `[::1]:guest` 正好
+    /// 鏡像 wslrelay，使 runtime 的 v4→v6 fallback 與補橋都接得上、互不搶埠。
+    pub fn add_forward(&mut self, listen_port: u16, guest_port: u16) -> std::io::Result<u16> {
+        let listener = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, listen_port))?;
         listener.set_nonblocking(true)?;
         let actual = listener.local_addr()?.port();
         self.forwards.push((listener, guest_port));
@@ -189,11 +203,18 @@ impl NetBackend {
                     local,
                 )
                 .is_ok();
+            if net_trace_enabled() {
+                eprintln!(
+                    "[whp-net-trace] host conn accepted -> smoltcp connect {}:{guest_port} local={local} ok={connected}",
+                    self.guest_ip
+                );
+            }
             if connected {
                 let handle = self.sockets.add(sock);
                 self.conns.push(Conn {
                     host: stream,
                     handle,
+                    last_state: tcp::State::Closed,
                 });
             }
         }
@@ -203,6 +224,16 @@ impl NetBackend {
         let mut closed = Vec::new();
         for (i, conn) in self.conns.iter_mut().enumerate() {
             let sock = self.sockets.get_mut::<tcp::Socket>(conn.handle);
+            let state = sock.state();
+            if state != conn.last_state {
+                if net_trace_enabled() {
+                    eprintln!(
+                        "[whp-net-trace] smoltcp socket {state:?} (was {:?})",
+                        conn.last_state
+                    );
+                }
+                conn.last_state = state;
+            }
             // guest → host：把 guest 回應寫到 host socket。
             if sock.can_recv() {
                 let _ = sock.recv(|data| {
@@ -307,10 +338,11 @@ mod tests {
             guest_ip,
             &mut phy,
         );
-        let host_port = backend.add_forward(0, 6379).unwrap();
+        let listen_port = backend.add_forward(0, 6379).unwrap();
 
-        // host 端連線（loopback，立即進 listener backlog）。
-        let _client = std::net::TcpStream::connect(("127.0.0.1", host_port)).unwrap();
+        // host 端連線（IPv6 loopback，立即進 listener backlog）。
+        let _client =
+            std::net::TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, listen_port)).unwrap();
         for ms in 0..50 {
             backend.poll(&mut phy, Instant::from_millis(ms));
         }
