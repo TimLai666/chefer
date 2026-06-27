@@ -75,6 +75,9 @@ pub struct HelperInvocation {
     pub data_dir: PathBuf,
     pub resources: VmResources,
     pub timeout_secs: u64,
+    /// host→guest TCP 埠轉發 `(host_port, guest_port)`。WHP 的轉發 listener 由 helper
+    /// 自身持有（guest IP 為 smoltcp 虛擬位址、host 無路由），故經 CLI 傳入。
+    pub forwards: Vec<(u16, u16)>,
 }
 
 impl HelperInvocation {
@@ -99,6 +102,10 @@ impl HelperInvocation {
         if self.timeout_secs != 300 {
             v.push("--timeout".into());
             v.push(self.timeout_secs.to_string().into());
+        }
+        for (host, guest) in &self.forwards {
+            v.push("--forward-tcp".into());
+            v.push(format!("{host}:{guest}").into());
         }
         v
     }
@@ -183,6 +190,7 @@ pub fn helper_invocation(
             data_dir: data_dir.to_path_buf(),
             resources: VmResources::compute(host_cpus, mem_override_mib),
             timeout_secs,
+            forwards: Vec::new(),
         }),
         other => Err(other),
     }
@@ -290,6 +298,40 @@ mod tests {
         ));
         assert!(has_arg_pair(&args, "--cpus", "4"));
         assert!(has_arg_pair(&args, "--memory-mib", "2048"));
+    }
+
+    #[test]
+    fn args_emit_repeated_forward_tcp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("bundle");
+        let data = tmp.path().join("data");
+        let vm = chefer_bundle::layout::vm_dir(&bundle);
+        let agents = chefer_bundle::layout::agents_dir(&bundle);
+        std::fs::create_dir_all(&vm).unwrap();
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(vm.join(chefer_bundle::layout::kernel_name("x86_64")), b"k").unwrap();
+        std::fs::write(
+            vm.join(chefer_bundle::layout::initramfs_name("x86_64")),
+            b"i",
+        )
+        .unwrap();
+        std::fs::write(
+            agents.join(chefer_bundle::layout::whp_helper_name("x86_64")),
+            b"h",
+        )
+        .unwrap();
+
+        let mut invocation = helper_invocation(&bundle, &data, false, "x86_64", 16, None).unwrap();
+        invocation.forwards = vec![(8080, 80), (16379, 6379)];
+        let args = invocation
+            .args()
+            .into_iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(has_arg_pair(&args, "--forward-tcp", "8080:80"));
+        assert!(has_arg_pair(&args, "--forward-tcp", "16379:6379"));
+        assert_eq!(args.iter().filter(|a| *a == "--forward-tcp").count(), 2);
     }
 
     #[test]
