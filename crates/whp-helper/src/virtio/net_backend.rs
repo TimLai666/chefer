@@ -57,6 +57,12 @@ impl VirtioNetPhy {
         self.tx.pop_front()
     }
 
+    /// 直接把一個 ethernet frame 排進 guest-bound 佇列（出網 NAT 合成的回程 frame 用，
+    /// 不經 smoltcp）。與 smoltcp `transmit` 產的 frame 走同一佇列、由 fill_rx 送 guest。
+    pub fn push_to_guest(&mut self, frame: Vec<u8>) {
+        self.tx.push_back(frame);
+    }
+
     /// 是否有待送給 guest 的 frame（接線層據此決定是否注入 rx + IRQ）。
     pub fn has_guest_frames(&self) -> bool {
         !self.tx.is_empty()
@@ -119,6 +125,10 @@ pub struct NetBackend {
     udp_forwards: Vec<(UdpSocket, u16)>,
     /// per-client UDP session：用 unique local port demux guest 的回程。
     udp_sessions: Vec<UdpSession>,
+    /// 出網 NAT：gateway 的 MAC（合成回程 frame 的 L2 src）。
+    gateway_mac: [u8; 6],
+    /// 出網 UDP NAT：per (guest_ip, guest_port) flow 的 host UDP socket。
+    nat_flows: Vec<NatFlow>,
     next_local_port: u16,
 }
 
@@ -134,6 +144,15 @@ struct UdpSession {
     handle: SocketHandle,
     client: SocketAddr,
     forward_idx: usize,
+}
+
+/// 出網 UDP NAT 的一條 flow：以 guest 的 `(ip, port)` 為鍵，持有一個 host UDP socket
+/// 對外送/收。回程以 socket `recv_from` 得到的外部位址當合成 frame 的 src。
+struct NatFlow {
+    guest_ip: [u8; 4],
+    guest_port: u16,
+    guest_mac: [u8; 6],
+    sock: UdpSocket,
 }
 
 impl NetBackend {
@@ -157,6 +176,8 @@ impl NetBackend {
             conns: Vec::new(),
             udp_forwards: Vec::new(),
             udp_sessions: Vec::new(),
+            gateway_mac,
+            nat_flows: Vec::new(),
             next_local_port: 49152,
         }
     }
@@ -202,6 +223,74 @@ impl NetBackend {
         self.udp_host_to_guest();
         self.iface.poll(now, phy, &mut self.sockets);
         self.udp_guest_to_host();
+        // 出網 NAT：把 host UDP socket 收到的外部回應合成 frame 注入 guest rx。
+        self.nat_poll(phy);
+    }
+
+    /// 處理一個 guest 出網 UDP 封包（接線層 drain_tx 分流後呼叫）：找/建對應 flow 的
+    /// host UDP socket，`send_to(dst)`。
+    pub fn nat_outbound(&mut self, udp: super::nat::OutboundUdp) {
+        let idx = match self
+            .nat_flows
+            .iter()
+            .position(|f| f.guest_ip == udp.src_ip && f.guest_port == udp.src_port)
+        {
+            Some(i) => i,
+            None => {
+                let sock = match UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        if net_trace_enabled() {
+                            eprintln!("[whp-net-trace] nat: host udp bind failed: {e}");
+                        }
+                        return;
+                    }
+                };
+                let _ = sock.set_nonblocking(true);
+                if net_trace_enabled() {
+                    let s = udp.src_ip;
+                    eprintln!(
+                        "[whp-net-trace] nat: new outbound flow {}.{}.{}.{}:{}",
+                        s[0], s[1], s[2], s[3], udp.src_port
+                    );
+                }
+                self.nat_flows.push(NatFlow {
+                    guest_ip: udp.src_ip,
+                    guest_port: udp.src_port,
+                    guest_mac: udp.src_mac,
+                    sock,
+                });
+                self.nat_flows.len() - 1
+            }
+        };
+        let dst = SocketAddr::from((udp.dst_ip, udp.dst_port));
+        let _ = self.nat_flows[idx].sock.send_to(&udp.payload, dst);
+    }
+
+    /// 把各 NAT flow 的 host socket 收到的外部回應合成 外部→guest 的 frame 注入 guest rx。
+    fn nat_poll(&mut self, phy: &mut VirtioNetPhy) {
+        let mut buf = [0u8; 65535];
+        for f in &self.nat_flows {
+            loop {
+                match f.sock.recv_from(&mut buf) {
+                    Ok((n, SocketAddr::V4(from))) => {
+                        let frame = super::nat::build_udp_reply(
+                            self.gateway_mac,
+                            f.guest_mac,
+                            from.ip().octets(),
+                            from.port(),
+                            f.guest_ip,
+                            f.guest_port,
+                            &buf[..n],
+                        );
+                        phy.push_to_guest(frame);
+                    }
+                    Ok((_, SocketAddr::V6(_))) => {} // 只合成 v4 回程
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
     }
 
     /// host UDP listener 收到的 datagram → 經 per-client smoltcp UDP socket 送到 guest。

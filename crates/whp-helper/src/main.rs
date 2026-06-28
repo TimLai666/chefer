@@ -592,6 +592,13 @@ mod whp_api {
         let _ = stderr.flush();
     }
 
+    /// dst IP 是否為「外部」（需走出網 NAT）：排除 guest 同網段 `10.0.2.0/24`（含 gateway/guest，
+    /// 由 smoltcp 處理）與 multicast/reserved/limited-broadcast（第一個 octet ≥ 224）。
+    fn is_external_dst(dst: [u8; 4]) -> bool {
+        let same_subnet = dst[..3] == NET_GUEST_IP[..3];
+        !same_subnet && dst[0] < 224
+    }
+
     fn append_virtio_mmio_cmdline(cmdline: &str) -> String {
         // virtio-blk(vda bundle) + virtio-blk(vdb data) + virtio-net，各以 base/IRQ 靜態註冊。
         let devices =
@@ -937,7 +944,14 @@ mod whp_api {
                                 frame.len()
                             );
                         }
-                        self.phy.push_from_guest(frame);
+                        // 出網分流：對「外部」dst 的 UDP 走 NAT（不交給 smoltcp，smoltcp 不轉發）；
+                        // 其餘（ARP、guest↔gateway、同網段、TCP、multicast/bcast）照舊餵 smoltcp。
+                        match super::virtio::nat::parse_udp(&frame) {
+                            Some(udp) if is_external_dst(udp.dst_ip) => {
+                                self.backend.nat_outbound(udp);
+                            }
+                            _ => self.phy.push_from_guest(frame),
+                        }
                     }
                     Err(e) => eprintln!("[whp-net] drop malformed tx frame: {e}"),
                 }
