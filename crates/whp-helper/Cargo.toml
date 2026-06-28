@@ -12,7 +12,7 @@ path = "src/main.rs"
 tar = "0.4.46"
 # WHP virtio-net 的 host 端 user-mode 網路堆疊（純 Rust，無 C 依賴，符合單檔精神）：
 # 當 guest 的 gateway，處理 ARP/IP/TCP/UDP；host→guest 埠轉發以其 TCP socket 橋接。
-smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }
+smoltcp = { version = "0.13", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
