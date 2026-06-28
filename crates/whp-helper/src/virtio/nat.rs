@@ -14,6 +14,7 @@
 const ETH_HDR: usize = 14;
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const IPPROTO_UDP: u8 = 17;
+const IPPROTO_TCP: u8 = 6;
 
 /// 一個 guest 送出的 outbound UDP 封包（已從 ethernet/IPv4/UDP header 解析出五元組 + payload）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +120,60 @@ pub fn build_udp_reply(
     frame
 }
 
+/// 一個 guest 送出的 outbound TCP 封包的關鍵欄位（4-tuple + 旗標）。出網 TCP 由 smoltcp
+/// 動態 dst 處理（非手工合成）；本結構供接線層分流／管理 NAT flow 與 iface 位址用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutboundTcp {
+    pub src_mac: [u8; 6],
+    pub src_ip: [u8; 4],
+    pub src_port: u16,
+    pub dst_ip: [u8; 4],
+    pub dst_port: u16,
+    pub syn: bool,
+    pub ack: bool,
+    pub fin: bool,
+    pub rst: bool,
+}
+
+/// 解析一個 guest ethernet frame；若為 IPv4/TCP 回傳 [`OutboundTcp`]（4-tuple + 旗標），
+/// 否則 None。**不**判斷 dst 是否「外部」——由呼叫端依路由規則決定是否 NAT。
+/// 只解析到 TCP 固定 20-byte header 的旗標與埠，不碰 options/payload。
+pub fn parse_tcp(frame: &[u8]) -> Option<OutboundTcp> {
+    if frame.len() < ETH_HDR + 20 + 20 {
+        return None;
+    }
+    if u16::from_be_bytes([frame[12], frame[13]]) != ETHERTYPE_IPV4 {
+        return None;
+    }
+    let src_mac = [frame[6], frame[7], frame[8], frame[9], frame[10], frame[11]];
+    let ip = &frame[ETH_HDR..];
+    let version = ip[0] >> 4;
+    let ihl = (ip[0] & 0x0f) as usize * 4;
+    if version != 4 || ihl < 20 || ip.len() < ihl + 20 {
+        return None;
+    }
+    if ip[9] != IPPROTO_TCP {
+        return None;
+    }
+    let src_ip = [ip[12], ip[13], ip[14], ip[15]];
+    let dst_ip = [ip[16], ip[17], ip[18], ip[19]];
+    let tcp = &ip[ihl..];
+    let src_port = u16::from_be_bytes([tcp[0], tcp[1]]);
+    let dst_port = u16::from_be_bytes([tcp[2], tcp[3]]);
+    let flags = tcp[13]; // data-offset(4)+rsvd 在 [12]，flags 在 [13]
+    Some(OutboundTcp {
+        src_mac,
+        src_ip,
+        src_port,
+        dst_ip,
+        dst_port,
+        fin: flags & 0x01 != 0,
+        syn: flags & 0x02 != 0,
+        rst: flags & 0x04 != 0,
+        ack: flags & 0x10 != 0,
+    })
+}
+
 /// IPv4 header checksum（RFC 1071 的 one's complement 和；輸入須為 20-byte header，
 /// checksum 欄位已置 0）。
 fn ipv4_checksum(header: &[u8]) -> u16 {
@@ -218,5 +273,79 @@ mod tests {
         frame.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]); // padding
         let p = parse_udp(&frame).unwrap();
         assert_eq!(p.payload, b"abc");
+    }
+
+    /// 測試用：合成一個 guest→外部 的 ethernet+IPv4+TCP frame（20-byte TCP header，無 options）。
+    fn build_tcp_frame(
+        src_ip: [u8; 4],
+        src_port: u16,
+        dst_ip: [u8; 4],
+        dst_port: u16,
+        flags: u8,
+    ) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&GW_MAC); // dst mac（任意）
+        f.extend_from_slice(&GUEST_MAC); // src mac
+        f.extend_from_slice(&[0x08, 0x00]); // ethertype IPv4
+        // IPv4 header (20)
+        f.push(0x45);
+        f.push(0x00);
+        f.extend_from_slice(&40u16.to_be_bytes()); // total len 20+20
+        f.extend_from_slice(&0u16.to_be_bytes());
+        f.extend_from_slice(&0x4000u16.to_be_bytes());
+        f.push(64);
+        f.push(IPPROTO_TCP);
+        f.extend_from_slice(&0u16.to_be_bytes()); // header checksum（parse 不驗）
+        f.extend_from_slice(&src_ip);
+        f.extend_from_slice(&dst_ip);
+        // TCP header (20)
+        f.extend_from_slice(&src_port.to_be_bytes());
+        f.extend_from_slice(&dst_port.to_be_bytes());
+        f.extend_from_slice(&[0, 0, 0, 0]); // seq
+        f.extend_from_slice(&[0, 0, 0, 0]); // ack
+        f.push(0x50); // data offset 5 (20 bytes)
+        f.push(flags);
+        f.extend_from_slice(&0xffffu16.to_be_bytes()); // window
+        f.extend_from_slice(&0u16.to_be_bytes()); // checksum
+        f.extend_from_slice(&0u16.to_be_bytes()); // urgent ptr
+        f
+    }
+
+    #[test]
+    fn parse_tcp_extracts_tuple_and_syn() {
+        // guest 10.0.2.15:50000 → 1.1.1.1:443，純 SYN。
+        let frame = build_tcp_frame(GUEST_IP, 50000, EXT_IP, 443, 0x02);
+        let t = parse_tcp(&frame).unwrap();
+        assert_eq!(t.src_mac, GUEST_MAC);
+        assert_eq!(t.src_ip, GUEST_IP);
+        assert_eq!(t.src_port, 50000);
+        assert_eq!(t.dst_ip, EXT_IP);
+        assert_eq!(t.dst_port, 443);
+        assert!(t.syn && !t.ack && !t.fin && !t.rst);
+    }
+
+    #[test]
+    fn parse_tcp_flag_combinations() {
+        // SYN+ACK
+        let sa = parse_tcp(&build_tcp_frame(GUEST_IP, 1, EXT_IP, 2, 0x12)).unwrap();
+        assert!(sa.syn && sa.ack && !sa.fin && !sa.rst);
+        // FIN+ACK
+        let fa = parse_tcp(&build_tcp_frame(GUEST_IP, 1, EXT_IP, 2, 0x11)).unwrap();
+        assert!(fa.fin && fa.ack && !fa.syn);
+        // RST
+        let r = parse_tcp(&build_tcp_frame(GUEST_IP, 1, EXT_IP, 2, 0x04)).unwrap();
+        assert!(r.rst && !r.syn && !r.ack);
+    }
+
+    #[test]
+    fn parse_tcp_rejects_udp_and_short() {
+        // UDP frame → parse_tcp None
+        let udp = build_udp_reply(GUEST_MAC, GW_MAC, GUEST_IP, 1, EXT_IP, 2, b"abcd");
+        assert!(parse_tcp(&udp).is_none());
+        // 太短
+        assert!(parse_tcp(&[0u8; 40]).is_none());
+        // parse_udp 不應把 TCP frame 當 UDP
+        let tcp = build_tcp_frame(GUEST_IP, 1, EXT_IP, 2, 0x02);
+        assert!(parse_udp(&tcp).is_none());
     }
 }
