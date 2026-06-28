@@ -11,6 +11,7 @@
 pub mod blk;
 pub mod image;
 pub mod mmio;
+pub mod nat;
 pub mod net;
 pub mod net_backend;
 pub mod queue;
