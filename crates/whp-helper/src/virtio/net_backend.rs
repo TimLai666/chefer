@@ -14,11 +14,11 @@
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::tcp;
+use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
@@ -115,6 +115,10 @@ pub struct NetBackend {
     guest_ip: Ipv4Address,
     forwards: Vec<(TcpListener, u16)>,
     conns: Vec<Conn>,
+    /// host UDP listener（綁 `[::1]:listen`）+ 對應 guest 埠。
+    udp_forwards: Vec<(UdpSocket, u16)>,
+    /// per-client UDP session：用 unique local port demux guest 的回程。
+    udp_sessions: Vec<UdpSession>,
     next_local_port: u16,
 }
 
@@ -122,6 +126,14 @@ struct Conn {
     host: TcpStream,
     handle: SocketHandle,
     last_state: tcp::State,
+}
+
+/// 一個 host UDP client 的轉發 session：smoltcp UDP socket（綁 unique local port）+
+/// 來源 client 位址 + 所屬 udp_forwards 索引（回程用其 listener send_to client）。
+struct UdpSession {
+    handle: SocketHandle,
+    client: SocketAddr,
+    forward_idx: usize,
 }
 
 impl NetBackend {
@@ -143,6 +155,8 @@ impl NetBackend {
             guest_ip,
             forwards: Vec::new(),
             conns: Vec::new(),
+            udp_forwards: Vec::new(),
+            udp_sessions: Vec::new(),
             next_local_port: 49152,
         }
     }
@@ -162,6 +176,17 @@ impl NetBackend {
         Ok(actual)
     }
 
+    /// 新增 host→guest **UDP** 埠轉發：host `[::1]:listen_port` → guest `:guest_port`。
+    /// 綁 `[::1]` 理由同 [`Self::add_forward`]（鏡像 wslrelay、與 runtime proxy 分層）。
+    /// 回傳實際綁定的 listen port（傳 0 由 OS 配，方便測試）。
+    pub fn add_udp_forward(&mut self, listen_port: u16, guest_port: u16) -> std::io::Result<u16> {
+        let listener = UdpSocket::bind((std::net::Ipv6Addr::LOCALHOST, listen_port))?;
+        listener.set_nonblocking(true)?;
+        let actual = listener.local_addr()?.port();
+        self.udp_forwards.push((listener, guest_port));
+        Ok(actual)
+    }
+
     fn alloc_local_port(&mut self) -> u16 {
         let p = self.next_local_port;
         self.next_local_port = if p >= 65534 { 49152 } else { p + 1 };
@@ -174,7 +199,83 @@ impl NetBackend {
         self.iface.poll(now, phy, &mut self.sockets);
         self.accept_new();
         self.pump();
+        self.udp_host_to_guest();
         self.iface.poll(now, phy, &mut self.sockets);
+        self.udp_guest_to_host();
+    }
+
+    /// host UDP listener 收到的 datagram → 經 per-client smoltcp UDP socket 送到 guest。
+    fn udp_host_to_guest(&mut self) {
+        let mut inbound: Vec<(usize, SocketAddr, u16, Vec<u8>)> = Vec::new();
+        for (idx, (listener, gp)) in self.udp_forwards.iter().enumerate() {
+            let mut buf = [0u8; 65535];
+            loop {
+                match listener.recv_from(&mut buf) {
+                    Ok((n, client)) => inbound.push((idx, client, *gp, buf[..n].to_vec())),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            }
+        }
+        for (idx, client, gp, data) in inbound {
+            let handle = match self
+                .udp_sessions
+                .iter()
+                .find(|s| s.forward_idx == idx && s.client == client)
+            {
+                Some(s) => s.handle,
+                None => {
+                    let local = self.alloc_local_port();
+                    let mut sock = udp::Socket::new(
+                        udp::PacketBuffer::new(
+                            vec![udp::PacketMetadata::EMPTY; 16],
+                            vec![0u8; 65536],
+                        ),
+                        udp::PacketBuffer::new(
+                            vec![udp::PacketMetadata::EMPTY; 16],
+                            vec![0u8; 65536],
+                        ),
+                    );
+                    if sock.bind(local).is_err() {
+                        continue;
+                    }
+                    let handle = self.sockets.add(sock);
+                    if net_trace_enabled() {
+                        eprintln!(
+                            "[whp-net-trace] new UDP session client={client} -> {}:{gp} local={local}",
+                            self.guest_ip
+                        );
+                    }
+                    self.udp_sessions.push(UdpSession {
+                        handle,
+                        client,
+                        forward_idx: idx,
+                    });
+                    handle
+                }
+            };
+            let sock = self.sockets.get_mut::<udp::Socket>(handle);
+            let _ = sock.send_slice(&data, (IpAddress::Ipv4(self.guest_ip), gp));
+        }
+    }
+
+    /// per-client smoltcp UDP socket 收到的 guest 回應 → send_to 原 host client。
+    fn udp_guest_to_host(&mut self) {
+        let mut outbound: Vec<(usize, SocketAddr, Vec<u8>)> = Vec::new();
+        for s in &self.udp_sessions {
+            let sock = self.sockets.get_mut::<udp::Socket>(s.handle);
+            while sock.can_recv() {
+                match sock.recv() {
+                    Ok((data, _meta)) => outbound.push((s.forward_idx, s.client, data.to_vec())),
+                    Err(_) => break,
+                }
+            }
+        }
+        for (idx, client, data) in outbound {
+            if let Some((listener, _)) = self.udp_forwards.get(idx) {
+                let _ = listener.send_to(&data, client);
+            }
+        }
     }
 
     fn accept_new(&mut self) {
@@ -358,5 +459,43 @@ mod tests {
             }
         }
         assert!(found, "NetBackend 應對 guest 發 ARP（埠轉發發起）");
+    }
+
+    #[test]
+    fn udp_forward_initiates_datagram_to_guest() {
+        // host client 對 UDP 轉發埠送一個 datagram 後，NetBackend 應對 guest 發起送出
+        // （先 ARP 找 guest MAC）——證明 host→guest UDP 轉發的發起端可行（回程需 guest 回應，
+        // 留實機驗證）。
+        let mut phy = VirtioNetPhy::new();
+        let gw_ip = Ipv4Address::new(10, 0, 2, 2);
+        let guest_ip = Ipv4Address::new(10, 0, 2, 15);
+        let mut backend = NetBackend::new(
+            [0x52, 0x54, 0x00, 0x00, 0x00, 0x02],
+            gw_ip,
+            guest_ip,
+            &mut phy,
+        );
+        let listen_port = backend.add_udp_forward(0, 53).unwrap();
+
+        // host client 送一個 datagram 到轉發埠（IPv6 loopback）。
+        let client = UdpSocket::bind((std::net::Ipv6Addr::LOCALHOST, 0)).unwrap();
+        client
+            .send_to(b"hello", (std::net::Ipv6Addr::LOCALHOST, listen_port))
+            .unwrap();
+        for ms in 0..50 {
+            backend.poll(&mut phy, Instant::from_millis(ms));
+        }
+
+        // device tx 應有一個 ARP request：who-has guest_ip（target protocol addr @ 38..42）。
+        let mut found = false;
+        while let Some(frame) = phy.pop_to_guest() {
+            if frame.len() >= 42
+                && frame[12..14] == [0x08, 0x06]
+                && frame[38..42] == guest_ip.octets()
+            {
+                found = true;
+            }
+        }
+        assert!(found, "NetBackend 應對 guest 發 ARP（UDP 埠轉發發起）");
     }
 }

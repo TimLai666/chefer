@@ -63,7 +63,7 @@ fn print_help() {
            chefer-whp-helper \\\n\
              --kernel <path> --initramfs <path> --cmdline <text> \\\n\
              --bundle-dir <path> --data-dir <path> --cpus <n> --memory-mib <n> \\\n\
-             [--timeout <seconds>]   (default: 300)\n\
+             [--timeout <seconds>] [--forward-tcp <h:g>]... [--forward-udp <h:g>]...\n\
          \n\
          Preflight dynamically loads WinHvPlatform.dll and validates the full\n\
          device model lifecycle (partition/GPA mapping/vCPU).\n\
@@ -755,8 +755,8 @@ mod whp_api {
     }
 
     impl VirtioNetMmioDevice {
-        /// `forwards`：host→guest TCP 轉發清單 `(host_port, guest_port)`。
-        fn new(forwards: &[(u16, u16)]) -> Self {
+        /// `forwards`/`udp_forwards`：host→guest TCP/UDP 轉發清單 `(listen_port, guest_port)`。
+        fn new(forwards: &[(u16, u16)], udp_forwards: &[(u16, u16)]) -> Self {
             let gateway_ip = smoltcp::wire::Ipv4Address::new(
                 NET_GATEWAY_IP[0],
                 NET_GATEWAY_IP[1],
@@ -779,10 +779,20 @@ mod whp_api {
             for &(listen_port, guest_port) in forwards {
                 match backend.add_forward(listen_port, guest_port) {
                     Ok(actual) => {
-                        eprintln!("[whp-net] forward [::1]:{actual} -> guest:{guest_port}")
+                        eprintln!("[whp-net] forward tcp [::1]:{actual} -> guest:{guest_port}")
                     }
                     Err(e) => eprintln!(
-                        "[whp-net] warning: cannot bind [::1]:{listen_port} for guest:{guest_port}: {e}"
+                        "[whp-net] warning: cannot bind tcp [::1]:{listen_port} for guest:{guest_port}: {e}"
+                    ),
+                }
+            }
+            for &(listen_port, guest_port) in udp_forwards {
+                match backend.add_udp_forward(listen_port, guest_port) {
+                    Ok(actual) => {
+                        eprintln!("[whp-net] forward udp [::1]:{actual} -> guest:{guest_port}")
+                    }
+                    Err(e) => eprintln!(
+                        "[whp-net] warning: cannot bind udp [::1]:{listen_port} for guest:{guest_port}: {e}"
                     ),
                 }
             }
@@ -1606,7 +1616,7 @@ mod whp_api {
             VIRTIO_DATA_MMIO_BASE,
             VIRTIO_DATA_MMIO_IRQ,
         );
-        let mut virtio_net = VirtioNetMmioDevice::new(&req.forwards);
+        let mut virtio_net = VirtioNetMmioDevice::new(&req.forwards, &req.udp_forwards);
         let emulator = WhpEmulator::new(&emulation)?;
 
         // 5b. 映射 LAPIC MMIO 頁面（GPA 0xFEE00000, 4KB）
@@ -2299,6 +2309,8 @@ struct HelperRequest {
     timeout_secs: u64,
     /// host→guest TCP 埠轉發 `(host_port, guest_port)`（`--forward-tcp host:guest`，可重複）。
     forwards: Vec<(u16, u16)>,
+    /// host→guest UDP 埠轉發 `(host_port, guest_port)`（`--forward-udp host:guest`，可重複）。
+    udp_forwards: Vec<(u16, u16)>,
 }
 
 impl HelperRequest {
@@ -2317,6 +2329,11 @@ impl HelperRequest {
             let raw = parser.value("--forward-tcp")?;
             forwards.push(parse_forward(&raw)?);
         }
+        let mut udp_forwards = Vec::new();
+        while parser.has("--forward-udp") {
+            let raw = parser.value("--forward-udp")?;
+            udp_forwards.push(parse_forward(&raw)?);
+        }
         let request = HelperRequest {
             kernel: parser.path("--kernel")?,
             initramfs: parser.path("--initramfs")?,
@@ -2327,6 +2344,7 @@ impl HelperRequest {
             memory_mib: parse_memory_mib(&parser.value("--memory-mib")?)?,
             timeout_secs,
             forwards,
+            udp_forwards,
         };
         parser.finish()?;
         Ok(request)
@@ -2460,6 +2478,7 @@ mod tests {
     fn defaults_to_no_forwards() {
         let req = HelperRequest::parse(valid_args()).unwrap();
         assert!(req.forwards.is_empty());
+        assert!(req.udp_forwards.is_empty());
     }
 
     #[test]
@@ -2470,6 +2489,17 @@ mod tests {
         }
         let req = HelperRequest::parse(args).unwrap();
         assert_eq!(req.forwards, vec![(8080, 80), (16379, 6379)]);
+    }
+
+    #[test]
+    fn parses_repeated_forward_udp() {
+        let mut args = valid_args();
+        for f in ["--forward-udp", "53:53", "--forward-udp", "1514:514"] {
+            args.push(f.to_string());
+        }
+        let req = HelperRequest::parse(args).unwrap();
+        assert_eq!(req.udp_forwards, vec![(53, 53), (1514, 514)]);
+        assert!(req.forwards.is_empty());
     }
 
     #[test]
