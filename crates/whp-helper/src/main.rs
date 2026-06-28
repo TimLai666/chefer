@@ -944,13 +944,24 @@ mod whp_api {
                                 frame.len()
                             );
                         }
-                        // 出網分流：對「外部」dst 的 UDP 走 NAT（不交給 smoltcp，smoltcp 不轉發）；
-                        // 其餘（ARP、guest↔gateway、同網段、TCP、multicast/bcast）照舊餵 smoltcp。
-                        match super::virtio::nat::parse_udp(&frame) {
-                            Some(udp) if is_external_dst(udp.dst_ip) => {
-                                self.backend.nat_outbound(udp);
+                        // 出網分流：
+                        // - 外部 dst 的 TCP：仍交給 smoltcp（出網 TCP 由 smoltcp 動態 dst 處理）；
+                        //   但 SYN 先 nat_tcp_syn 預註冊 dst+listen socket+背景 connect host。
+                        // - 外部 dst 的 UDP：手工 NAT（不交 smoltcp，smoltcp 不轉發）。
+                        // - 其餘（ARP、guest↔gateway、同網段、multicast/bcast）照舊餵 smoltcp。
+                        if let Some(t) = super::virtio::nat::parse_tcp(&frame) {
+                            if is_external_dst(t.dst_ip) && t.syn && !t.ack {
+                                self.backend.nat_tcp_syn(t);
                             }
-                            _ => self.phy.push_from_guest(frame),
+                            self.phy.push_from_guest(frame);
+                        } else if let Some(udp) = super::virtio::nat::parse_udp(&frame) {
+                            if is_external_dst(udp.dst_ip) {
+                                self.backend.nat_outbound(udp);
+                            } else {
+                                self.phy.push_from_guest(frame);
+                            }
+                        } else {
+                            self.phy.push_from_guest(frame);
                         }
                     }
                     Err(e) => eprintln!("[whp-net] drop malformed tx frame: {e}"),

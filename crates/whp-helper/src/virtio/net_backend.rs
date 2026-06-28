@@ -15,12 +15,19 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{
+    EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpListenEndpoint, Ipv4Address,
+};
+
+/// 出網 host TCP connect 的逾時（背景執行緒，不阻塞 VM run loop）。
+const NAT_TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// 乙太網 MTU（virtio-net 預設）。
 pub const MTU: usize = 1500;
@@ -129,6 +136,8 @@ pub struct NetBackend {
     gateway_mac: [u8; 6],
     /// 出網 UDP NAT：per (guest_ip, guest_port) flow 的 host UDP socket。
     nat_flows: Vec<NatFlow>,
+    /// 出網 TCP NAT：per 4-tuple flow（smoltcp socket ↔ host TcpStream）。
+    tcp_nat: Vec<TcpNatFlow>,
     next_local_port: u16,
 }
 
@@ -155,6 +164,25 @@ struct NatFlow {
     sock: UdpSocket,
 }
 
+/// 出網 TCP NAT 的 host 端連線狀態。
+enum TcpConnState {
+    /// 背景執行緒 connect 中；收到結果前 guest 側資料先緩在 smoltcp socket。
+    Connecting(mpsc::Receiver<std::io::Result<TcpStream>>),
+    /// 已連上外部 host。
+    Up(TcpStream),
+}
+
+/// 出網 TCP NAT 的一條 flow（以 guest 4-tuple 為鍵）：guest 側由 smoltcp socket（在 dst
+/// 位址上 listen→accept）承接，host 側為連到外部的 TcpStream。dst IP 已動態加進 iface。
+struct TcpNatFlow {
+    guest_ip: [u8; 4],
+    guest_port: u16,
+    dst_ip: [u8; 4],
+    dst_port: u16,
+    handle: SocketHandle,
+    host: TcpConnState,
+}
+
 impl NetBackend {
     /// 以 gateway MAC/IP 與 guest IP 建立 smoltcp interface（綁在給定 phy 上）。
     pub fn new(
@@ -178,6 +206,7 @@ impl NetBackend {
             udp_sessions: Vec::new(),
             gateway_mac,
             nat_flows: Vec::new(),
+            tcp_nat: Vec::new(),
             next_local_port: 49152,
         }
     }
@@ -220,11 +249,162 @@ impl NetBackend {
         self.iface.poll(now, phy, &mut self.sockets);
         self.accept_new();
         self.pump();
+        self.tcp_nat_pump();
         self.udp_host_to_guest();
         self.iface.poll(now, phy, &mut self.sockets);
         self.udp_guest_to_host();
         // 出網 NAT：把 host UDP socket 收到的外部回應合成 frame 注入 guest rx。
         self.nat_poll(phy);
+    }
+
+    /// 出網 TCP SYN（接線層 drain_tx 分流後、push frame 給 smoltcp 前呼叫）：為此 4-tuple
+    /// 預註冊——dst IP 動態加進 iface、建 smoltcp listen socket(dst,port)、背景 connect host。
+    /// 重傳 SYN（同 4-tuple 已有 flow）則略過。
+    pub fn nat_tcp_syn(&mut self, t: super::nat::OutboundTcp) {
+        if self.tcp_nat.iter().any(|f| {
+            f.guest_ip == t.src_ip
+                && f.guest_port == t.src_port
+                && f.dst_ip == t.dst_ip
+                && f.dst_port == t.dst_port
+        }) {
+            return;
+        }
+        if !self.ensure_dst_addr(t.dst_ip) {
+            if net_trace_enabled() {
+                eprintln!("[whp-net-trace] nat-tcp: iface addr table full, dropping new dst");
+            }
+            return;
+        }
+        let dst_addr = Ipv4Address::new(t.dst_ip[0], t.dst_ip[1], t.dst_ip[2], t.dst_ip[3]);
+        let mut sock = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0u8; 65536]),
+            tcp::SocketBuffer::new(vec![0u8; 65536]),
+        );
+        let ep = IpListenEndpoint {
+            addr: Some(IpAddress::Ipv4(dst_addr)),
+            port: t.dst_port,
+        };
+        if sock.listen(ep).is_err() {
+            self.release_dst_addr(t.dst_ip);
+            return;
+        }
+        let handle = self.sockets.add(sock);
+        let (tx, rx) = mpsc::channel();
+        let dst = SocketAddr::from((t.dst_ip, t.dst_port));
+        std::thread::spawn(move || {
+            let _ = tx.send(TcpStream::connect_timeout(&dst, NAT_TCP_CONNECT_TIMEOUT));
+        });
+        if net_trace_enabled() {
+            let d = t.dst_ip;
+            eprintln!(
+                "[whp-net-trace] nat-tcp: new flow guest:{} -> {}.{}.{}.{}:{}",
+                t.src_port, d[0], d[1], d[2], d[3], t.dst_port
+            );
+        }
+        self.tcp_nat.push(TcpNatFlow {
+            guest_ip: t.src_ip,
+            guest_port: t.src_port,
+            dst_ip: t.dst_ip,
+            dst_port: t.dst_port,
+            handle,
+            host: TcpConnState::Connecting(rx),
+        });
+    }
+
+    /// 確保 dst IP 在 iface ip_addrs（讓 smoltcp 接受 guest 對該 dst 的連線）；滿了則嘗試
+    /// 驅逐一個無 active flow 的 /32 dst 再加。成功回 true。
+    fn ensure_dst_addr(&mut self, dst_ip: [u8; 4]) -> bool {
+        let x = Ipv4Address::new(dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]);
+        let cidr = IpCidr::new(IpAddress::Ipv4(x), 32);
+        if self.iface.ip_addrs().contains(&cidr) {
+            return true;
+        }
+        let mut ok = false;
+        self.iface
+            .update_ip_addrs(|addrs| ok = addrs.push(cidr).is_ok());
+        if ok {
+            return true;
+        }
+        // 滿了：找一個目前無 flow 使用的 /32 dst 驅逐。
+        let evict = self.iface.ip_addrs().iter().copied().find(|c| {
+            c.prefix_len() == 32
+                && match c.address() {
+                    IpAddress::Ipv4(a) => !self.tcp_nat.iter().any(|f| f.dst_ip == a.octets()),
+                    #[allow(unreachable_patterns)]
+                    _ => false,
+                }
+        });
+        if let Some(e) = evict {
+            self.iface.update_ip_addrs(|addrs| {
+                addrs.retain(|c| *c != e);
+                let _ = addrs.push(cidr);
+            });
+            return true;
+        }
+        false
+    }
+
+    /// flow 關閉後釋放其 dst IP（若無其他 flow 再用該 dst）。須在 flow 已自 tcp_nat 移除後呼叫。
+    fn release_dst_addr(&mut self, dst_ip: [u8; 4]) {
+        if self.tcp_nat.iter().any(|f| f.dst_ip == dst_ip) {
+            return;
+        }
+        let x = Ipv4Address::new(dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]);
+        let cidr = IpCidr::new(IpAddress::Ipv4(x), 32);
+        self.iface
+            .update_ip_addrs(|addrs| addrs.retain(|c| *c != cidr));
+    }
+
+    /// 驅動出網 TCP flow：完成 host connect、雙向橋接 smoltcp socket ↔ host TcpStream、
+    /// 清理已關閉的 flow。
+    fn tcp_nat_pump(&mut self) {
+        let mut closed: Vec<usize> = Vec::new();
+        for (i, flow) in self.tcp_nat.iter_mut().enumerate() {
+            // 1. 完成 host connect。
+            if let TcpConnState::Connecting(rx) = &flow.host {
+                match rx.try_recv() {
+                    Ok(Ok(stream)) => {
+                        let _ = stream.set_nonblocking(true);
+                        flow.host = TcpConnState::Up(stream);
+                    }
+                    Ok(Err(_)) | Err(mpsc::TryRecvError::Disconnected) => {
+                        self.sockets.get_mut::<tcp::Socket>(flow.handle).abort();
+                        closed.push(i);
+                        continue;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => continue, // 仍在連，下一輪再看
+                }
+            }
+            // 2. Established：橋接 bytes。
+            let sock = self.sockets.get_mut::<tcp::Socket>(flow.handle);
+            if let TcpConnState::Up(host) = &mut flow.host {
+                if sock.can_recv() {
+                    let _ = sock.recv(|data| {
+                        let n = host.write(data).unwrap_or(0);
+                        (n, ())
+                    });
+                }
+                if sock.can_send() {
+                    let mut buf = [0u8; 4096];
+                    match host.read(&mut buf) {
+                        Ok(0) => sock.close(),
+                        Ok(n) => {
+                            let _ = sock.send_slice(&buf[..n]);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(_) => sock.close(),
+                    }
+                }
+            }
+            if sock.state() == tcp::State::Closed {
+                closed.push(i);
+            }
+        }
+        for i in closed.into_iter().rev() {
+            let flow = self.tcp_nat.remove(i);
+            self.sockets.remove(flow.handle);
+            self.release_dst_addr(flow.dst_ip);
+        }
     }
 
     /// 處理一個 guest 出網 UDP 封包（接線層 drain_tx 分流後呼叫）：找/建對應 flow 的
