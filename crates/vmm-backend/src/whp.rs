@@ -78,23 +78,19 @@ impl ExecBackend for WhpBackend {
         // host 無路由可達）。helper 把每個 guest 埠暴露在 host `[::1]:guest`（鏡像 WSL2
         // wslrelay），host≠guest 的對外 remap 仍由 runtime 既有的埠代理負責——故這裡只需
         // 把要暴露的 guest 埠（去重）傳給 helper，bind 用 guest 埠、不是使用者的 host 埠。
-        // UDP 目前 helper 的 net backend 尚未支援，先略過並告警。
         let mut tcp_forwards: Vec<(u16, u16)> = Vec::new();
+        let mut udp_forwards: Vec<(u16, u16)> = Vec::new();
         for f in vz_util::forward_ports(ctx.manifest) {
-            match f.proto {
-                PortProto::Tcp => {
-                    if !tcp_forwards.iter().any(|(_, g)| *g == f.guest) {
-                        tcp_forwards.push((f.guest, f.guest));
-                    }
-                }
-                PortProto::Udp => eprintln!(
-                    "[chefer] warning: the WHP backend cannot forward UDP yet \
-                     (127.0.0.1:{} -> guest:{}); skipping",
-                    f.host, f.guest
-                ),
+            let bucket = match f.proto {
+                PortProto::Tcp => &mut tcp_forwards,
+                PortProto::Udp => &mut udp_forwards,
+            };
+            if !bucket.iter().any(|(_, g)| *g == f.guest) {
+                bucket.push((f.guest, f.guest));
             }
         }
         invocation.forwards = tcp_forwards;
+        invocation.udp_forwards = udp_forwards;
 
         std::fs::create_dir_all(ctx.data_dir).with_context(|| {
             format!(

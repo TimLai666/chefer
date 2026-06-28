@@ -83,6 +83,8 @@ pub struct HelperInvocation {
     /// host→guest TCP 埠轉發 `(host_port, guest_port)`。WHP 的轉發 listener 由 helper
     /// 自身持有（guest IP 為 smoltcp 虛擬位址、host 無路由），故經 CLI 傳入。
     pub forwards: Vec<(u16, u16)>,
+    /// host→guest UDP 埠轉發 `(host_port, guest_port)`（同上，經 CLI 傳給 helper）。
+    pub udp_forwards: Vec<(u16, u16)>,
 }
 
 impl HelperInvocation {
@@ -110,6 +112,10 @@ impl HelperInvocation {
         }
         for (host, guest) in &self.forwards {
             v.push("--forward-tcp".into());
+            v.push(format!("{host}:{guest}").into());
+        }
+        for (host, guest) in &self.udp_forwards {
+            v.push("--forward-udp".into());
             v.push(format!("{host}:{guest}").into());
         }
         v
@@ -196,6 +202,7 @@ pub fn helper_invocation(
             resources: VmResources::compute(host_cpus, mem_override_mib),
             timeout_secs,
             forwards: Vec::new(),
+            udp_forwards: Vec::new(),
         }),
         other => Err(other),
     }
@@ -331,6 +338,7 @@ mod tests {
 
         let mut invocation = helper_invocation(&bundle, &data, false, "x86_64", 16, None).unwrap();
         invocation.forwards = vec![(8080, 80), (16379, 6379)];
+        invocation.udp_forwards = vec![(53, 53)];
         let args = invocation
             .args()
             .into_iter()
@@ -340,6 +348,8 @@ mod tests {
         assert!(has_arg_pair(&args, "--forward-tcp", "8080:80"));
         assert!(has_arg_pair(&args, "--forward-tcp", "16379:6379"));
         assert_eq!(args.iter().filter(|a| *a == "--forward-tcp").count(), 2);
+        assert!(has_arg_pair(&args, "--forward-udp", "53:53"));
+        assert_eq!(args.iter().filter(|a| *a == "--forward-udp").count(), 1);
     }
 
     #[test]
