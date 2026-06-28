@@ -1,11 +1,11 @@
 [package]
 name = "guest-agent"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
-chefer-bundle = { version = "0.1.0", path = "../chefer-bundle" }
+chefer-bundle = { version = "0.2.0", path = "../chefer-bundle" }
 clap = { version = "4.6.1", features = ["derive"] }
 hex = "0.4.3"
 ruzstd = "0.8.3"
