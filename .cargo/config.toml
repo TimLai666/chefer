@@ -6,3 +6,10 @@ linker = "rust-lld"
 
 [target.aarch64-unknown-linux-musl]
 linker = "rust-lld"
+
+# WHP 出網 TCP NAT：smoltcp 的 interface ip_addrs 是 heapless Vec（IFACE_MAX_ADDR_COUNT
+# 預設 2）。出網 TCP 以「動態把每個外部 dst IP 加進 iface」的方式讓 smoltcp 接受 guest 對
+# 任意 dst 的連線，故需較大容量（搭配對 idle dst 的 LRU 驅逐）。smoltcp build.rs 讀此環境
+# 變數（見其 README）；放這裡讓本機與 CI 一致。
+[env]
+SMOLTCP_IFACE_MAX_ADDR_COUNT = "64"
