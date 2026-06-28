@@ -157,10 +157,17 @@ mod whp_api {
     const VIRTIO_MMIO_SIZE: u64 = 0x200;
     const VIRTIO_MMIO_IRQ: u8 = 5;
     const VIRTIO_MMIO_CMDLINE: &str = "virtio_mmio.device=0x200@0xd0000000:5";
-    // virtio-net 視窗緊接 virtio-blk 之後（base +0x200），配 PIC IRQ 6（見 DESIGN §6 GPA 佈局）。
+    // virtio-net 視窗緊接 virtio-blk(vda) 之後（base +0x200），配 PIC IRQ 6（見 DESIGN §6 GPA 佈局）。
     const VIRTIO_NET_MMIO_BASE: u64 = 0xD000_0200;
     const VIRTIO_NET_MMIO_IRQ: u8 = 6;
     const VIRTIO_NET_MMIO_CMDLINE: &str = "virtio_mmio.device=0x200@0xd0000200:6";
+    // virtio-blk(vdb, data rw) 視窗（base +0x400），配 PIC IRQ 7。
+    const VIRTIO_DATA_MMIO_BASE: u64 = 0xD000_0400;
+    const VIRTIO_DATA_MMIO_IRQ: u8 = 7;
+    const VIRTIO_DATA_MMIO_CMDLINE: &str = "virtio_mmio.device=0x200@0xd0000400:7";
+    // vdb（data）image 容量上限（host RAM 內的 backing；env CHEFER_WHP_DATA_MIB 覆寫，預設 256MiB）。
+    // 必須 ≥ guest 關機 re-tar data_dir 後的 tar 大小，否則回寫 IOERR。
+    const VIRTIO_DATA_DEFAULT_MIB: u64 = 256;
     // user-mode 網路：smoltcp gateway 10.0.2.2、guest 靜態 10.0.2.15/24（與 appliance init 約定）。
     const NET_GATEWAY_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x00, 0x02];
     const NET_GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
@@ -412,6 +419,7 @@ mod whp_api {
         host_mem: *mut u8,
         host_mem_len: usize,
         virtio: *mut VirtioMmioDevice,
+        data: *mut VirtioMmioDevice,
         net: *mut VirtioNetMmioDevice,
         pic1: *mut super::pic::Pic,
         /// 單調毫秒時鐘（boot 起算），供 net backend 的 smoltcp poll。
@@ -585,8 +593,9 @@ mod whp_api {
     }
 
     fn append_virtio_mmio_cmdline(cmdline: &str) -> String {
-        // blk（vda/vdb）+ net 兩個 virtio-mmio 裝置，各以 base/IRQ 靜態註冊。
-        let devices = format!("{VIRTIO_MMIO_CMDLINE} {VIRTIO_NET_MMIO_CMDLINE}");
+        // virtio-blk(vda bundle) + virtio-blk(vdb data) + virtio-net，各以 base/IRQ 靜態註冊。
+        let devices =
+            format!("{VIRTIO_MMIO_CMDLINE} {VIRTIO_DATA_MMIO_CMDLINE} {VIRTIO_NET_MMIO_CMDLINE}");
         if cmdline.contains("virtio_mmio.device=") {
             cmdline.to_string()
         } else if cmdline.trim().is_empty() {
@@ -597,19 +606,25 @@ mod whp_api {
     }
 
     impl VirtioMmioDevice {
-        fn new(backing: Vec<u8>) -> Self {
+        /// 建一顆 virtio-blk MMIO 裝置。`read_only`：bundle(vda)=true、data(vdb)=false。
+        fn new(backing: Vec<u8>, read_only: bool, id: &str, base: u64, irq: u8) -> Self {
             Self {
-                base: VIRTIO_MMIO_BASE,
-                irq: VIRTIO_MMIO_IRQ,
+                base,
+                irq,
                 mmio: super::virtio::mmio::Mmio::new(
                     super::virtio::DEVICE_ID_BLK,
                     super::virtio::VIRTIO_F_VERSION_1,
                     1,
                     256,
                 ),
-                blk: super::virtio::blk::BlkDevice::new(backing, true, "chefer-bundle"),
+                blk: super::virtio::blk::BlkDevice::new(backing, read_only, id),
                 last_avail_idx: 0,
             }
+        }
+
+        /// 取出 backing（關機時回寫 host data image：`vdb` → data_dir）。
+        fn into_backing(self) -> Vec<u8> {
+            self.blk.into_backing()
         }
 
         fn contains(&self, gpa: u64) -> bool {
@@ -1075,6 +1090,36 @@ mod whp_api {
                 return 0;
             }
 
+            // virtio-blk(vdb, data rw) 視窗（與 vda/net 不同物件，disjoint deref）。
+            let data_dev = &mut *ctx.data;
+            if data_dev.contains(access.gpa_address) {
+                let offset = access.gpa_address - data_dev.base;
+                if access.direction == EMULATOR_DIRECTION_WRITE {
+                    let host = std::slice::from_raw_parts_mut(ctx.host_mem, ctx.host_mem_len);
+                    let pic1 = &mut *ctx.pic1;
+                    if let Err(err) = data_dev.write_bytes(offset, &access.data[..len], host, pic1)
+                    {
+                        eprintln!(
+                            "virtio-blk(data) write failed at 0x{:X}: {err}",
+                            access.gpa_address
+                        );
+                        return E_FAIL;
+                    }
+                } else {
+                    match data_dev.read_bytes(offset, len) {
+                        Ok(bytes) => access.data[..len].copy_from_slice(&bytes[..len]),
+                        Err(err) => {
+                            eprintln!(
+                                "virtio-blk(data) read failed at 0x{:X}: {err}",
+                                access.gpa_address
+                            );
+                            return E_FAIL;
+                        }
+                    }
+                }
+                return 0;
+            }
+
             // virtio-net 視窗（與 blk 不同物件，disjoint deref）。
             let net = &mut *ctx.net;
             if net.contains(access.gpa_address) {
@@ -1421,6 +1466,20 @@ mod whp_api {
             )
         })?;
 
+        // data(vdb) backing：pack_dir(data_dir) 補零到容量上限——guest 關機會 re-tar data_dir
+        // 寫回 /dev/vdb，需預留空間（sector 對齊；tar 讀取會在 EOF 區塊停止、忽略尾端補零）。
+        let data_capacity = std::env::var("CHEFER_WHP_DATA_MIB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(VIRTIO_DATA_DEFAULT_MIB)
+            .saturating_mul(1024 * 1024) as usize;
+        std::fs::create_dir_all(&req.data_dir).ok();
+        let mut data_image = super::virtio::image::pack_dir(&req.data_dir)
+            .map_err(|e| format!("Failed to pack data dir {}: {e}", req.data_dir.display()))?;
+        if data_image.len() < data_capacity {
+            data_image.resize(data_capacity, 0);
+        }
+
         // 2. 解析 bzImage
         let info = bzimage::parse(&kernel_data)?;
         eprintln!(
@@ -1533,7 +1592,20 @@ mod whp_api {
 
         let mem: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(host_mem as *mut u8, mem_size) };
-        let mut virtio_blk = VirtioMmioDevice::new(bundle_image);
+        let mut virtio_blk = VirtioMmioDevice::new(
+            bundle_image,
+            true,
+            "chefer-bundle",
+            VIRTIO_MMIO_BASE,
+            VIRTIO_MMIO_IRQ,
+        );
+        let mut virtio_data = VirtioMmioDevice::new(
+            data_image,
+            false,
+            "chefer-data",
+            VIRTIO_DATA_MMIO_BASE,
+            VIRTIO_DATA_MMIO_IRQ,
+        );
         let mut virtio_net = VirtioNetMmioDevice::new(&req.forwards);
         let emulator = WhpEmulator::new(&emulation)?;
 
@@ -1646,6 +1718,7 @@ mod whp_api {
             &emulator,
             mem,
             &mut virtio_blk,
+            &mut virtio_data,
             &mut virtio_net,
             &mut serial_port,
             &mut cmos_addr,
@@ -1663,6 +1736,17 @@ mod whp_api {
 
         // 14. 印出剩餘 serial 輸出
         flush_serial(&serial_port, &mut last_printed);
+
+        // 14b. data(vdb) 持久化回寫：guest 關機前 re-tar data_dir → /dev/vdb，其位元組落在
+        // virtio_data 的 backing；在此解回 host data_dir。best-effort——guest 若異常結束未
+        // re-tar，backing 仍為開機原樣，解回等同原內容（無害）。
+        let data_backing = virtio_data.into_backing();
+        if let Err(e) = super::virtio::image::unpack_image(&data_backing, &req.data_dir) {
+            eprintln!(
+                "[chefer] warning: failed to write back data image to {}: {e}",
+                req.data_dir.display()
+            );
+        }
 
         // 13. 清理
         unsafe {
@@ -1739,6 +1823,7 @@ mod whp_api {
         emulator: &WhpEmulator<'_>,
         host_mem: &mut [u8],
         virtio_blk: &mut VirtioMmioDevice,
+        virtio_data: &mut VirtioMmioDevice,
         virtio_net: &mut VirtioNetMmioDevice,
         serial: &mut super::serial::SerialPort,
         cmos_addr: &mut u8,
@@ -1912,7 +1997,10 @@ mod whp_api {
                         rip,
                         &format!("exit_access={}", access_type_name(access_type)),
                     );
-                    if !virtio_blk.contains(gpa) && !virtio_net.contains(gpa) {
+                    if !virtio_blk.contains(gpa)
+                        && !virtio_data.contains(gpa)
+                        && !virtio_net.contains(gpa)
+                    {
                         return Err(format!(
                             "Memory access fault at GPA 0x{gpa:016X} (RIP=0x{rip:016X})"
                         ));
@@ -1926,6 +2014,7 @@ mod whp_api {
                         host_mem: host_mem.as_mut_ptr(),
                         host_mem_len: host_mem.len(),
                         virtio: virtio_blk as *mut VirtioMmioDevice,
+                        data: virtio_data as *mut VirtioMmioDevice,
                         net: virtio_net as *mut VirtioNetMmioDevice,
                         pic1: pic1 as *mut super::pic::Pic,
                         now_ms: start.elapsed().as_millis() as u64,
@@ -2181,7 +2270,8 @@ mod whp_api {
         fn cmdline_appends_both_blk_and_net_devices() {
             let out = append_virtio_mmio_cmdline("console=ttyS0");
             assert!(out.starts_with("console=ttyS0 "));
-            assert!(out.contains("virtio_mmio.device=0x200@0xd0000000:5")); // blk
+            assert!(out.contains("virtio_mmio.device=0x200@0xd0000000:5")); // blk vda (bundle)
+            assert!(out.contains("virtio_mmio.device=0x200@0xd0000400:7")); // blk vdb (data)
             assert!(out.contains("virtio_mmio.device=0x200@0xd0000200:6")); // net
         }
 
