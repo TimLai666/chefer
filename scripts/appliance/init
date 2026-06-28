@@ -89,7 +89,7 @@ else
     log "WHP 路徑：從 /dev/vdb 解開 data tar -> ${data_dir}"
     dd if=/dev/vdb bs=64k 2>/dev/null | tar -C "$data_dir" -xf - \
       || fail "無法從 /dev/vdb 展開 data image；請確認 helper 的 data virtio-blk 內容有效" 126
-    log "注意：WHP data image 目前尚未實作關機回寫 host，data 仍為暫時性"
+    log "WHP 路徑：data 將於關機 re-tar 回寫 /dev/vdb（持久化）"
   else
     log "WHP 路徑：未提供 /dev/vdb，先使用 ephemeral data dir ${data_dir}"
   fi
@@ -137,6 +137,17 @@ code="$?"
 set -e
 
 log "guest-agent 結束，exit=${code}"
+
+# WHP 路徑：把 data_dir re-tar 回寫 /dev/vdb，讓 helper 關機後解回 host（persist 跨重啟）。
+# 須在 poweroff 前完成（virtio-blk 寫入同步進 helper backing）。vz/QEMU 走 virtiofs 直寫
+# host、無 /dev/vdb，故此區塊自動略過。conv=notrunc：不截斷固定大小的 block device。
+if [ -b /dev/vdb ]; then
+  log "WHP 路徑：關機回寫 data ${data_dir} -> /dev/vdb"
+  tar -C "$data_dir" -cf - . 2>/dev/null | dd of=/dev/vdb bs=64k conv=notrunc 2>/dev/null \
+    || log "警告：data 回寫 /dev/vdb 失敗，persist 資料可能未保存"
+  sync
+fi
+
 emit_exit "$code"
 sync
 poweroff -f >/dev/null 2>&1 || halt -f >/dev/null 2>&1 || true
