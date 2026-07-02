@@ -1,6 +1,6 @@
 [package]
 name = "chefer-runtime"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
@@ -15,8 +15,8 @@ clap = { version = "4.0", features = ["derive"] }
 fs-err = "3.3.0"
 sha2 = "0.11.0"
 ctrlc = "3.5.2"
-chefer-bundle = { version = "0.2.0", path = "../chefer-bundle" }
-vmm-backend = { version = "0.2.0", path = "../vmm-backend" }
+chefer-bundle = { version = "0.3.0", path = "../chefer-bundle" }
+vmm-backend = { version = "0.3.0", path = "../vmm-backend" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

@@ -1,12 +1,12 @@
 [package]
 name = "vmm-backend"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
-chefer-bundle = { version = "0.2.0", path = "../chefer-bundle" }
-guest-agent = { version = "0.2.0", path = "../guest-agent" }
+chefer-bundle = { version = "0.3.0", path = "../chefer-bundle" }
+guest-agent = { version = "0.3.0", path = "../guest-agent" }
 sha2 = "0.11.0"
 tar = "0.4.46"
 

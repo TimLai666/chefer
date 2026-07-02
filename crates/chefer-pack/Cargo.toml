@@ -1,12 +1,12 @@
 [package]
 name = "chefer-pack"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
 appcipe-spec = { version = "0.1.0", path = "../appcipe-spec" }
-chefer-bundle = { version = "0.2.0", path = "../chefer-bundle" }
+chefer-bundle = { version = "0.3.0", path = "../chefer-bundle" }
 flate2 = "1.1.9"
 fs-err = "3.3.0"
 # registry pull（source: image）。rustls 對齊 workspace（chefer-cli 也用 rustls）。
