@@ -314,9 +314,23 @@ pub fn run_app(ctx: &AppRunContext) -> anyhow::Result<i32>; // 取第一個 Avai
 
     - **Guest（appliance）**：kernel 開 `CONFIG_DRM_VIRTIO_GPU`（+ DRM/evdev）；initramfs 內嵌極小 kiosk Wayland compositor **`cage`** + Mesa（llvmpipe 軟算繪，或 virtio-gpu 加速）+ **Xwayland**（讓 X11 app 也能跑）。guest-agent 對 `interface_mode: gui/both` 的服務改以 `cage -- <服務命令>` 啟動（設好 `WAYLAND_DISPLAY`），算繪到 virtio-gpu scanout。`cage` 的「全螢幕單一 app」模型恰好對上 chefer「一個 app 至多一個介面服務」。
     - **Host（vz 後端，`#[cfg(target_os = "macos")]`）**：VM 組態加 `VZVirtioGraphicsDeviceConfiguration`（一個 scanout）+ USB 鍵盤/指標裝置；開一個 AppKit 視窗承載 `VZVirtualMachineView` 綁該 VM → 顯示 guest framebuffer，VZ 自動把鍵鼠 HID 轉進 guest。代表 macOS 版 chefer 在 gui 模式時要成為「有 NSApplication 事件迴圈的 GUI 程式」；非 gui 維持 headless。
-    - **生命週期 / 輸入 / 剪貼簿**：`cage` 內 app 結束 → 沿用 guest-agent 既有「介面服務結束＝收掉 app」→ VM 關、視窗關。鍵鼠走 VZ→USB HID→evdev→cage，免額外處理。macOS↔guest 剪貼簿需另開一條 **vsock** + 小 agent 同步，列為後續加強。
+    - **生命週期 / 輸入**：`cage` 內 app 結束 → 沿用 guest-agent 既有「介面服務結束＝收掉 app」→ VM 關、視窗關。鍵鼠走 VZ→USB HID→evdev→cage，免額外處理。
+    - **剪貼簿（host↔guest，vz 與 whp 共用設計）**：**不走 vsock**（whp 得再寫一個 virtio-vsock 裝置模型，成本高）——改走**既有網路通道**：guest-agent 起剪貼簿同步服務（guest 側以 wl-clipboard 對接 cage 的 Wayland 剪貼簿），host 側經該後端既有的 host→guest 通道連入（vz：直連 guest IP；whp：helper 的 `[::1]` 轉發），雙向同步。安全：localhost TCP 任何本機程序可連 → 以 **kernel cmdline 帶入的隨機 token** 握手，未帶 token 的連線一律拒絕。首版同步 UTF-8 文字；圖片/大 payload 後續。
     - **分期**：① vz 後端先點亮（非 GUI）→ ② appliance 加 virtio-gpu + cage + Xwayland，先在 **QEMU** 驗 GUI app 能算繪 → ③ 真 Mac 接 `VZVirtualMachineView` + HID → ④ 剪貼簿/縮放打磨。全程依賴實體 Mac 才能完成 ③ 之後。
     - **替代（不採用）**：X11 → 要求使用者裝 **XQuartz**、X11 經 vsock 轉發——較快但破壞零安裝、過 VM 邊界延遲高、XQuartz 老舊，故不採。
+
+  - **GUI overlay 打包契約（vz 與 whp 共用；規劃）**：cage + Xwayland + Mesa(llvmpipe) 及其依賴閉包太肥（估數十 MB），**不放進基礎 initramfs**——做成獨立 kit 產物 **`chefer-gui-overlay-<arch>`**（rootfs subtree 的 `tar.zst`，由 `scripts/build-gui-overlay.sh` 於容器內自 Alpine 套件收集，release workflow 建置、`verify-release-kit` 檢查）。
+    - **嵌入規則**：app 有任一 `interface_mode: gui/both` 服務 **且** target 為 Windows 或 macOS（存在 VM 後端可能）→ chefer-pack 把 overlay 嵌入 bundle `vm/gui-overlay-<arch>.tar.zst`；純 server app 與 Linux target **不揹此體積**。Windows target 就算最後跑在 wsl2（用不到 overlay）也要嵌——build 時無從得知執行時會落在哪個後端。kit 缺 overlay → build 印明確警告（GUI 在 WHP/vz 將降級並附補救方式），不擋 build。
+    - **kit 探索**：統一加在 `chefer_bundle::kit::find_gui_overlay(kit_dirs, arch)`，比照 guest-agent/pasta，不另起爐灶。`chefer upgrade` 整包換 kit → overlay 不會與 CLI 漂移；`inspect` 的 `vm/` 清單自然列出。
+    - **消費端**：appliance init 見 bundle `vm/` 有 overlay → 解壓到 tmpfs 根（在既有 switch_root 之後）；guest-agent 對 gui/both 服務以 `cage -- <cmd>` 包裝。舊 bundle / 無 overlay 而有 gui 服務 → WHP/vz 印可行動錯誤（說明需以含 GUI overlay 的 kit 重新打包），不得無聲黑屏。
+
+  - **WHP GUI（M8，規劃）— host 側自建顯示與輸入（guest 側與 vz 完全共用上述 overlay/cage 路線）**：vz 有 `VZVirtualMachineView` 免費送顯示+HID，WHP 全要自己來。**2D only**（不做 virgl/GPU 加速——WHP 路線本就 CPU-only，cage 用 llvmpipe 軟算繪；host 只做 framebuffer 搬運與顯示）；指標採 **virtio-input tablet（絕對座標）** 避免滑鼠捕捉問題。
+    - **M8-a guest 側（QEMU 驗證，CI 可跑，與 vz 共用）**：kernel 加 `CONFIG_DRM`/`CONFIG_DRM_VIRTIO_GPU`/`CONFIG_INPUT_EVDEV`；`build-gui-overlay.sh` + init 解壓 + guest-agent cage 包裝；QEMU `-device virtio-gpu -device virtio-tablet-pci -device virtio-keyboard-pci` 驗 GUI app 真的算繪出畫面。**最大不確定點**：Alpine 動態庫閉包收集的正確性與 overlay 體積。
+    - **M8-b 裝置模型純邏輯（與 M8-a 並行）**：`whp-helper/src/virtio/gpu.rs`（control queue：`GET_DISPLAY_INFO`/`RESOURCE_CREATE_2D`/`RESOURCE_ATTACH_BACKING`/`SET_SCANOUT`/`TRANSFER_TO_HOST_2D`/`RESOURCE_FLUSH`；cursor queue 後續）＋ `virtio/input.rs`（evdev 事件封包、event/status queue）。單元測試鎖行為，沿用 M1-M7 的 mmio/queue 積木。
+    - **M8-c host 視窗**：helper 內 Win32 視窗執行緒（`RESOURCE_FLUSH` 時 `StretchDIBits` blit scanout；`WM_KEYDOWN`/`WM_MOUSEMOVE` 等轉 virtio-input 事件；使用者關窗 = 介面服務結束語意 → 整個 app 收掉）。只有 bundle 含 gui/both 服務才建視窗，否則維持 headless。
+    - **M8-d 實機接線**：兩個新 virtio-mmio 視窗（沿既有佈局續排：gpu `0xD000_0600`/IRQ 8、input `0xD000_0800`/IRQ 9，實作時以 boot loop 佈局為準）+ cmdline `virtio_mmio.device=...` + 實機 GUI demo。
+    - **M8-e 剪貼簿**：依上方共用設計（網路通道 + token），host 側 Win32 clipboard API + `WM_CLIPBOARDUPDATE`。
+    - **首版範圍**：鍵盤＋滑鼠＋固定解析度（1280×800，env 可覆寫）＋ UTF-8 文字剪貼簿；動態解析度/DPI/圖片剪貼簿後續。
 
 ### guest-agent（lib + bin；Linux 專屬邏輯 cfg 隔離）
 - lib：`pub struct RunConfig { pub bundle_dir: PathBuf, pub data_dir: PathBuf, pub cache_dir: Option<PathBuf>, pub keep_rootfs: bool, pub udp_bridge: bool }`
