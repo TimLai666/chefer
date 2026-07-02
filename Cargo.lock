@@ -242,7 +242,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "chefer-assembler"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chefer-bundle",
@@ -256,7 +256,7 @@ dependencies = [
 
 [[package]]
 name = "chefer-bundle"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "chefer-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "appcipe-normalize",
@@ -295,7 +295,7 @@ dependencies = [
 
 [[package]]
 name = "chefer-pack"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "appcipe-spec",
@@ -316,7 +316,7 @@ dependencies = [
 
 [[package]]
 name = "chefer-runtime"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chefer-bundle",
@@ -1078,7 +1078,7 @@ dependencies = [
 
 [[package]]
 name = "guest-agent"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chefer-bundle",
@@ -3053,7 +3053,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vmm-backend"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chefer-bundle",
@@ -3250,7 +3250,7 @@ dependencies = [
 
 [[package]]
 name = "whp-helper"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "smoltcp",
  "tar",
