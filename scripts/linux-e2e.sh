@@ -583,6 +583,77 @@ run_wayland_e2e() {
 # 網路隔離 E2E：同一個 web image，分別以 shared 與 internal 打包執行。
 #  - shared  ：未宣告的 secret port 在 host loopback 上可達（示範洩漏；驗證測試本身的靈敏度）
 #  - internal：未宣告的 secret port 從 host 連不到（隔離成立）；宣告的 port 仍經 relay 可達
+# rootless subuid 委派：非 root 執行時，若有 /etc/subuid + newuidmap，服務的 user ns
+# 應為範圍映射 → 容器內 chown 到其他 uid（chown/gosu image 的核心動作）要成功。
+# 環境沒有委派（無 newuidmap 或無 subuid 範圍）就跳過（單一 uid 映射下 chown 本就會失敗）。
+# 兩種網路模式各驗一次：省略 network:（bridge → netns holder 的 user ns 走委派）與
+# shared（middle 行程的 user ns 走委派）。
+run_subid_e2e() {
+  local work="$1"
+  local output_target="$2"
+  local image_platform="$3"
+  local cli="$4"
+  local kit="$5"
+  local image_tar="$6"
+
+  if [[ "$(id -u)" -eq 0 ]]; then
+    note "Subuid E2E skipped: running as root (services run as real root; delegation not used)"
+    return 0
+  fi
+  if ! command -v newuidmap >/dev/null 2>&1 || ! command -v newgidmap >/dev/null 2>&1 \
+    || ! grep -Eq "^($(id -un)|$(id -u)):" /etc/subuid 2>/dev/null \
+    || ! grep -Eq "^($(id -un)|$(id -g)):" /etc/subgid 2>/dev/null; then
+    note "Subuid E2E skipped: no newuidmap/newgidmap or no subuid/subgid ranges for $(id -un)"
+    return 0
+  fi
+
+  local mode net_line
+  for mode in bridge shared; do
+    if [[ "$mode" == "bridge" ]]; then
+      net_line="" # 省略 network: → 預設 bridge（netns holder 路徑）
+    else
+      net_line="network: shared"
+    fi
+    note "Subuid E2E (${mode}): in-container chown to another uid must succeed"
+    mkdir -p "$work/subid-$mode"
+    cat >"$work/subid-$mode/appcipe.yml" <<YAML
+version: "0.1"
+name: LinuxSubid
+app_version: "e2e"
+data_dir: "$work/subid-$mode-data"
+crash: fail_fast
+${net_line}
+services:
+  app:
+    image:
+      source: tar
+      file: "${image_tar}"
+      format: docker-archive
+      platform: ${image_platform}
+    cmd: ["sh", "-c", "touch /tmp/chefer-subid && chown 999:999 /tmp/chefer-subid && echo CHEFER_SUBID_OK"]
+    interface_mode: none
+YAML
+    "$cli" build "$work/subid-$mode/appcipe.yml" --out "$work/out-subid-$mode" --kit-dir "$kit" --target "$output_target"
+    local app="$work/out-subid-$mode/LinuxSubid/LinuxSubid_${output_target}"
+    [[ -f "$app" ]] || die "missing built subuid app: $app"
+    chmod +x "$app"
+    local log="$work/subid-$mode.log"
+    set +e
+    "$app" >"$log" 2>&1
+    local code=$?
+    set -e
+    if [[ "$code" -ne 0 ]] || ! grep -q "CHEFER_SUBID_OK" "$log"; then
+      cat "$log" >&2 || true
+      die "Subuid E2E (${mode}) failed: exit=${code}, expected CHEFER_SUBID_OK (rootless chown via subuid delegation)"
+    fi
+    if ! grep -q "subuid delegation active" "$log"; then
+      cat "$log" >&2 || true
+      die "Subuid E2E (${mode}): delegation banner missing — chown may have passed for the wrong reason"
+    fi
+    note "Subuid E2E (${mode}) passed: rootless chown to uid 999 via /etc/subuid delegation"
+  done
+}
+
 run_netns_iso_e2e() {
   local work="$1"
   local output_target="$2"
@@ -1114,6 +1185,8 @@ main() {
 
   note "Checking network isolation (shared leak vs internal isolation)"
   run_netns_iso_e2e "$work" "$output_target" "$image_platform" "$cli" "$kit" "$image_tar"
+
+  run_subid_e2e "$work" "$output_target" "$image_platform" "$cli" "$kit" "$image_tar"
 
   note "Checking registry image pull (source: image)"
   run_registry_pull_e2e "$work" "$output_target" "$image_platform" "$cli" "$kit"

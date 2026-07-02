@@ -23,7 +23,7 @@ docker build / docker pull  →  docker save -o x.tar <image>   # 取得 image t
 寫 appcipe.yml（image 指向那些 tar）
 chefer build appcipe.yml --out dist                            # 產出單檔
 ```
-Chefer **只吃 image tar**（`docker save` 或 OCI archive），不吃 Dockerfile/registry 名稱。
+image 來源可為 **tar**（`docker save`/OCI archive）、**registry ref**（釘版 tag 或 `@sha256`，build 時匿名拉取）或 **Dockerfile**（打包機需有 docker/podman/nerdctl）。
 
 ## 最小可用範例
 
@@ -97,13 +97,15 @@ service 名規則：`[a-z][a-z0-9_]*`，≤32。
 - **官方 redis/postgres/nginx 等**的 entrypoint 常在以 root 執行時 `chown`+`gosu` 切到
   服務專用 uid（如 999）。這類映像在 **WSL2、macOS VM、以及原生 Linux 以 root 執行**時
   可直接使用——這些後端讓服務以真實 root 執行（不開 user namespace），chown/gosu 到任何
-  uid 都成功（官方 `redis` 已在 WSL2 實測通過）。**唯一受限**是原生 Linux 的 **rootless**
-  路徑（以非 root 使用者執行單檔）：核心規定 `unshare(NEWUSER)` 後只能自映射單一 uid，那些
-  映像可能 `chown` `EINVAL` 而起不來——此為 rootless 固有限制（同 rootless podman 需
-  `/etc/subuid` 委派）。若要支援 rootless，改用**以容器 root 直接執行、不 chown** 的映像
-  （例：自建 `alpine + apk add redis`，`CMD ["redis-server", ...]`）。參考 `examples/demo/db/Dockerfile`。
+  uid 都成功（官方 `redis` 已在 WSL2 實測通過）。原生 Linux 的 **rootless** 路徑（以非
+  root 使用者執行單檔）也支援：host 有 `newuidmap`/`newgidmap`（`uidmap` 套件）且使用者在
+  `/etc/subuid`/`/etc/subgid` 有委派範圍時（多數發行版預設都有），guest-agent 走範圍映射
+  （同 rootless podman），chown/gosu 映像照跑（官方 `redis` 已以非 root 實測）。**只有**
+  無委派環境（無 uidmap 或無 subuid 範圍）會退回單一 uid 映射，那些映像可能 `chown`
+  失敗而起不來——此時裝 `uidmap` 並補 subuid 範圍，或改用**以容器 root 直接執行、不
+  chown** 的映像（例：自建 `alpine + apk add redis`）。參考 `examples/demo/db/Dockerfile`。
 - `format` 用**連字號**：`docker-archive` / `oci-archive`（底線形式也接受，但文件統一用連字號）。
-- `image.source` 只支援 `tar`：要打包 registry 映像先 `docker pull` + `docker save`。
+- registry ref **必須釘版**（`redis:7.2-alpine` 或 `@sha256:…`）；`latest`/未帶 tag 會被驗證拒絕。私有 registry 認證尚未支援，仍可 `docker pull` + `docker save` 走 tar。
 
 ## 多服務範例（app + db，內部連線 + 持久化）
 

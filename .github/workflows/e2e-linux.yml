@@ -63,6 +63,11 @@ jobs:
       - name: Install pasta (passt) for bridge networking E2E
         run: sudo apt-get install -y passt
 
+      # uidmap 提供 newuidmap/newgidmap：rootless subuid 委派 E2E（chown/gosu image）需要；
+      # 缺少時 linux-e2e.sh 會跳過該情境（runner 使用者的 /etc/subuid 範圍需已存在）。
+      - name: Install uidmap for rootless subuid delegation E2E
+        run: sudo apt-get install -y uidmap
+
       # podman 讓 `source: dockerfile` 的 E2E 多測一條「非-docker、docker 相容 CLI」builder。
       # linux-e2e.sh 偵測到 podman 就會以 CHEFER_DOCKERFILE_BUILDER=podman 再 build 一次。
       - name: Install podman for non-docker Dockerfile builder E2E
