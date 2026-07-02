@@ -282,9 +282,63 @@ pub fn setup_app_netns(
 /// 找不到 pasta 或啟動失敗回 None（呼叫端據此退化為 internal）。
 fn start_pasta(holder: Pid, net_uid: u32, net_gid: u32, hint: Option<PathBuf>) -> Option<Child> {
     let prog = locate_pasta(hint);
+    match spawn_pasta(&prog, holder, net_uid, net_gid) {
+        Ok(child) => {
+            eprintln!(
+                "[guest-agent] bridge outbound: started pasta ({}) providing NAT for the app netns",
+                prog.to_string_lossy()
+            );
+            Some(child)
+        }
+        // 在 Windows host 打包的 bundle 無法記錄 unix 執行位（pack 的 chmod 只在 unix 生效），
+        // 解到 guest 後 pasta 是 0644 → exec EACCES。補救：複製到 tmp、補 0755 再重試一次
+        // （同時涵蓋唯讀掛載的情境）。
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+            let staged = std::env::temp_dir().join(format!("chefer-pasta-{}", std::process::id()));
+            let retried = std::fs::copy(&prog, &staged).and_then(|_| {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))?;
+                spawn_pasta(staged.as_os_str(), holder, net_uid, net_gid)
+            });
+            match retried {
+                Ok(child) => {
+                    eprintln!(
+                        "[guest-agent] bridge outbound: started pasta (staged copy of {}; original lacked the exec bit) providing NAT for the app netns",
+                        prog.to_string_lossy()
+                    );
+                    Some(child)
+                }
+                Err(e2) => {
+                    eprintln!(
+                        "[guest-agent] bridge mode could not start pasta ({}: {e}; staged-copy retry: {e2}) → degrading to internal \
+                         (only lo, no outbound network). Bundle pasta in the kit, or set CHEFER_PASTA to its path.",
+                        prog.to_string_lossy()
+                    );
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "[guest-agent] bridge mode could not find/start pasta ({}: {e}) → degrading to internal\
+                 (only lo, no outbound network). Bundle pasta in the kit, or set CHEFER_PASTA to its path.",
+                prog.to_string_lossy()
+            );
+            None
+        }
+    }
+}
+
+/// 組裝並 spawn pasta 行程（start_pasta 的單次嘗試；EACCES 補救重試共用）。
+fn spawn_pasta(
+    prog: &std::ffi::OsStr,
+    holder: Pid,
+    net_uid: u32,
+    net_gid: u32,
+) -> io::Result<Child> {
     let net_ns = format!("/proc/{}/ns/net", holder.as_raw());
     let user_ns = format!("/proc/{}/ns/user", holder.as_raw());
-    let mut cmd = Command::new(&prog);
+    let mut cmd = Command::new(prog);
     // --config-net：在目標 netns 內自動配置位址/路由/DNS；--foreground：由我們掌控其生命週期。
     cmd.arg("--config-net").arg("--foreground");
     // 關閉 pasta 的「自動轉發所有 port」——否則它會在 netns 內搶先 bind 服務要用的 port
@@ -303,23 +357,7 @@ fn start_pasta(holder: Pid, net_uid: u32, net_gid: u32, hint: Option<PathBuf>) -
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    match cmd.spawn() {
-        Ok(child) => {
-            eprintln!(
-                "[guest-agent] bridge outbound: started pasta ({}) providing NAT for the app netns",
-                prog.to_string_lossy()
-            );
-            Some(child)
-        }
-        Err(e) => {
-            eprintln!(
-                "[guest-agent] bridge mode could not find/start pasta ({}: {e}) → degrading to internal\
-                 (only lo, no outbound network). Bundle pasta in the kit, or set CHEFER_PASTA to its path.",
-                prog.to_string_lossy()
-            );
-            None
-        }
-    }
+    cmd.spawn()
 }
 
 /// 尋找 pasta 執行檔，依序：
