@@ -1,0 +1,12 @@
+# cargo-audit（RustSec）設定：.github/workflows/security.yml 的 `cargo audit` 會讀取。
+# ignore 只放「無升級路徑的 transitive 公告」，每筆都要註明原因與解除條件。
+
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0194: quick-xml <0.41 檢查重複屬性名時有 O(n^2) 行為（DoS 型）。
+    # 依賴鏈：chefer-cli → self_update 0.42 → quick-xml 0.37（self_update 上游 master
+    # 也僅到 quick-xml 0.38，尚無 >=0.41 的版本可升）。quick-xml 在 self_update 內只用於
+    # S3/GCS release backend 的 XML 清單解析；chefer `upgrade` 走 GitHub backend（JSON、
+    # TLS），該程式路徑不會被觸發。等 self_update 換到 quick-xml >=0.41 後移除本條並升版。
+    "RUSTSEC-2026-0194",
+]
