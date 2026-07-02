@@ -220,17 +220,39 @@ pub fn setup_app_netns(
     )
     .context("failed to create netns factory socketpair")?;
 
+    // rootless 且有 subuid 委派：由 supervisor 對 holder 代寫範圍 uid/gid map
+    //（newuidmap）；服務加入 holder 的 user ns 即繼承 → chown/gosu image 可用。
+    // root 後端 holder 是 nobody（無委派概念），維持自寫單一映射。
+    let delegation = if rootless {
+        crate::subid::delegation()
+    } else {
+        None
+    };
+    let map_sync = delegation
+        .map(|_| crate::subid::MapSync::new())
+        .transpose()
+        .context("failed to create id-map sync pipes")?;
+
     // SAFETY: fork 後 holder 子行程僅呼叫相對安全的系統呼叫；holder 為 fork-without-exec
     //（在尚未生成任何執行緒的早期階段建立，見 run_bundle_linux 的呼叫順序）。
     match unsafe { fork() }.context("failed to fork netns holder")? {
         ForkResult::Child => {
             drop(rd);
             drop(sv_parent);
-            holder_main(net_uid, net_gid, wr, sv_holder) // 不返回（factory 迴圈 → pause）
+            let child_sync = map_sync.map(|s| {
+                drop(s.unshared_r);
+                drop(s.verdict_w);
+                (s.unshared_w, s.verdict_r)
+            });
+            holder_main(net_uid, net_gid, wr, sv_holder, child_sync) // 不返回（factory 迴圈 → pause）
         }
         ForkResult::Parent { child } => {
             drop(wr);
             drop(sv_holder);
+            if let (Some(d), Some(sync)) = (delegation, &map_sync) {
+                crate::subid::supervisor_write_maps(d, child, &sync.unshared_r, &sync.verdict_w);
+            }
+            drop(map_sync);
             // 等 holder 完成 lo 設定。
             let mut byte = [0u8; 1];
             let ok = {
@@ -401,7 +423,15 @@ fn open_ns_fd(pid: Pid, which: &str) -> Result<OwnedFd> {
 /// holder 子行程：unshare 出 netns（rootless 另含 user ns + uid map），拉起 lo，回報就緒後
 /// 進入 socket factory 迴圈（為 supervisor 建立 app-netns 內的 upstream 並以 SCM_RIGHTS 回傳），
 /// 通道關閉後 pause() 常駐以維持 netns 存活。`wr` 為就緒回報管線，`factory` 為 SCM_RIGHTS 通道。
-fn holder_main(net_uid: u32, net_gid: u32, wr: OwnedFd, factory: OwnedFd) -> ! {
+fn holder_main(
+    net_uid: u32,
+    net_gid: u32,
+    wr: OwnedFd,
+    factory: OwnedFd,
+    // Some = supervisor 有 subuid 委派（僅 rootless）：unshare(NEWUSER) 後握手等它
+    // 以 newuidmap 代寫範圍映射；None 或握手回 fallback 時自寫單一映射。
+    map_sync: Option<(OwnedFd, OwnedFd)>,
+) -> ! {
     // 父行程（supervisor）若先死，holder 連帶被 SIGKILL，避免遺留 netns。
     unsafe {
         libc::prctl(
@@ -448,7 +478,13 @@ fn holder_main(net_uid: u32, net_gid: u32, wr: OwnedFd, factory: OwnedFd) -> ! {
         report(false);
         unsafe { libc::_exit(1) }
     }
-    if let Err(e) = write_self_id_maps(real_uid, real_gid) {
+    // 有 subuid 委派時由 supervisor 代寫範圍映射（chown/gosu image 可用）；
+    // 無委派或代寫失敗則自寫單一映射（現行行為）。
+    let delegated = map_sync
+        .as_ref()
+        .is_some_and(|(w, r)| crate::subid::child_wait_maps(w, r));
+    drop(map_sync);
+    if !delegated && let Err(e) = write_self_id_maps(real_uid, real_gid) {
         eprintln!("[guest-agent] netns holder failed to write uid/gid map: {e:#}");
         report(false);
         unsafe { libc::_exit(1) }

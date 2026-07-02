@@ -2,15 +2,17 @@
 //!
 //! 流程（docs/DESIGN.md §6）：
 //! supervisor fork 出「中繼行程」→ 中繼行程依執行身分 unshare namespaces
-//! （**真實 root：MNT|PID，不開 user ns**；**非 root（rootless）：USER|MNT|PID
-//! 並寫單一 uid/gid map**）→ 再 fork 一次，孫行程成為新 pid namespace 的 pid 1 →
+//! （**真實 root：MNT|PID，不開 user ns**；**非 root（rootless）：先 USER 寫映射——
+//! 有 /etc/subuid 委派時由 supervisor 以 newuidmap 代寫範圍映射、否則自寫單一
+//! uid/gid map——再 MNT|PID**）→ 再 fork 一次，孫行程成為新 pid namespace 的 pid 1 →
 //! 孫行程完成掛載（proc、dev、persist、bind mounts、GUI socket）→
 //! pivot_root → chdir → execve。中繼行程等待孫行程並轉送 exit code。
 //!
 //! 網路 **不** unshare（共享 host 網路 → ports 直接生效）。
 //! 以真實 root 執行時不開 user namespace、服務以 root 跑——官方會 `chown`/`gosu` 到
-//! 服務專用 uid（redis/postgres 999…）的映像因此可用；非 root 才開 user ns + 單一
-//! uid map（uid ↔ 0）。image_config.user 在 v1 忽略。
+//! 服務專用 uid（redis/postgres 999…）的映像因此可用；非 root 開 user ns，映射見
+//! `subid.rs`（範圍委派 → chown/gosu 亦可用；無委派 → 單一 uid 映射，此類映像受限）。
+//! image_config.user 在 v1 忽略。
 //!
 //! 本模組於 `lib.rs` 以 `#[cfg(target_os = "linux")]` 限定，故此處不再重複內層 cfg。
 
@@ -140,6 +142,19 @@ pub fn spawn_service(spec: &SpawnSpec) -> Result<Spawned> {
     let (pid_r, pid_w) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
         .context("failed to create pid report pipe")?;
 
+    // rootless + shared 模式且有 subuid 委派：建立映射握手管線，由 supervisor 對
+    // 中繼行程代寫範圍 uid/gid map（newuidmap）——chown/gosu image 因此可用。
+    // internal/bridge 的服務走 holder 的 user ns（netns.rs 已套委派），此處不需要。
+    let delegation = if plan.netns.is_none() && !nix::unistd::geteuid().is_root() {
+        crate::subid::delegation()
+    } else {
+        None
+    };
+    let map_sync = delegation
+        .map(|_| crate::subid::MapSync::new())
+        .transpose()
+        .context("failed to create id-map sync pipes")?;
+
     // SAFETY: fork 後子行程僅呼叫 async-signal 相對安全的操作與系統呼叫，
     // 失敗一律以 _exit 結束，不返回呼叫端。
     match unsafe { fork() }.with_context(|| format!("failed to fork service `{}`", svc.name))? {
@@ -149,6 +164,10 @@ pub fn spawn_service(spec: &SpawnSpec) -> Result<Spawned> {
             drop(out_w);
             drop(err_w);
             drop(pid_w);
+            if let (Some(d), Some(sync)) = (delegation, &map_sync) {
+                crate::subid::supervisor_write_maps(d, child, &sync.unshared_r, &sync.verdict_w);
+            }
+            drop(map_sync);
             // 讀取孫行程 host pid（4 bytes LE i32）；中繼行程二次 fork 失敗時
             // 管線會被關閉而讀到 EOF → init_pid = None。
             let init_pid = read_init_pid(pid_r);
@@ -163,7 +182,12 @@ pub fn spawn_service(spec: &SpawnSpec) -> Result<Spawned> {
             drop(out_r);
             drop(err_r);
             drop(pid_r);
-            let code = middle_child(&plan, out_w, err_w, pid_w);
+            let child_sync = map_sync.map(|s| {
+                drop(s.unshared_r);
+                drop(s.verdict_w);
+                (s.unshared_w, s.verdict_r)
+            });
+            let code = middle_child(&plan, out_w, err_w, pid_w, child_sync);
             unsafe { libc::_exit(code) }
         }
     }
@@ -326,6 +350,9 @@ fn middle_child(
     stdout_w: Option<OwnedFd>,
     stderr_w: Option<OwnedFd>,
     pid_w: OwnedFd,
+    // Some = supervisor 有 subuid 委派：unshare(NEWUSER) 後握手等它代寫範圍映射
+    //（(unshared_w, verdict_r)，見 subid.rs）。None = 自寫單一映射（現行 fallback）。
+    map_sync: Option<(OwnedFd, OwnedFd)>,
 ) -> i32 {
     // stdio 重導（terminal 服務維持繼承）
     unsafe {
@@ -358,43 +385,47 @@ fn middle_child(
     // root 對完整 uid 範圍本就有 CAP_SETUID/CAP_CHOWN，容器 entrypoint 的
     // chown/gosu/setuid 到服務專用 uid（官方 redis/postgres 的 999…）可直接成功。
     //
-    // 為何不在 NEWUSER 內做範圍映射：核心規定「unshare(NEWUSER) 後由行程自寫
-    // 自身 uid_map」只允許單一 uid；範圍映射需由仍在 parent ns、持有 CAP_SETUID 的
-    // 父行程代寫 /proc/<child>/uid_map。故自寫範圍永遠退化成單一 uid，那些會 chown
-    // 到其他 uid 的映像就會失敗——即便我們是 root。直接以 root 執行則無此限制。
-    //
-    // 非 root（原生 Linux rootless）才需要 NEWUSER 取得 ns 內 root 以做 pivot_root/mount；
-    // 此情境下單一 uid 映射為其固有限制（同 podman rootless 需 /etc/subuid 委派）。
+    // 非 root（原生 Linux rootless）才需要 NEWUSER 取得 ns 內 root 以做 pivot_root/mount。
+    // 映射有兩條路（subid.rs）：核心規定 unshare(NEWUSER) 後自寫 uid_map 只能映射單一
+    // uid，範圍映射需由仍在 parent ns 的特權行程代寫——有 /etc/subuid 委派時由 supervisor
+    // 以 newuidmap/newgidmap 代寫範圍映射（chown/gosu image 可用，同 rootless podman）；
+    // 無委派則自寫單一映射（此類映像受限）。
     let real_root = nix::unistd::geteuid().is_root();
     if let Some(join) = plan.netns {
         // internal/bridge：加入既有的 app netns（rootless 另先加入 holder 的 user ns
-        // 以取得 caps，並沿用 holder 已寫好的單一 uid/gid map → 自己不再 unshare/寫 map）。
+        // 以取得 caps，並沿用 holder 已寫好的 uid/gid 映射 → 自己不再 unshare/寫 map）。
         if let Err(code) = join_app_netns(&plan.name, join, real_root) {
             return code;
         }
     } else {
         // shared：沿用共享 netns。以真實 root 執行時不開 user ns（chown/gosu 直接可行）；
-        // 非 root 才開 user ns + 寫單一 uid/gid map。
-        let mut flags = CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID;
+        // 非 root 先單獨 unshare(NEWUSER) 寫映射（有 subuid 委派時由 supervisor 以
+        // newuidmap 代寫範圍映射 → chown/gosu 可用；否則自寫單一 uid/gid map），
+        // 再 unshare(MNT|PID)。
         if !real_root {
-            flags |= CloneFlags::CLONE_NEWUSER;
+            if let Err(e) = unshare(CloneFlags::CLONE_NEWUSER) {
+                eprintln!(
+                    "[guest-agent] service `{}` unshare(user) failed: {e}; \
+                     make sure the kernel allows unprivileged user namespaces (/proc/sys/kernel/unprivileged_userns_clone = 1)",
+                    plan.name
+                );
+                return 126;
+            }
+            let delegated = map_sync
+                .as_ref()
+                .is_some_and(|(w, r)| crate::subid::child_wait_maps(w, r));
+            if !delegated && let Err(e) = write_id_maps(plan.uid, plan.gid) {
+                eprintln!(
+                    "[guest-agent] service `{}` failed to write uid/gid map: {e:#}",
+                    plan.name
+                );
+                return 126;
+            }
         }
-        if let Err(e) = unshare(flags) {
+        drop(map_sync);
+        if let Err(e) = unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID) {
             eprintln!(
-                "[guest-agent] service `{}` unshare({}) failed: {e}; \
-                 make sure the kernel allows unprivileged user namespaces (/proc/sys/kernel/unprivileged_userns_clone = 1)",
-                plan.name,
-                if real_root {
-                    "mount+pid"
-                } else {
-                    "user+mount+pid"
-                }
-            );
-            return 126;
-        }
-        if !real_root && let Err(e) = write_id_maps(plan.uid, plan.gid) {
-            eprintln!(
-                "[guest-agent] service `{}` failed to write uid/gid map: {e:#}",
+                "[guest-agent] service `{}` unshare(mount+pid) failed: {e}",
                 plan.name
             );
             return 126;
@@ -449,7 +480,8 @@ fn middle_child(
 /// internal/bridge 模式：把當前（中繼）行程加入既有的 app netns，再 unshare(MNT|PID)。
 ///
 /// - **rootless**（`join.user` 為 Some）：先 `setns` 進 holder 的 user ns（取得 ns 內
-///   root 與 CAP_SYS_ADMIN，並沿用 holder 已寫的單一 uid/gid map），再 `setns` 進 netns，
+///   root 與 CAP_SYS_ADMIN，並沿用 holder 的 uid/gid 映射——有 subuid 委派時為範圍映射，
+///   chown/gosu 因此可用），再 `setns` 進 netns，
 ///   最後 `unshare(NEWNS|NEWPID)`。**不**再開新 user ns、**不**重寫 uid map。
 /// - **root**（`join.user` 為 None）：直接 `setns` 進 netns，再 `unshare(NEWNS|NEWPID)`。
 ///
@@ -479,13 +511,13 @@ fn join_app_netns(name: &str, join: crate::netns::NetnsJoin, _real_root: bool) -
     Ok(())
 }
 
-/// 在新 user namespace 內設定**單一** uid/gid 映射（只在非 root 的原生 Linux
-/// rootless 路徑呼叫；root 不開 NEWUSER，見 `middle_child` 內的 `real_root` 分支）。
+/// 在新 user namespace 內設定**單一** uid/gid 映射——rootless 且**沒有** subuid 委派
+/// 時的 fallback（有委派時由 supervisor 以 newuidmap 代寫範圍映射，見 `subid.rs`；
+/// root 不開 NEWUSER，見 `middle_child` 內的 `real_root` 分支）。
 ///
 /// 把容器內 uid/gid 0 映射到呼叫者自身的 uid/gid，並先 **deny** setgroups。
-/// 核心規定：unshare(NEWUSER) 後行程自寫自身 uid_map 只能映射單一 id（範圍映射需由
-/// 仍持 CAP_SETUID 的 parent 代寫），故 rootless 下會 chown 到其他服務 uid 的映像
-/// 受限——這是 rootless 的固有限制（等同 podman rootless 需 /etc/subuid 委派）。
+/// 核心規定：unshare(NEWUSER) 後行程自寫自身 uid_map 只能映射單一 id，故此 fallback
+/// 下會 chown 到其他服務 uid 的映像受限（等同 rootless podman 無 /etc/subuid 委派）。
 fn write_id_maps(uid: u32, gid: u32) -> Result<()> {
     // 寫單行 gid_map 前必須 deny setgroups。
     match fs::write("/proc/self/setgroups", "deny") {
