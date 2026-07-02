@@ -45,6 +45,9 @@ enable_kernel_options() {
   "$cfg" --enable VIRTIO_BLK
   "$cfg" --enable VIRTIO_CONSOLE
   "$cfg" --enable VIRTIO_NET
+  # pasta（bridge 出網 NAT）要在 app netns 內建立 tap 裝置；x86_64 defconfig 不含 TUN，
+  # 缺了它 pasta 起不來、bridge 會靜默降級成 internal（只有 lo、無出網）。
+  "$cfg" --enable TUN
   "$cfg" --enable DAX
   "$cfg" --enable FS_DAX
   "$cfg" --enable FUSE_FS

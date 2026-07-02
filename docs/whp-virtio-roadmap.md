@@ -75,6 +75,13 @@
   不觸發；`/dev/kmsg` 走 kernel printk polled I/O。
 - WHP 專屬 cmdline：`nolapic lpj=1000000 notsc clocksource=jiffies`（見 DESIGN §4）。
 - timer interrupt 由 host 背景執行緒每 10ms 注入（WHP LAPIC emulation 不完整）。
+- **bridge 出網（pasta）在 VM guest 的三個前提**（缺一即靜默降級 internal）：kernel
+  `CONFIG_TUN`（x86_64 defconfig 不含）；`/dev/net/tun` 節點 0666（devtmpfs 預設 0600，
+  pasta 以非特權 uid 開不了）；根不能是 initramfs 的 rootfs（pasta 自我沙箱 `pivot_root`
+  在 rootfs 上 EINVAL）——appliance init 已依序處理（switch_root 到 tmpfs 根 + tun 節點）。
+  另外 Windows host 打包記錄不了執行位，guest-agent 對 pasta exec EACCES 以 staged copy
+  補 0755 重試（`netns.rs`）。除錯時 guest-agent stderr 在 WHP 不可見，可暫改 init 把
+  stderr 收 `/tmp/ga.err` 再逐行 `report` 重播（`<0>` 優先序，`quiet` 下才上得了 console）。
 
 ## 在這台（有 WSL）怎麼測 whp
 
