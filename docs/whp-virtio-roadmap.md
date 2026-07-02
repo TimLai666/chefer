@@ -67,6 +67,26 @@
 4. **在沒有 WSL 或設 `CHEFER_BACKEND=whp` 的 Windows** 跑單檔，驗 redis + app 起來、埠可連、
    `CHEFER_GUEST_EXIT` 正確回傳、data 持久化。
 
+### M8 — GUI（virtio-gpu + cage overlay；契約見 DESIGN §6「WHP GUI」與「GUI overlay 打包契約」）
+
+M1-M7（blk/persist/net/NAT 含預設 bridge）皆已實機完成後，WHP 僅剩這條大線。
+拍板決策：virtio-gpu 2D（無 virgl，llvmpipe 軟算繪）；guest 側與 macOS vz 共用
+「cage + Xwayland + Mesa 的 GUI overlay」（kit 產物 `chefer-gui-overlay-<arch>`，
+**只在 app 有 gui/both 服務且 target 為 Windows/macOS 時嵌入 bundle `vm/`**）；
+指標用 virtio-input tablet（絕對座標）；剪貼簿走既有網路通道 + cmdline token
+（不做 virtio-vsock）。
+
+1. **M8-a（QEMU，CI 可跑，與 vz 共用）**：kernel 加 DRM/DRM_VIRTIO_GPU/INPUT_EVDEV；
+   `scripts/build-gui-overlay.sh`（容器內收 Alpine 套件閉包）；init 解 overlay 到 tmpfs 根；
+   guest-agent 以 `cage --` 包 gui 服務。QEMU 加 `-device virtio-gpu` 等驗真的算繪出畫面。
+2. **M8-b（純邏輯，與 M8-a 並行）**：`whp-helper/src/virtio/{gpu,input}.rs` + 單元測試。
+3. **M8-c**：helper Win32 視窗執行緒（blit + WM→virtio-input；關窗=app 結束語意）。
+4. **M8-d**：實機接線（gpu `0xD000_0600`/IRQ 8、input `0xD000_0800`/IRQ 9 起排）。
+5. **M8-e**：剪貼簿（guest wl-clipboard ↔ host Win32 clipboard，UTF-8 文字先行）。
+
+打包契約（嵌入規則/kit 探索/降級行為）動工前先照 DESIGN 寫測試鎖住，
+再動 chefer-pack / chefer-bundle / release workflow / verify-release-kit。
+
 ## 已知陷阱（前期 boot shim 實測已確認，務必沿用）
 
 - init 必須 **non-PIE 靜態 ELF**（`ET_EXEC`；PIE 在無 dynamic linker 的 minimal VM segfault）。
