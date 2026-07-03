@@ -33,6 +33,10 @@ pub const VIRTIO_MMIO_VERSION: u32 = 2;
 /// feature bit：VIRTIO_F_VERSION_1（bit 32，modern 介面必備）。
 pub const VIRTIO_F_VERSION_1: u64 = 1 << 32;
 
+/// virtio-gpu feature bit：VIRTIO_GPU_F_EDID（bit 1）——支援 GET_EDID 命令，讓 guest
+/// 從 EDID 取得正確偏好解析度（見 virtio/gpu.rs）。
+pub const VIRTIO_GPU_F_EDID: u64 = 1 << 1;
+
 /// Status register（0x070）bit 旗標（virtio spec §2.1）。
 pub const STATUS_ACKNOWLEDGE: u32 = 1;
 pub const STATUS_DRIVER: u32 = 2;

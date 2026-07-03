@@ -24,12 +24,14 @@ const VIRTIO_GPU_CMD_RESOURCE_FLUSH: u32 = 0x0104;
 const VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
 const VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0106;
 const VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING: u32 = 0x0107;
+const VIRTIO_GPU_CMD_GET_EDID: u32 = 0x010a;
 // cursor queue（q1）
 const VIRTIO_GPU_CMD_UPDATE_CURSOR: u32 = 0x0300;
 const VIRTIO_GPU_CMD_MOVE_CURSOR: u32 = 0x0301;
 // 回應
 const VIRTIO_GPU_RESP_OK_NODATA: u32 = 0x1100;
 const VIRTIO_GPU_RESP_OK_DISPLAY_INFO: u32 = 0x1101;
+const VIRTIO_GPU_RESP_OK_EDID: u32 = 0x1104;
 const VIRTIO_GPU_RESP_ERR_UNSPEC: u32 = 0x1200;
 const VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID: u32 = 0x1204;
 const VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER: u32 = 0x1205;
@@ -163,6 +165,9 @@ impl GpuDevice {
             VIRTIO_GPU_CMD_GET_DISPLAY_INFO => {
                 (VIRTIO_GPU_RESP_OK_DISPLAY_INFO, self.display_info_payload())
             }
+            // GET_EDID：回一份描述 width×height 偏好模式的 EDID，讓 guest 的 DRM connector
+            // 取得正確偏好解析度（否則 cage/wlroots 無 EDID 時挑 640×480）。
+            VIRTIO_GPU_CMD_GET_EDID => (VIRTIO_GPU_RESP_OK_EDID, self.edid_payload()),
             VIRTIO_GPU_CMD_RESOURCE_CREATE_2D => self.cmd_create_2d(req),
             VIRTIO_GPU_CMD_RESOURCE_UNREF => {
                 let res_id = u32_at(req, CTRL_HDR_LEN);
@@ -214,6 +219,18 @@ impl GpuDevice {
                 p.extend_from_slice(&v.to_le_bytes());
             }
         }
+        p
+    }
+
+    /// GET_EDID 回應 payload：`le32 size`（EDID bytes）+ `le32 padding` + `edid[1024]`
+    /// （前 128 bytes 為 EDID block，其餘補零）。
+    fn edid_payload(&self) -> Vec<u8> {
+        let edid = build_edid(self.width, self.height);
+        let mut p = Vec::with_capacity(8 + 1024);
+        p.extend_from_slice(&(edid.len() as u32).to_le_bytes());
+        p.extend_from_slice(&0u32.to_le_bytes()); // padding
+        p.extend_from_slice(&edid);
+        p.resize(8 + 1024, 0); // edid[1024]，剩餘補零
         p
     }
 
@@ -351,6 +368,106 @@ fn u32_at(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(v)
 }
 
+/// 組一份 128-byte EDID 1.4 block：以 `width`×`height`@60 為第一個（＝偏好）detailed timing。
+/// 對虛擬顯示器而言，只要 active 解析度正確、checksum 有效，driver 就會建出該偏好模式；
+/// blanking/sync/pixel-clock 用合理近似值（無真實硬體時序要求）。
+fn build_edid(width: u32, height: u32) -> [u8; 128] {
+    let mut e = [0u8; 128];
+    // 固定 header。
+    e[0..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+    // 製造商 ID「CHF」（各 5-bit，A=1..Z=26），big-endian 2 bytes。
+    let mid: u16 = (3u16 << 10) | (8u16 << 5) | 6u16; // C,H,F
+    e[8] = (mid >> 8) as u8;
+    e[9] = (mid & 0xFF) as u8;
+    e[10] = 0x01; // product code
+    e[11] = 0x01;
+    e[12] = 1; // serial
+    e[16] = 1; // week
+    e[17] = 34; // year 1990+34 = 2024
+    e[18] = 1; // EDID version 1
+    e[19] = 4; // revision 4
+    e[20] = 0xA5; // digital input, 8bpc, DisplayPort
+    e[21] = 30; // 螢幕水平 cm（任意）
+    e[22] = 20; // 垂直 cm
+    e[23] = 120; // gamma 2.2
+    e[24] = 0x06; // features: RGB 4:4:4、preferred timing 為原生
+    // chromaticity（10 bytes）：一組常見 sRGB-ish 值。
+    e[25..35].copy_from_slice(&[0xEE, 0x91, 0xA3, 0x54, 0x4C, 0x99, 0x26, 0x0F, 0x50, 0x54]);
+    // established timings（3 bytes）：不用，全 0（模式改由 detailed timing 提供）。
+    // standard timings（16 bytes，offset 38..54）：未用 → 0x01 0x01。
+    for i in 0..8 {
+        e[38 + i * 2] = 0x01;
+        e[38 + i * 2 + 1] = 0x01;
+    }
+    // descriptor 1（54..72）：偏好 detailed timing = width×height。
+    e[54..72].copy_from_slice(&detailed_timing(width, height));
+    // descriptor 2（72..90）：monitor name「Chefer」。
+    e[72..90].copy_from_slice(&name_descriptor(b"Chefer"));
+    // descriptor 3、4：dummy。
+    e[90..108].copy_from_slice(&dummy_descriptor());
+    e[108..126].copy_from_slice(&dummy_descriptor());
+    e[126] = 0; // extension flag：0 個延伸 block
+    // checksum：全 128 bytes 之和須 ≡ 0 (mod 256)。
+    let sum = e[..127].iter().fold(0u8, |a, b| a.wrapping_add(*b));
+    e[127] = 0u8.wrapping_sub(sum);
+    e
+}
+
+/// 18-byte detailed timing descriptor（EDID §3.10.2），active = `w`×`h`@60Hz。
+fn detailed_timing(w: u32, h: u32) -> [u8; 18] {
+    let hblank: u32 = 160;
+    let vblank: u32 = 22;
+    let htotal = w + hblank;
+    let vtotal = h + vblank;
+    // pixel clock（單位 10kHz）：htotal*vtotal*60 Hz。
+    let pclk_10khz = ((htotal as u64 * vtotal as u64 * 60) / 10_000) as u32;
+    // sync：合理近似（h front porch 48、h sync 32；v front porch 3、v sync 6）。
+    let (hso, hsw, vso, vsw) = (48u32, 32u32, 3u32, 6u32);
+    let mut d = [0u8; 18];
+    d[0] = (pclk_10khz & 0xFF) as u8;
+    d[1] = ((pclk_10khz >> 8) & 0xFF) as u8;
+    d[2] = (w & 0xFF) as u8;
+    d[3] = (hblank & 0xFF) as u8;
+    d[4] = (((w >> 8) & 0xF) << 4) as u8 | ((hblank >> 8) & 0xF) as u8;
+    d[5] = (h & 0xFF) as u8;
+    d[6] = (vblank & 0xFF) as u8;
+    d[7] = (((h >> 8) & 0xF) << 4) as u8 | ((vblank >> 8) & 0xF) as u8;
+    d[8] = (hso & 0xFF) as u8;
+    d[9] = (hsw & 0xFF) as u8;
+    d[10] = (((vso & 0xF) << 4) | (vsw & 0xF)) as u8;
+    // d[11]：各同步值高位（本組皆小 → 0）。
+    // d[12..15]：影像實體尺寸 mm（任意 300×200 → low bytes + 高位 nibble）。
+    d[12] = 0x2C; // 300 & 0xFF
+    d[13] = 0xC8; // 200 & 0xFF
+    d[14] = 0x10; // (300>>8)=1 高 nibble、(200>>8)=0 低 nibble
+    // d[15]、d[16]：border 0。
+    d[17] = 0x1E; // flags：digital separate sync、h/v sync positive
+    d
+}
+
+/// monitor name descriptor（type 0xFC）：`00 00 00 FC 00` + 名稱（`\n` 結尾、空白補到 18）。
+fn name_descriptor(name: &[u8]) -> [u8; 18] {
+    let mut d = [0x20u8; 18]; // 以空白填
+    d[0] = 0;
+    d[1] = 0;
+    d[2] = 0;
+    d[3] = 0xFC;
+    d[4] = 0;
+    let n = name.len().min(12);
+    d[5..5 + n].copy_from_slice(&name[..n]);
+    if 5 + n < 18 {
+        d[5 + n] = 0x0A; // 名稱結尾
+    }
+    d
+}
+
+/// dummy descriptor（type 0x10）：`00 00 00 10 00` + 補零。
+fn dummy_descriptor() -> [u8; 18] {
+    let mut d = [0u8; 18];
+    d[3] = 0x10;
+    d
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +495,41 @@ mod tests {
 
     fn push_u32(v: &mut Vec<u8>, x: u32) {
         v.extend_from_slice(&x.to_le_bytes());
+    }
+
+    #[test]
+    fn edid_is_valid_and_encodes_resolution() {
+        // build_edid：checksum 有效、header 正確、detailed timing active = 指定解析度。
+        let e = build_edid(1280, 800);
+        assert_eq!(&e[0..8], &[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
+        assert_eq!(e.iter().fold(0u8, |a, b| a.wrapping_add(*b)), 0, "checksum");
+        // detailed timing @ 54：hactive = 1280、vactive = 800。
+        let dt = &e[54..72];
+        let hactive = (dt[2] as u32) | (((dt[4] >> 4) as u32) << 8);
+        let vactive = (dt[5] as u32) | (((dt[7] >> 4) as u32) << 8);
+        assert_eq!(hactive, 1280);
+        assert_eq!(vactive, 800);
+        // 另一解析度也對。
+        let e2 = build_edid(1920, 1080);
+        assert_eq!(e2.iter().fold(0u8, |a, b| a.wrapping_add(*b)), 0);
+        let dt2 = &e2[54..72];
+        assert_eq!((dt2[2] as u32) | (((dt2[4] >> 4) as u32) << 8), 1920);
+        assert_eq!((dt2[5] as u32) | (((dt2[7] >> 4) as u32) << 8), 1080);
+    }
+
+    #[test]
+    fn get_edid_returns_ok_edid_with_payload() {
+        let mut buf = vec![0u8; 1 << 20];
+        let mut mem = SliceMem::new(0, &mut buf);
+        let mut dev = GpuDevice::new(1280, 800);
+        let resp = run_cmd(&mut dev, &mut mem, &hdr(VIRTIO_GPU_CMD_GET_EDID), 2048);
+        assert_eq!(u32_at(&resp, 0), VIRTIO_GPU_RESP_OK_EDID);
+        // payload：size=128 @ CTRL_HDR_LEN，edid header 隨後（+8）。
+        assert_eq!(u32_at(&resp, CTRL_HDR_LEN), 128);
+        assert_eq!(
+            &resp[CTRL_HDR_LEN + 8..CTRL_HDR_LEN + 16],
+            &[0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0]
+        );
     }
 
     #[test]

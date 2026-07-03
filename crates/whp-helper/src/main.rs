@@ -1133,7 +1133,7 @@ mod whp_api {
                 irq: VIRTIO_GPU_MMIO_IRQ,
                 mmio: super::virtio::mmio::Mmio::new(
                     super::virtio::DEVICE_ID_GPU,
-                    super::virtio::VIRTIO_F_VERSION_1,
+                    super::virtio::VIRTIO_F_VERSION_1 | super::virtio::VIRTIO_GPU_F_EDID,
                     2,
                     256,
                 ),
