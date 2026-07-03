@@ -389,7 +389,7 @@ AppCipe 新增 app 級欄位 **`network`**（appcipe-spec enum，serde rename �
 
 **平台界線（架構限制，非未實作）**——只在能實際觸及 host GPU 的後端可行：
 
-- **原生 Linux（namespaces）**：bind `/dev/dri`（DRM render/display）+ `/dev/nvidia*`（NVIDIA）。userspace 驅動 libs 的版本必須與 host kernel module 相符（類 NVIDIA Container Toolkit）；**首版只做節點綁定**，image 需自帶相符 libs，否則 app 於 dlopen 時失敗（錯誤來自 app 本身）。相符 libs 的自動注入列後續階段。
+- **原生 Linux（namespaces）**：bind `/dev/dri`（DRM render/display）+ `/dev/nvidia*`（NVIDIA）。userspace 驅動 libs 的版本必須與 host kernel module 相符（image 自帶的未必相符）——**已做 host 相符 lib 自動注入**（類 NVIDIA Container Toolkit）：`gpu.rs` 讀 `/proc/driver/nvidia/version` 取 driver 版本，掃標準 lib 目錄找 `libcuda`/`libnvidia-*` 中以 `.so.<driver-version>` 結尾者，每個以多重 bind mount 綁到容器 `/run/chefer-nvidia/` 下的 versioned + `.so.1`（soname）+ `.so`（dev）三個名字，並把該目錄加進 `LD_LIBRARY_PATH`（免在容器內建 symlink；ABI major 假設為 1，讀 DT_SONAME 精準化列後續）。**版本解析與 lib 選取有單元測試；但因無原生 NVIDIA 硬體,CUDA 於容器實跑尚未實機驗證。**
 - **Windows WSL2**：bind `/dev/dxg`（Microsoft GPU-PV）+ `/dev/dri` + host `/usr/lib/wsl/lib`（內含 host 版本相符的 `libcuda`/`libdxcore` 等），並把 `/usr/lib/wsl/lib` 加進容器 `LD_LIBRARY_PATH` → CUDA/DirectML/OpenCL/Vulkan 直接可用（繞過原生 Linux 的版本對齊難題）。
 - **不支援**：Windows WHP micro-VM 與 macOS vz——裸 WHP/VZ VM 拿不到 Microsoft/Apple 的 GPU 半虛擬化（那套綁 WSL2/Sandbox/Hyper-V-GPU-P），virtio-gpu 只有顯示、無 compute。這些後端上 `gpu: true` → **服務啟動時明確錯誤**（不靜默綁到 virtio-gpu 的 2D `/dev/dri`）。
 
@@ -399,7 +399,7 @@ AppCipe 新增 app 級欄位 **`network`**（appcipe-spec enum，serde rename �
 
 **版本**：`gpu` 為相容加法（可選欄位、預設關；舊 recipe/bundle 缺欄位 → `false`）→ `APPCIPE_SPEC_VERSION`、`MANIFEST_FORMAT_VERSION`、`appcipe-spec`/`appcipe-normalize` 版號**皆不動**（同 `network`/`console`/`healthcheck` 當年加入時）。
 
-**分階段**：① 契約 + spec/manifest/pack 欄位 + guest-agent 節點綁定 + WSL2 lib 綁定/LD path + 後端界線錯誤（本 PR；**WSL2 實機已驗證**：`gpu: true` 的容器內見 `/dev/dxg`、`/dev/dri`（card0/renderD128）、`/usr/lib/wsl/lib`，`LD_LIBRARY_PATH` 指向驅動 libs，服務 exit 0）→ ② 原生 Linux 的 host 相符 userspace lib 自動注入（類 NVIDIA Container Toolkit；最難，獨立 PR）。
+**分階段**：① 契約 + spec/manifest/pack 欄位 + guest-agent 節點綁定 + WSL2 lib 綁定/LD path + 後端界線錯誤（本 PR；**WSL2 實機已驗證**：`gpu: true` 的容器內見 `/dev/dxg`、`/dev/dri`（card0/renderD128）、`/usr/lib/wsl/lib`，`LD_LIBRARY_PATH` 指向驅動 libs，服務 exit 0）→ ② 原生 Linux 的 host 相符 userspace lib 自動注入（類 NVIDIA Container Toolkit）——**已實作（`gpu.rs` `parse_nvidia_version`/`nvidia_lib_binds`，含單元測試），但需原生 NVIDIA Linux 機器實機驗證 CUDA 於容器可用後才 merge**（同 macOS VZ 項目 gated on real hardware 的慣例；本開發機為 WSL2 無原生 NVIDIA）。
 
 ### Dockerfile build（`source: dockerfile`）— 設計
 
