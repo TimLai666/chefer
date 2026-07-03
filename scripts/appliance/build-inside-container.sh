@@ -59,6 +59,10 @@ enable_kernel_options() {
   "$cfg" --enable FUSE_FS
   "$cfg" --enable VIRTIO_FS
   "$cfg" --enable OVERLAY_FS
+  # GUI overlay（M8）以 squashfs（zstd 壓縮）唯讀掛載 + overlayfs 疊上 VM 根，免每次開機
+  # 解壓 200MB+。見 DESIGN §6「GUI overlay 打包契約」與 guest-agent/src/gui.rs。
+  "$cfg" --enable SQUASHFS
+  "$cfg" --enable SQUASHFS_ZSTD
   "$cfg" --enable NAMESPACES
   "$cfg" --enable USER_NS
   "$cfg" --enable PID_NS
