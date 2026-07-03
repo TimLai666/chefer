@@ -9,7 +9,9 @@
 //! VirtualAlloc 區（[`SliceMem`]）實作；單元測試用同一個 [`SliceMem`] 包一塊 Vec。
 
 pub mod blk;
+pub mod gpu;
 pub mod image;
+pub mod input;
 pub mod mmio;
 pub mod nat;
 pub mod net;
@@ -19,6 +21,8 @@ pub mod queue;
 /// virtio device type（virtio spec §5；DeviceID register 0x008）。
 pub const DEVICE_ID_NET: u32 = 1;
 pub const DEVICE_ID_BLK: u32 = 2;
+pub const DEVICE_ID_GPU: u32 = 16;
+pub const DEVICE_ID_INPUT: u32 = 18;
 
 /// virtio-mmio MagicValue（"virt" little-endian，register 0x000）。
 pub const VIRTIO_MMIO_MAGIC: u32 = 0x7472_6976;
