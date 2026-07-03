@@ -222,6 +222,13 @@ fn is_would_block(e: &std::io::Error) -> bool {
     )
 }
 
+/// 除錯用（`chefer-whp-helper --clip-selftest`）：讀目前 Windows 剪貼簿（經與 host↔guest
+/// 同步完全相同的 `get_clipboard_any` 路徑，含 `"PNG"` 直通與 CF_DIB→PNG 轉換），回
+/// `(kind, byte_len)`；空剪貼簿回 None。用來免 WHP 驗證 host 端讀取/轉換路徑。
+pub fn selftest_read() -> Option<(u8, usize)> {
+    get_clipboard_any().map(|(k, d)| (k, d.len()))
+}
+
 /// Windows 註冊的 `"PNG"` 剪貼簿格式 id（同名多次註冊回同一 id）。失敗回 0。
 fn png_format() -> u32 {
     // "PNG" as UTF-16 + NUL.
