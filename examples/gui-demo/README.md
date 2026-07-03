@@ -14,6 +14,17 @@ xeyes 是最適合做 GUI 驗證的程式：它一開機就嘗試連 `$DISPLAY` 
 > Linux 上同樣可用：chefer 直通 `/tmp/.X11-unix` 與 `$XDG_RUNTIME_DIR/wayland-*`，
 > 故 X11 與 Wayland 程式都能顯示（best-effort，視 host 是否有 X/Wayland server）。
 
+## 在無 WSL 的 Windows 上跑（WHP 路徑）
+
+同一個單檔在**沒有 WSL** 的 Windows 上一樣能顯示 GUI——chefer 的 **WHP 後端**用 Windows Hypervisor Platform 開一台 Linux micro-VM，VM 內以 bundle 內嵌的 **`cage`** Wayland compositor（+ Xwayland，讓 xeyes 這類 X11 程式也能跑）把畫面軟算繪（llvmpipe）到 virtio-gpu scanout，再由 helper 搬進一個原生 Windows 視窗；鍵鼠（virtio-input）與雙向文字剪貼簿都通。已於實機驗證。
+
+需要：
+
+- 用**含 GUI overlay + appliance 的 release kit** 打包（`chefer doctor` 會檢查 kit 是否有 `chefer-gui-overlay-<arch>`）；打 Windows 目標時 chefer 會把 GUI overlay 嵌進 bundle 的 `vm/`。純 server app 或 Linux 目標不揹這個體積。
+- 執行機開啟硬體虛擬化 + WHP 選用功能。WSL 不在時自動走 WHP；機器同時有 WSL 又想強制走 WHP 時設 `CHEFER_BACKEND=whp`（長駐服務可另設 `CHEFER_WHP_TIMEOUT=<秒>` 自動收）。
+
+其餘操作與下方相同：執行 → 出現以 app 名為標題的視窗顯示 xeyes → 關窗即結束。GPU 一律軟算繪（WHP 路徑無 GPU 加速）。
+
 ## 一、產生 image tar（需要 Docker）
 
 ```bash
