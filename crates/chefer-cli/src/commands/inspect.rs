@@ -475,6 +475,7 @@ mod tests {
                     retries: 1,
                     start_period_ms: 0,
                 }),
+                gpu: false,
             }],
         };
         m.save(&chefer_bundle::layout::manifest_path(&bundle))

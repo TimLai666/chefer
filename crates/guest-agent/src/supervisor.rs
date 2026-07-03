@@ -76,6 +76,7 @@ pub fn run_services(
     data_dir: &Path,
     app_net: Option<&AppNet>,
     manifest: &chefer_bundle::Manifest,
+    gpu_host: bool,
 ) -> Result<i32> {
     // internal/bridge 模式：各服務 setns 進 app netns。
     let netns_join = app_net.map(|n| n.join());
@@ -101,6 +102,7 @@ pub fn run_services(
             terminal,
             netns: netns_join,
             overlay: sr.overlay.as_ref(),
+            gpu_host,
         })
         .with_context(|| format!("failed to start service `{}`", svc.name));
         let spawned = match spawned {

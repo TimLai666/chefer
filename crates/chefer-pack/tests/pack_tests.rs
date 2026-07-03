@@ -182,6 +182,7 @@ fn make_service(image: ImageSourceOrPath) -> Service {
         interface_mode: Default::default(),
         depends_on: vec![],
         healthcheck: None,
+        gpu: false,
     }
 }
 
@@ -311,6 +312,29 @@ fn pack_oci_archive_gzip_layer() {
     assert_eq!(s.layers[0].diff_id, diff_id);
     assert_layer_roundtrip(&res.bundle_dir, &s.layers[0].rel_path, &diff_id);
     assert_eq!(s.image_config.cmd, vec!["echo", "hi"]);
+}
+
+#[test]
+fn pack_maps_gpu_flag_to_manifest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (image_tar, _) = build_docker_archive(tmp.path(), "linux", "amd64", None);
+
+    // 預設不開 gpu → manifest gpu == false
+    let svc = make_service(ImageSourceOrPath::TarPath(
+        image_tar.to_string_lossy().to_string(),
+    ));
+    let app = make_app("GpuOff", vec![("api", svc)]);
+    let res = pack(&app, &default_opts(&tmp.path().join("off"))).unwrap();
+    assert!(!res.manifest.services[0].gpu);
+
+    // 顯式 gpu: true → manifest gpu == true
+    let mut svc = make_service(ImageSourceOrPath::TarPath(
+        image_tar.to_string_lossy().to_string(),
+    ));
+    svc.gpu = true;
+    let app = make_app("GpuOn", vec![("api", svc)]);
+    let res = pack(&app, &default_opts(&tmp.path().join("on"))).unwrap();
+    assert!(res.manifest.services[0].gpu);
 }
 
 #[test]

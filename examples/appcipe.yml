@@ -71,6 +71,13 @@ services:
     # --- Terminal/GUI ---
     interface_mode: none                           # Optional: gui | terminal | both | none (default none)
 
+    # --- GPU passthrough (optional; opt-in per service, default off) ---
+    # gpu: true                                    # Bind host GPU device nodes (+ WSL2 driver libs) into this
+                                                   #   service's container -> CUDA/OpenCL/Vulkan compute & hardware render.
+                                                   #   Only works on native Linux (/dev/nvidia*, /dev/dri) and the Windows
+                                                   #   WSL2 backend (/dev/dxg + host /usr/lib/wsl/lib). The Windows WHP
+                                                   #   micro-VM and the macOS VM cannot expose a host GPU -> clear error.
+
   ui:
     # Short-form example: image is a tar path directly (equivalent to source: tar + format: auto + default platform)
     image: ./images/studio-ui.tar                  # Required (for this form): tar file path

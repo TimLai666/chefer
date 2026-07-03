@@ -1227,6 +1227,7 @@ mod linux_tests {
             interface_mode: chefer_bundle::InterfaceMode::None,
             depends_on: vec![],
             healthcheck: None,
+            gpu: false,
         }
     }
 

@@ -40,6 +40,11 @@ enum Cmd {
         /// (because wslrelay/VZ NAT does not forward UDP). The native Linux backend must not set this flag.
         #[arg(long)]
         udp_bridge: bool,
+        /// Native Linux / WSL2 backend only: allow opt-in per-service GPU passthrough (bind host GPU
+        /// device nodes + WSL2 driver libs into the container). The WHP/vz VM backends must not set
+        /// this flag — a bare micro-VM cannot expose a host GPU.
+        #[arg(long)]
+        gpu_host: bool,
     },
     /// Print this machine's (the VM's) primary outward-facing IPv4 for the host backend to build a UDP relay; exits non-zero if none
     Vmip,
@@ -72,6 +77,7 @@ fn main() -> ExitCode {
             cache,
             keep_rootfs,
             udp_bridge,
+            gpu_host,
         } => {
             let cfg = guest_agent::RunConfig {
                 bundle_dir: bundle,
@@ -79,6 +85,7 @@ fn main() -> ExitCode {
                 cache_dir: cache,
                 keep_rootfs,
                 udp_bridge,
+                gpu_host,
             };
             match guest_agent::run_bundle(&cfg) {
                 // exit code 透傳（clamp 至 u8 範圍；>255 取低位元組慣例）

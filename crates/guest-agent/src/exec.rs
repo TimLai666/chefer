@@ -49,6 +49,9 @@ pub struct SpawnSpec<'a> {
     /// Some = overlayfs 模式（root 後端）：在 `rootfs`（merged 掛載點）上掛 overlay。
     /// None = 直接 bind 合併好的 rootfs（rootless / 不支援 overlay）。
     pub overlay: Option<&'a OverlayDirs>,
+    /// 此後端能否對容器做 GPU passthrough（僅原生 Linux / WSL2 為 true）。
+    /// 服務 `gpu: true` 但此為 false（WHP/vz VM）→ 啟動時回明確錯誤。
+    pub gpu_host: bool,
 }
 
 /// overlay 掛載所需的目錄：唯讀 lowerdir（base→top）+ 每次執行的可寫 upper/work。
@@ -241,6 +244,53 @@ fn build_plan(spec: &SpawnSpec) -> Result<ChildPlan> {
             read_only: m.read_only,
             is_dir,
         });
+    }
+
+    // GPU passthrough（opt-in per-service `gpu: true`；見 docs/DESIGN.md「GPU passthrough」）。
+    // 只在能實際觸及 host GPU 的後端可行（原生 Linux / WSL2）；WHP/vz VM 明確報錯，
+    // 不靜默綁到 virtio-gpu 的 2D `/dev/dri`。探測到的節點/libs 以既有 bind 流程套用
+    //（在 setup_dev 建好 /dev tmpfs 之後）。
+    if svc.gpu {
+        if !spec.gpu_host {
+            bail!(
+                "service `{}` requests `gpu: true`, but GPU passthrough is not available on this backend. \
+It works only on native Linux and the Windows WSL2 backend; the Windows WHP micro-VM and the macOS VM cannot expose a host GPU to a Linux container. \
+On Windows, use the WSL2 backend for GPU (a bare WHP micro-VM has no GPU paravirtualization).",
+                svc.name
+            );
+        }
+        let gpu = crate::gpu::collect();
+        if gpu.is_empty() {
+            bail!(
+                "service `{}` requests `gpu: true`, but no GPU device nodes were found on the host \
+(searched /dev/dxg, /dev/dri, /dev/nvidia*). \
+Ensure a GPU with drivers is present: on native Linux install the vendor driver (exposes /dev/nvidia* and/or /dev/dri); \
+on WSL2 use a recent GPU driver with WSL support so /dev/dxg appears.",
+                svc.name
+            );
+        }
+        for b in &gpu.binds {
+            binds.push(BindEntry {
+                host: b.host.clone(),
+                target: join_guest(spec.rootfs, &b.guest)?,
+                read_only: b.read_only,
+                is_dir: b.is_dir,
+            });
+        }
+        // WSL2：把 host 驅動 lib 目錄（含版本相符的 libcuda 等）接進容器 LD_LIBRARY_PATH
+        //（附加於既有值後，不覆蓋 image 自身設定）。
+        if !gpu.ld_library_paths.is_empty() {
+            let extra = gpu.ld_library_paths.join(":");
+            env.entry("LD_LIBRARY_PATH".to_string())
+                .and_modify(|v| {
+                    *v = if v.is_empty() {
+                        extra.clone()
+                    } else {
+                        format!("{v}:{extra}")
+                    };
+                })
+                .or_insert(extra);
+        }
     }
 
     // GUI：存在才掛 X11 / Wayland socket，並補上對應環境變數（不覆蓋使用者設定）
