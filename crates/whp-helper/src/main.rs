@@ -679,6 +679,9 @@ mod whp_api {
         let mut devices =
             format!("{VIRTIO_MMIO_CMDLINE} {VIRTIO_DATA_MMIO_CMDLINE} {VIRTIO_NET_MMIO_CMDLINE}");
         // GUI：額外掛 virtio-gpu + virtio-input(keyboard/tablet)。
+        // 註：guest 的 cage/wlroots 目前挑 640x480 預設模式（virtio-gpu 無 EDID → connector
+        // 無偏好模式）；host 視窗以 resize-to-content 跟著 1:1 顯示（不失真）。要更大的預設
+        // 視窗需為 virtio-gpu 加 EDID（VIRTIO_GPU_F_EDID + GET_EDID）——列為後續。
         if gui {
             devices.push_str(&format!(
                 " {VIRTIO_GPU_MMIO_CMDLINE} {VIRTIO_KBD_MMIO_CMDLINE} {VIRTIO_TABLET_MMIO_CMDLINE}"

@@ -24,12 +24,13 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, IDC_ARROW, KillTimer,
-    LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SW_SHOW, SetTimer,
-    SetWindowLongPtrW, ShowWindow, TranslateMessage, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCCREATE, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
-    WNDCLASSW, WS_CAPTION, WS_MINIMIZEBOX, WS_SYSMENU, WS_VISIBLE,
+    DispatchMessageW, GWL_STYLE, GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, GetWindowLongW,
+    IDC_ARROW, KillTimer, LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SW_SHOW,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, TranslateMessage, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_PAINT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_CAPTION,
+    WS_MINIMIZEBOX, WS_SYSMENU, WS_VISIBLE,
 };
 
 use crate::virtio::gui_bridge::{
@@ -143,7 +144,8 @@ fn window_thread(
         };
         RegisterClassW(&wc);
 
-        // 非可調整大小：client 區 == 顯示尺寸，blit 1:1（AdjustWindowRect 換算外框）。
+        // 初始 client 區 = 傳入尺寸；首個 frame 後依 guest 實際 scanout 解析度
+        // resize-to-content（見 WM_TIMER），以 1:1 顯示不失真。
         let style = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE;
         let mut rect = windows_sys::Win32::Foundation::RECT {
             left: 0,
@@ -233,6 +235,14 @@ unsafe extern "system" fn wnd_proc(
                 state.snap_w = w;
                 state.snap_h = h;
                 state.last_gen = generation;
+                // guest 選定的 scanout 解析度可能 ≠ 初始視窗大小（cage/wlroots 挑的模式）。
+                // 視窗 client 區跟著調整為 guest 實際解析度 → 1:1 blit、不放大失真；
+                // 同時讓 abs 座標映射（用 state.width/height）與可見畫面一致。
+                if (w, h) != (state.width, state.height) && w > 0 && h > 0 {
+                    state.width = w;
+                    state.height = h;
+                    unsafe { resize_client(hwnd, w, h) };
+                }
                 unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
             }
             0
@@ -320,6 +330,29 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// 調整視窗使 client 區為 `w`×`h`（依目前 window style 換算外框；不移動、不改 Z 序）。
+unsafe fn resize_client(hwnd: HWND, w: u32, h: u32) {
+    let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32;
+    let mut rect = windows_sys::Win32::Foundation::RECT {
+        left: 0,
+        top: 0,
+        right: w as i32,
+        bottom: h as i32,
+    };
+    unsafe { AdjustWindowRect(&mut rect, style, 0) };
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
     }
 }
 
