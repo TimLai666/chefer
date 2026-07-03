@@ -85,6 +85,8 @@ pub struct HelperInvocation {
     pub forwards: Vec<(u16, u16)>,
     /// host→guest UDP 埠轉發 `(host_port, guest_port)`（同上，經 CLI 傳給 helper）。
     pub udp_forwards: Vec<(u16, u16)>,
+    /// app 含 gui/both 服務 → 傳 `--gui`，helper 掛 virtio-gpu/input 並開顯示視窗（M8-c-2）。
+    pub gui: bool,
 }
 
 impl HelperInvocation {
@@ -117,6 +119,9 @@ impl HelperInvocation {
         for (host, guest) in &self.udp_forwards {
             v.push("--forward-udp".into());
             v.push(format!("{host}:{guest}").into());
+        }
+        if self.gui {
+            v.push("--gui".into());
         }
         v
     }
@@ -203,6 +208,7 @@ pub fn helper_invocation(
             timeout_secs,
             forwards: Vec::new(),
             udp_forwards: Vec::new(),
+            gui: false, // 由呼叫端（whp.rs）依 manifest 是否有 gui 服務設定
         }),
         other => Err(other),
     }
@@ -350,6 +356,17 @@ mod tests {
         assert_eq!(args.iter().filter(|a| *a == "--forward-tcp").count(), 2);
         assert!(has_arg_pair(&args, "--forward-udp", "53:53"));
         assert_eq!(args.iter().filter(|a| *a == "--forward-udp").count(), 1);
+        // 預設非 GUI：不帶 --gui。
+        assert!(!args.iter().any(|a| a == "--gui"));
+
+        // 設 gui → args 帶 --gui。
+        invocation.gui = true;
+        let gui_args = invocation
+            .args()
+            .into_iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(gui_args.iter().any(|a| a == "--gui"));
     }
 
     #[test]
