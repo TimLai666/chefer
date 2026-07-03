@@ -25,4 +25,8 @@ windows-sys = { version = "0.61", features = [
     # GUI 顯示視窗（M8-c）：視窗類別/訊息迴圈、GDI blit（StretchDIBits）。
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
+    # 剪貼簿同步（M8-e）：Win32 clipboard API + token 用的 CSPRNG。
+    "Win32_System_DataExchange",
+    "Win32_System_Ole",
+    "Win32_Security_Cryptography",
 ] }

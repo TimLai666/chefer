@@ -29,15 +29,19 @@ const GUI_RUNTIME_DIR: &str = "/run/chefer-gui";
 /// 等 compositor socket 出現的上限。llvmpipe 首次啟動慢，放寬一點。
 const SOCKET_WAIT: Duration = Duration::from_secs(20);
 
-/// 存活中的 GUI 環境；Drop 時收掉 cage / seatd / udevd。
+/// 存活中的 GUI 環境；Drop 時收掉 clipboard / cage / seatd / udevd。
 pub struct GuiSession {
     cage: Child,
     seatd: Option<Child>,
     udevd: Option<Child>,
+    /// host↔guest 剪貼簿同步（有 cmdline token 且 wl-clipboard 可用時；見 clipboard.rs）。
+    clipboard: Option<crate::clipboard::ClipboardSync>,
 }
 
 impl Drop for GuiSession {
     fn drop(&mut self) {
+        // 先收剪貼簿同步（背景執行緒），再收 compositor。
+        self.clipboard.take();
         let _ = self.cage.kill();
         let _ = self.cage.wait();
         for c in [self.seatd.take(), self.udevd.take()].into_iter().flatten() {
@@ -82,7 +86,12 @@ pub fn maybe_start(bundle_dir: &Path, manifest: &Manifest) -> Result<Option<GuiS
     let udevd = start_udev();
     let seatd = start_seatd();
     let cage = start_cage().context("failed to start the in-VM compositor (cage)")?;
-    let mut session = GuiSession { cage, seatd, udevd };
+    let mut session = GuiSession {
+        cage,
+        seatd,
+        udevd,
+        clipboard: None,
+    };
 
     let wayland = PathBuf::from(GUI_RUNTIME_DIR).join("wayland-0");
     wait_for_socket(&wayland, &mut session)?;
@@ -105,6 +114,9 @@ pub fn maybe_start(bundle_dir: &Path, manifest: &Manifest) -> Result<Option<GuiS
         );
     }
     eprintln!("[guest-agent] gui: compositor ready (WAYLAND_DISPLAY=wayland-0)");
+    // compositor 就緒後起剪貼簿同步（env 已設好，wl-clipboard 可接 cage）。無 cmdline
+    // token（host 未啟用剪貼簿）或 wl-clipboard 缺失時回 None，不致命。
+    session.clipboard = crate::clipboard::maybe_start();
     Ok(Some(session))
 }
 
