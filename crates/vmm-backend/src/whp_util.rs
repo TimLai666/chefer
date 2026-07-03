@@ -87,6 +87,8 @@ pub struct HelperInvocation {
     pub udp_forwards: Vec<(u16, u16)>,
     /// app 含 gui/both 服務 → 傳 `--gui`，helper 掛 virtio-gpu/input 並開顯示視窗（M8-c-2）。
     pub gui: bool,
+    /// gui 時的顯示視窗標題（= app 名）；空字串則 helper 用預設 "Chefer"。
+    pub app_name: String,
 }
 
 impl HelperInvocation {
@@ -122,6 +124,10 @@ impl HelperInvocation {
         }
         if self.gui {
             v.push("--gui".into());
+            if !self.app_name.is_empty() {
+                v.push("--gui-title".into());
+                v.push(self.app_name.clone().into());
+            }
         }
         v
     }
@@ -208,7 +214,8 @@ pub fn helper_invocation(
             timeout_secs,
             forwards: Vec::new(),
             udp_forwards: Vec::new(),
-            gui: false, // 由呼叫端（whp.rs）依 manifest 是否有 gui 服務設定
+            gui: false,              // 由呼叫端（whp.rs）依 manifest 是否有 gui 服務設定
+            app_name: String::new(), // 由呼叫端（whp.rs）填 manifest app 名
         }),
         other => Err(other),
     }
@@ -359,14 +366,16 @@ mod tests {
         // 預設非 GUI：不帶 --gui。
         assert!(!args.iter().any(|a| a == "--gui"));
 
-        // 設 gui → args 帶 --gui。
+        // 設 gui + app 名 → args 帶 --gui 與 --gui-title <name>。
         invocation.gui = true;
+        invocation.app_name = "MyApp".to_string();
         let gui_args = invocation
             .args()
             .into_iter()
             .map(|a| a.to_string_lossy().to_string())
             .collect::<Vec<_>>();
         assert!(gui_args.iter().any(|a| a == "--gui"));
+        assert!(has_arg_pair(&gui_args, "--gui-title", "MyApp"));
     }
 
     #[test]
