@@ -399,7 +399,7 @@ AppCipe 新增 app 級欄位 **`network`**（appcipe-spec enum，serde rename �
 
 **版本**：`gpu` 為相容加法（可選欄位、預設關；舊 recipe/bundle 缺欄位 → `false`）→ `APPCIPE_SPEC_VERSION`、`MANIFEST_FORMAT_VERSION`、`appcipe-spec`/`appcipe-normalize` 版號**皆不動**（同 `network`/`console`/`healthcheck` 當年加入時）。
 
-**分階段**：① 契約 + spec/manifest/pack 欄位 + guest-agent 節點綁定 + WSL2 lib 綁定/LD path + 後端界線錯誤（本 PR，WSL2 實機驗證）→ ② 原生 Linux 的 host 相符 userspace lib 自動注入（類 NVIDIA Container Toolkit；最難，獨立 PR）。
+**分階段**：① 契約 + spec/manifest/pack 欄位 + guest-agent 節點綁定 + WSL2 lib 綁定/LD path + 後端界線錯誤（本 PR；**WSL2 實機已驗證**：`gpu: true` 的容器內見 `/dev/dxg`、`/dev/dri`（card0/renderD128）、`/usr/lib/wsl/lib`，`LD_LIBRARY_PATH` 指向驅動 libs，服務 exit 0）→ ② 原生 Linux 的 host 相符 userspace lib 自動注入（類 NVIDIA Container Toolkit；最難，獨立 PR）。
 
 ### Dockerfile build（`source: dockerfile`）— 設計
 
