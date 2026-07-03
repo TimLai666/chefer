@@ -10,6 +10,7 @@
 
 pub mod blk;
 pub mod gpu;
+pub mod gui_bridge;
 pub mod image;
 pub mod input;
 pub mod mmio;

@@ -13,6 +13,9 @@ mod serial;
 // 連 Windows 上都還沒有消費端，待接上 run_loop 的 MMIO dispatch 後移除此 allow。
 #[allow(dead_code)]
 mod virtio;
+// GUI 顯示視窗（M8-c，Win32；非 Windows 為空）。
+#[cfg(windows)]
+mod gui_window;
 
 use std::path::PathBuf;
 
@@ -44,6 +47,10 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
 
     if args.iter().any(|arg| arg == "--preflight") {
         return run_preflight(args);
+    }
+
+    if args.iter().any(|arg| arg == "--gui-selftest") {
+        return run_gui_selftest();
     }
 
     let request = HelperRequest::parse(args)?;
@@ -125,6 +132,16 @@ fn run_boot(request: HelperRequest) -> Result<(), String> {
 #[cfg(not(windows))]
 fn run_boot(_request: HelperRequest) -> Result<(), String> {
     Err("WHP boot requires Windows.".to_string())
+}
+
+#[cfg(windows)]
+fn run_gui_selftest() -> Result<(), String> {
+    gui_window::gui_selftest()
+}
+
+#[cfg(not(windows))]
+fn run_gui_selftest() -> Result<(), String> {
+    Err("GUI self-test requires Windows.".to_string())
 }
 
 // ---------------------------------------------------------------------------

@@ -18,4 +18,11 @@ smoltcp = { version = "0.12", default-features = false, features = ["std", "medi
 tempfile = "3.27.0"
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_Memory"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    # GUI 顯示視窗（M8-c）：視窗類別/訊息迴圈、GDI blit（StretchDIBits）。
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+] }
