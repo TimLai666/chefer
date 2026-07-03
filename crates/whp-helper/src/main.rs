@@ -2143,7 +2143,9 @@ mod whp_api {
                 VIRTIO_TABLET_MMIO_IRQ,
                 super::virtio::input::InputKind::Tablet,
             );
-            let window = crate::gui_window::spawn("Chefer", frame, input.clone(), gw, gh);
+            // 視窗標題 = app 名（vmm-backend 帶 --gui-title）；缺省 "Chefer"。
+            let title = req.gui_title.as_deref().unwrap_or("Chefer");
+            let window = crate::gui_window::spawn(title, frame, input.clone(), gw, gh);
             (
                 Some(gpu),
                 Some(kbd),
@@ -2919,6 +2921,8 @@ struct HelperRequest {
     udp_forwards: Vec<(u16, u16)>,
     /// `--gui`：app 有介面服務時由 vmm-backend 帶入 → 掛 virtio-gpu/input 並開顯示視窗。
     gui: bool,
+    /// `--gui-title <name>`：顯示視窗標題（通常 = app 名）；缺省用 "Chefer"。
+    gui_title: Option<String>,
 }
 
 impl HelperRequest {
@@ -2943,6 +2947,11 @@ impl HelperRequest {
             udp_forwards.push(parse_forward(&raw)?);
         }
         let gui = parser.take_flag("--gui");
+        let gui_title = if parser.has("--gui-title") {
+            Some(parser.value("--gui-title")?)
+        } else {
+            None
+        };
         let request = HelperRequest {
             kernel: parser.path("--kernel")?,
             initramfs: parser.path("--initramfs")?,
@@ -2955,6 +2964,7 @@ impl HelperRequest {
             forwards,
             udp_forwards,
             gui,
+            gui_title,
         };
         parser.finish()?;
         Ok(request)

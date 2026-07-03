@@ -97,6 +97,8 @@ impl ExecBackend for WhpBackend {
             .services
             .iter()
             .any(|s| s.interface_mode.wants_gui());
+        // 顯示視窗標題用 app 名。
+        invocation.app_name = ctx.manifest.app.name.clone();
 
         std::fs::create_dir_all(ctx.data_dir).with_context(|| {
             format!(
