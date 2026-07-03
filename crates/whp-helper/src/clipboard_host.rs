@@ -2,10 +2,13 @@
 //!
 //! 與 guest 的 `guest-agent::clipboard` 對接：helper 透過**既有埠轉發**連到 guest 的
 //! 剪貼簿服務（`[::1]:<port>` → smoltcp → guest eth0:<port>），送 token 後雙向同步
-//! Windows 剪貼簿與 cage 剪貼簿。首版 UTF-8 文字。純 Win32，故 `#[cfg(windows)]`。
+//! Windows 剪貼簿與 cage 剪貼簿。純 Win32，故 `#[cfg(windows)]`。
 //!
-//! 協定同 guest 端：token 行 → 各於本地剪貼簿變更時送 `<u32 be len><utf8>`；套用對端
-//! 內容後記住以抑制回音。輪詢 Windows 剪貼簿（不需 clipboard listener 視窗）。
+//! 協定同 guest 端：token 行 → 各於本地剪貼簿變更時送 `<u8 kind><u32 be len><payload>`
+//! （kind 0 = `text/plain` UTF-8、1 = `image/png` 原始 PNG bytes）；套用對端內容後記住
+//! `(kind, payload)` 以抑制回音。**文字與 PNG 圖片皆同步**——圖片在線協定上一律用 PNG；
+//! Windows 端同時支援註冊的 `"PNG"` 格式（現代 app，bytes 直通）與 CF_DIB（傳統 app：
+//! 小畫家/剪取工具/Office，經 `dib` 模組以 `png` codec 轉換）。輪詢 Windows 剪貼簿。
 
 #![cfg(windows)]
 
@@ -18,13 +21,21 @@ use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{HANDLE, HGLOBAL};
 use windows_sys::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW,
+    SetClipboardData,
 };
-use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
-use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
+use windows_sys::Win32::System::Memory::{
+    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+};
+use windows_sys::Win32::System::Ole::{CF_DIB, CF_UNICODETEXT};
 
 const POLL: Duration = Duration::from_millis(400);
-const MAX_TEXT: usize = 4 * 1024 * 1024;
+/// 單則剪貼簿 payload 上限（文字或 PNG 圖片）。與 guest 端一致。
+const MAX_PAYLOAD: usize = 32 * 1024 * 1024;
+
+/// 線協定的內容類別位元組（與 guest 端一致）。
+const KIND_TEXT: u8 = 0;
+const KIND_PNG: u8 = 1;
 
 /// host 端剪貼簿同步把手；Drop 時停背景執行緒。
 pub struct ClipHost {
@@ -105,9 +116,13 @@ fn session(mut stream: TcpStream, token: &str, stop: &Arc<AtomicBool>) -> std::i
     stream.write_all(b"\n")?;
     stream.flush()?;
 
+    let trace = std::env::var_os("CHEFER_CLIP_TRACE").is_some();
     let mut reader = stream.try_clone()?;
-    let mut last_applied: Option<String> = None; // 對端送來、已寫入 Windows 剪貼簿的內容
-    let mut last_sent: Option<String> = None; // 我方最近送出的內容
+    let mut last_applied: Option<(u8, Vec<u8>)> = None; // 對端送來、已寫入 Windows 剪貼簿
+    let mut last_sent: Option<(u8, Vec<u8>)> = None; // 我方最近送出
+    // 讀對端 `<u8 kind><u32 len><payload>`（跨迴圈保留部分讀取狀態）。
+    let mut kind_byte = [0u8; 1];
+    let mut kind_filled = 0usize;
     let mut hdr = [0u8; 4];
     let mut hdr_filled = 0usize;
 
@@ -115,44 +130,66 @@ fn session(mut stream: TcpStream, token: &str, stop: &Arc<AtomicBool>) -> std::i
         if stop.load(Ordering::Relaxed) {
             return Ok(());
         }
-        // 讀對端（guest→host）：套用到 Windows 剪貼簿。
-        match reader.read(&mut hdr[hdr_filled..]) {
-            Ok(0) => return Ok(()),
-            Ok(n) => {
-                hdr_filled += n;
-                if hdr_filled == 4 {
-                    hdr_filled = 0;
-                    let len = u32::from_be_bytes(hdr) as usize;
-                    if len > MAX_TEXT {
-                        return Ok(());
-                    }
-                    let mut buf = vec![0u8; len];
-                    read_exact_timeout(&mut reader, &mut buf, stop)?;
-                    let text = String::from_utf8_lossy(&buf).into_owned();
-                    if std::env::var_os("CHEFER_CLIP_TRACE").is_some() {
-                        eprintln!("[clip-host] applied from guest ({} bytes)", text.len());
-                    }
-                    set_clipboard_text(&text);
-                    last_applied = Some(text);
-                }
+        // 讀 1 byte kind。
+        if kind_filled < 1 {
+            match reader.read(&mut kind_byte[..]) {
+                Ok(0) => return Ok(()),
+                Ok(n) => kind_filled += n,
+                Err(ref e) if is_would_block(e) => {}
+                Err(e) => return Err(e),
             }
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(e) => return Err(e),
+        }
+        // kind 到齊才讀 4 byte len。
+        if kind_filled == 1 {
+            match reader.read(&mut hdr[hdr_filled..]) {
+                Ok(0) => return Ok(()),
+                Ok(n) => {
+                    hdr_filled += n;
+                    if hdr_filled == 4 {
+                        let kind = kind_byte[0];
+                        let len = u32::from_be_bytes(hdr) as usize;
+                        kind_filled = 0;
+                        hdr_filled = 0;
+                        if len > MAX_PAYLOAD {
+                            return Ok(());
+                        }
+                        let mut buf = vec![0u8; len];
+                        read_exact_timeout(&mut reader, &mut buf, stop)?;
+                        if trace {
+                            eprintln!(
+                                "[clip-host] applied from guest (kind {kind}, {} bytes)",
+                                buf.len()
+                            );
+                        }
+                        set_clipboard_any(kind, &buf);
+                        last_applied = Some((kind, buf));
+                    }
+                }
+                Err(ref e) if is_would_block(e) => {}
+                Err(e) => return Err(e),
+            }
         }
 
         // host→guest：Windows 剪貼簿變了且非回音就送。
-        if let Some(cur) = get_clipboard_text() {
-            let is_echo = last_applied.as_ref() == Some(&cur);
-            if !is_echo && last_sent.as_ref() != Some(&cur) && cur.len() <= MAX_TEXT {
-                if std::env::var_os("CHEFER_CLIP_TRACE").is_some() {
-                    eprintln!("[clip-host] sent to guest ({} bytes)", cur.len());
+        if let Some((kind, data)) = get_clipboard_any() {
+            let is_echo = last_applied
+                .as_ref()
+                .is_some_and(|(k, d)| *k == kind && d == &data);
+            let is_resent = last_sent
+                .as_ref()
+                .is_some_and(|(k, d)| *k == kind && d == &data);
+            if !is_echo && !is_resent && data.len() <= MAX_PAYLOAD {
+                if trace {
+                    eprintln!(
+                        "[clip-host] sent to guest (kind {kind}, {} bytes)",
+                        data.len()
+                    );
                 }
-                stream.write_all(&(cur.len() as u32).to_be_bytes())?;
-                stream.write_all(cur.as_bytes())?;
+                stream.write_all(&[kind])?;
+                stream.write_all(&(data.len() as u32).to_be_bytes())?;
+                stream.write_all(&data)?;
                 stream.flush()?;
-                last_sent = Some(cur);
+                last_sent = Some((kind, data));
             }
         }
     }
@@ -171,65 +208,148 @@ fn read_exact_timeout(
         match r.read(&mut buf[filled..]) {
             Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
             Ok(n) => filled += n,
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(ref e) if is_would_block(e) => {}
             Err(e) => return Err(e),
         }
     }
     Ok(())
 }
 
-/// 讀 Windows 剪貼簿的 UTF-8 文字（無文字/開啟失敗回 None）。
-fn get_clipboard_text() -> Option<String> {
+fn is_would_block(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
+}
+
+/// 除錯用（`chefer-whp-helper --clip-selftest`）：讀目前 Windows 剪貼簿（經與 host↔guest
+/// 同步完全相同的 `get_clipboard_any` 路徑，含 `"PNG"` 直通與 CF_DIB→PNG 轉換），回
+/// `(kind, byte_len)`；空剪貼簿回 None。用來免 WHP 驗證 host 端讀取/轉換路徑。
+pub fn selftest_read() -> Option<(u8, usize)> {
+    get_clipboard_any().map(|(k, d)| (k, d.len()))
+}
+
+/// Windows 註冊的 `"PNG"` 剪貼簿格式 id（同名多次註冊回同一 id）。失敗回 0。
+fn png_format() -> u32 {
+    // "PNG" as UTF-16 + NUL.
+    let name: [u16; 4] = [b'P' as u16, b'N' as u16, b'G' as u16, 0];
+    unsafe { RegisterClipboardFormatW(name.as_ptr()) }
+}
+
+/// 讀目前剪貼簿某格式的原始 bytes（呼叫時 clipboard **必須已 Open**）。無/空回 None。
+fn read_global_bytes(fmt: u32) -> Option<Vec<u8>> {
+    if fmt == 0 {
+        return None;
+    }
+    unsafe {
+        let h = GetClipboardData(fmt);
+        if h.is_null() {
+            return None;
+        }
+        let size = GlobalSize(h as HGLOBAL);
+        if size == 0 {
+            return None;
+        }
+        let ptr = GlobalLock(h as HGLOBAL) as *const u8;
+        if ptr.is_null() {
+            return None;
+        }
+        let data = std::slice::from_raw_parts(ptr, size).to_vec();
+        let _ = GlobalUnlock(h as HGLOBAL);
+        Some(data)
+    }
+}
+
+/// 讀 Windows 剪貼簿。優先圖片：有 `"PNG"` 格式 → 直接 (KIND_PNG, bytes)；否則 CF_DIB
+/// （小畫家/剪取工具等傳統 app）→ 轉 PNG。都沒有 → CF_UNICODETEXT → (KIND_TEXT, utf8)。
+fn get_clipboard_any() -> Option<(u8, Vec<u8>)> {
     unsafe {
         if OpenClipboard(std::ptr::null_mut()) == 0 {
             return None;
         }
-        let h = GetClipboardData(CF_UNICODETEXT as u32);
-        let result = if h.is_null() {
-            None
-        } else {
-            let ptr = GlobalLock(h as HGLOBAL) as *const u16;
-            if ptr.is_null() {
-                None
-            } else {
-                // 找 NUL 結尾。
-                let mut len = 0usize;
-                while *ptr.add(len) != 0 {
-                    len += 1;
+        let mut out = None;
+        // 先看 "PNG" 格式（現代 app；bytes 原樣直通）。
+        let png_fmt = png_format();
+        if png_fmt != 0
+            && let Some(bytes) = read_global_bytes(png_fmt)
+        {
+            out = Some((KIND_PNG, bytes));
+        }
+        // 否則 CF_DIB（傳統 app）→ 轉成 PNG。
+        if out.is_none()
+            && let Some(dib) = read_global_bytes(CF_DIB as u32)
+            && let Some(png) = crate::dib::dib_to_png(&dib)
+        {
+            out = Some((KIND_PNG, png));
+        }
+        // 否則文字。
+        if out.is_none() {
+            let h = GetClipboardData(CF_UNICODETEXT as u32);
+            if !h.is_null() {
+                let ptr = GlobalLock(h as HGLOBAL) as *const u16;
+                if !ptr.is_null() {
+                    let mut len = 0usize;
+                    while *ptr.add(len) != 0 {
+                        len += 1;
+                    }
+                    let slice = std::slice::from_raw_parts(ptr, len);
+                    let s = String::from_utf16_lossy(slice);
+                    let _ = GlobalUnlock(h as HGLOBAL);
+                    out = Some((KIND_TEXT, s.into_bytes()));
                 }
-                let slice = std::slice::from_raw_parts(ptr, len);
-                let s = String::from_utf16_lossy(slice);
-                let _ = GlobalUnlock(h as HGLOBAL);
-                Some(s)
             }
-        };
+        }
         CloseClipboard();
-        result
+        out
     }
 }
 
-/// 設定 Windows 剪貼簿為 `text`（UTF-8 → UTF-16 + NUL）。
-fn set_clipboard_text(text: &str) {
-    let mut utf16: Vec<u16> = text.encode_utf16().collect();
-    utf16.push(0);
-    let bytes = utf16.len() * 2;
+/// 設定 Windows 剪貼簿。text → CF_UNICODETEXT（UTF-16+NUL）；png → **同時**放註冊的 `"PNG"`
+/// 格式（現代 app）與 CF_DIB（傳統 app：小畫家/剪取工具/Office），兩者互通。
+fn set_clipboard_any(kind: u8, data: &[u8]) {
+    // 準備要放的 (格式 id, bytes) 清單。
+    let mut items: Vec<(u32, Vec<u8>)> = Vec::new();
+    if kind == KIND_PNG {
+        let fmt = png_format();
+        if fmt != 0 {
+            items.push((fmt, data.to_vec()));
+        }
+        // CF_DIB 供傳統 app（PNG 解碼失敗則只放 "PNG"）。
+        if let Some(dib) = crate::dib::png_to_dib(data) {
+            items.push((CF_DIB as u32, dib));
+        }
+    } else {
+        let mut utf16: Vec<u16> = String::from_utf8_lossy(data).encode_utf16().collect();
+        utf16.push(0);
+        let mut bytes = Vec::with_capacity(utf16.len() * 2);
+        for u in utf16 {
+            bytes.extend_from_slice(&u.to_le_bytes());
+        }
+        items.push((CF_UNICODETEXT as u32, bytes));
+    }
+    items.retain(|(_, p)| !p.is_empty());
+    if items.is_empty() {
+        return;
+    }
     unsafe {
         if OpenClipboard(std::ptr::null_mut()) == 0 {
             return;
         }
         EmptyClipboard();
-        let hmem = GlobalAlloc(GMEM_MOVEABLE, bytes);
-        if !hmem.is_null() {
-            let dst = GlobalLock(hmem) as *mut u16;
-            if !dst.is_null() {
-                std::ptr::copy_nonoverlapping(utf16.as_ptr(), dst, utf16.len());
-                let _ = GlobalUnlock(hmem);
-                // SetClipboardData 成功後 hmem 的所有權轉給系統，不可再釋放。
-                if SetClipboardData(CF_UNICODETEXT as u32, hmem as HANDLE).is_null() {
-                    // 失敗：所有權仍在我方，但這裡沿用 best-effort（不釋放，罕見）。
-                }
+        for (fmt, payload) in &items {
+            let hmem = GlobalAlloc(GMEM_MOVEABLE, payload.len());
+            if hmem.is_null() {
+                continue;
+            }
+            let dst = GlobalLock(hmem) as *mut u8;
+            if dst.is_null() {
+                continue;
+            }
+            std::ptr::copy_nonoverlapping(payload.as_ptr(), dst, payload.len());
+            let _ = GlobalUnlock(hmem);
+            // SetClipboardData 成功後 hmem 所有權轉給系統，不可再釋放。
+            if SetClipboardData(*fmt, hmem as HANDLE).is_null() {
+                // best-effort（失敗時所有權仍在我方，罕見，不釋放）。
             }
         }
         CloseClipboard();

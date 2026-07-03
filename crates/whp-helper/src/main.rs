@@ -19,6 +19,9 @@ mod gui_window;
 // GUI 剪貼簿同步 host 端（M8-e，Win32）。
 #[cfg(windows)]
 mod clipboard_host;
+// 剪貼簿圖片的 CF_DIB ↔ PNG 轉換（純邏輯；供 clipboard_host 與現代/傳統 Windows app 互通）。
+#[cfg(windows)]
+mod dib;
 
 use std::path::PathBuf;
 
@@ -54,6 +57,10 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
 
     if args.iter().any(|arg| arg == "--gui-selftest") {
         return run_gui_selftest();
+    }
+
+    if args.iter().any(|arg| arg == "--clip-selftest") {
+        return run_clip_selftest();
     }
 
     let request = HelperRequest::parse(args)?;
@@ -145,6 +152,28 @@ fn run_gui_selftest() -> Result<(), String> {
 #[cfg(not(windows))]
 fn run_gui_selftest() -> Result<(), String> {
     Err("GUI self-test requires Windows.".to_string())
+}
+
+/// 除錯：讀目前 Windows 剪貼簿（經與 host↔guest 同步相同的 `get_clipboard_any` 路徑，
+/// 含 CF_DIB→PNG 轉換），印出 kind + bytes。免 WHP 即可驗 host 端剪貼簿讀取路徑。
+#[cfg(windows)]
+fn run_clip_selftest() -> Result<(), String> {
+    match clipboard_host::selftest_read() {
+        Some((kind, len)) => {
+            let ty = if kind == 1 { "image/png" } else { "text/plain" };
+            println!("CLIP_SELFTEST kind={kind} ({ty}) bytes={len}");
+            Ok(())
+        }
+        None => {
+            println!("CLIP_SELFTEST empty (no readable text or image on clipboard)");
+            Ok(())
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn run_clip_selftest() -> Result<(), String> {
+    Err("clipboard self-test requires Windows.".to_string())
 }
 
 // ---------------------------------------------------------------------------
