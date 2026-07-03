@@ -61,6 +61,9 @@ enable_kernel_options() {
   "$cfg" --enable OVERLAY_FS
   # GUI overlay（M8）以 squashfs（zstd 壓縮）唯讀掛載 + overlayfs 疊上 VM 根，免每次開機
   # 解壓 200MB+。見 DESIGN §6「GUI overlay 打包契約」與 guest-agent/src/gui.rs。
+  # squashfs 是 block filesystem，掛載檔案需經 loop 裝置（BLK_DEV_LOOP）；guest-agent
+  # 以 loop ioctl 把 .sqfs 綁上 /dev/loopN 再掛。
+  "$cfg" --enable BLK_DEV_LOOP
   "$cfg" --enable SQUASHFS
   "$cfg" --enable SQUASHFS_ZSTD
   "$cfg" --enable NAMESPACES

@@ -134,11 +134,21 @@ const OVERLAY_SKIP: &[&str] = &["dev", "proc", "sys", "run", "tmp", "mnt", "newr
 fn mount_overlay(sqfs: &Path) -> Result<()> {
     let ro = Path::new("/run/chefer/gui-ro");
     std::fs::create_dir_all(ro).with_context(|| format!("failed to create {}", ro.display()))?;
-    mnt(Some(sqfs), ro, Some("squashfs"), MsFlags::MS_RDONLY, None).with_context(|| {
+    // squashfs 是 block filesystem——掛載檔案須先綁一個 loop 裝置（不能直接 mount 檔案）。
+    let loop_dev = setup_loop(sqfs)?;
+    mnt(
+        Some(&loop_dev),
+        ro,
+        Some("squashfs"),
+        MsFlags::MS_RDONLY,
+        None,
+    )
+    .with_context(|| {
         format!(
-            "failed to mount the GUI overlay squashfs {} \
+            "failed to mount the GUI overlay squashfs {} via {} \
              (the appliance kernel needs CONFIG_SQUASHFS + CONFIG_SQUASHFS_ZSTD)",
-            sqfs.display()
+            sqfs.display(),
+            loop_dev.display()
         )
     })?;
 
@@ -211,6 +221,41 @@ fn mnt(
     data: Option<&str>,
 ) -> nix::Result<()> {
     mount(src, target, fstype, flags, data)
+}
+
+// linux/loop.h ioctl 常數。
+const LOOP_SET_FD: u64 = 0x4C00;
+const LOOP_CTL_GET_FREE: u64 = 0x4C82;
+
+/// 把 squashfs 檔綁到一個 free loop 裝置，回傳其 `/dev/loopN` 路徑（唯讀：backing 以
+/// `O_RDONLY` 開，loop 因而為唯讀）。kernel 需 `CONFIG_BLK_DEV_LOOP`。VM ephemeral，
+/// 不需手動 `LOOP_CLR_FD`（關機即釋放）。
+fn setup_loop(sqfs: &Path) -> Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    let backing = std::fs::File::open(sqfs)
+        .with_context(|| format!("failed to open GUI overlay {}", sqfs.display()))?;
+    let ctl = std::fs::File::open("/dev/loop-control").context(
+        "failed to open /dev/loop-control (the appliance kernel needs CONFIG_BLK_DEV_LOOP)",
+    )?;
+    let num = unsafe { libc::ioctl(ctl.as_raw_fd(), LOOP_CTL_GET_FREE as _) };
+    if num < 0 {
+        return Err(std::io::Error::last_os_error()).context("LOOP_CTL_GET_FREE ioctl failed");
+    }
+    let loop_path = PathBuf::from(format!("/dev/loop{num}"));
+    // loop 節點以 O_RDWR 開（losetup 慣例，LOOP_SET_FD 相容性較廣）；唯讀性由 backing 的
+    // O_RDONLY 決定（kernel 讓 loop 繼承 backing 的唯讀屬性），故實際仍是唯讀 loop。
+    let loopdev = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&loop_path)
+        .with_context(|| format!("failed to open {}", loop_path.display()))?;
+    let r = unsafe { libc::ioctl(loopdev.as_raw_fd(), LOOP_SET_FD as _, backing.as_raw_fd()) };
+    if r < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("LOOP_SET_FD on {} failed", loop_path.display()));
+    }
+    // LOOP_SET_FD 後 kernel 已持有 backing 檔參考；backing/loopdev fd 於此可關（loop 綁定持續）。
+    Ok(loop_path)
 }
 
 /// 啟動 udevd 並 trigger 一輪裝置事件（best-effort：udev 缺失時 wlroots 多半仍可
