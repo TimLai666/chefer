@@ -33,7 +33,7 @@ you can "cook" your containerized application into a portable single-file app, m
 | **Internal networking** (services reach each other via `127.0.0.1:<port>`) | ✅ | ✅ | 🔧 |
 | **Host port mapping — TCP** (`"host:guest"`, host≠guest proxied) | ✅ | ✅ verified | 🔧 |
 | **Host port mapping — UDP** | ✅ | ✅ verified — Chefer relays via the VM IP + an in-VM eth0→loopback bridge (WSL2's own forwarding is TCP-only) | 🔧 |
-| **GUI services** | ✅ X11 / Wayland socket passthrough | ✅ WSL2 via WSLg ([gui-demo](examples/gui-demo)); **✅ WHP (no WSL)** — bundle-embedded `cage` compositor on a virtio-gpu scanout shown in a native window, with keyboard/mouse + bidirectional clipboard (text + PNG images; software-rendered; validated on real hardware, image round-trip E2E pending) | 🔧 (same guest path, real-Mac VZ pending) |
+| **GUI services** | ✅ X11 / Wayland socket passthrough | ✅ WSL2 via WSLg ([gui-demo](examples/gui-demo)); **✅ WHP (no WSL)** — bundle-embedded `cage` compositor on a virtio-gpu scanout shown in a native window, with keyboard/mouse + bidirectional clipboard (text validated bidirectionally on real hardware; PNG images via the `PNG` format / `CF_DIB`, host read/convert path verified via `--clip-selftest`) | 🔧 (same guest path, real-Mac VZ pending) |
 | **`crash: fail_fast`** (any non-zero exit tears down the app, code propagated) | ✅ | ✅ verified | 🔧 |
 | **Data-dir migration** (`old_names`) | ✅ | ✅ | 🔧 |
 | **Official chown/gosu images** (redis, postgres, …) | ✅ as root (no userns); ✅ rootless via `/etc/subuid` + `newuidmap` (falls back to single-uid without them) | ✅ verified — distro runs as real root, runs official redis/postgres as-is | 🔧 |

@@ -280,9 +280,10 @@ fn render_manifest_summary(
             ColumnConstraint::Absolute(Width::Percentage(13)), // Layers
             ColumnConstraint::Absolute(Width::Percentage(10)), // Persist
             ColumnConstraint::Absolute(Width::Percentage(13)), // Ports
-            ColumnConstraint::Absolute(Width::Percentage(15)), // Mounts
+            ColumnConstraint::Absolute(Width::Percentage(9)),  // Mounts
             ColumnConstraint::Absolute(Width::Percentage(10)), // Depends
             ColumnConstraint::Absolute(Width::Percentage(8)),  // Health
+            ColumnConstraint::Absolute(Width::Percentage(6)),  // GPU
         ]);
     t.set_header(vec![
         Cell::new("Service")
@@ -312,6 +313,9 @@ fn render_manifest_summary(
         Cell::new("Health")
             .add_attribute(Attribute::Bold)
             .fg(Color::Green),
+        Cell::new("GPU")
+            .add_attribute(Attribute::Bold)
+            .fg(Color::Green),
     ]);
 
     for svc in &m.services {
@@ -333,6 +337,11 @@ fn render_manifest_summary(
                 "yes"
             } else {
                 "no"
+            }),
+            Cell::new(if svc.gpu { "yes" } else { "no" }).fg(if svc.gpu {
+                Color::Green
+            } else {
+                Color::Reset
             }),
         ]);
     }
