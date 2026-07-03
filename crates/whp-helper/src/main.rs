@@ -1227,6 +1227,12 @@ mod whp_api {
             if self.gpu.take_dirty()
                 && let Some((px, w, h, fmt)) = self.gpu.scanout()
             {
+                if std::env::var_os("CHEFER_WHP_TRACE_GPU").is_some() {
+                    eprintln!(
+                        "[whp-gpu] scanout flush {w}x{h} fmt={fmt} ({} bytes)",
+                        px.len()
+                    );
+                }
                 self.frame.update(px, w, h, fmt);
             }
             if used_any {

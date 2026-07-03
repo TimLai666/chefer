@@ -31,6 +31,15 @@ const REG_QUEUE_DRIVER_LOW: u64 = 0x090; // avail ring
 const REG_QUEUE_DRIVER_HIGH: u64 = 0x094;
 const REG_QUEUE_DEVICE_LOW: u64 = 0x0a0; // used ring
 const REG_QUEUE_DEVICE_HIGH: u64 = 0x0a4;
+// shared-memory region 視窗（virtio spec §4.2.2；virtio-gpu 的 host-visible region 查詢）。
+// 我們不提供任何 SHM region：SHMSel 寫入後，SHMLen 讀 0xFFFFFFFF（len=-1=不存在），
+// driver 便跳過 host-visible 路徑（否則 virtio-gpu probe 會因「Could not reserve host
+// visible region」失敗 -EBUSY）。
+const REG_SHM_SEL: u64 = 0x0ac;
+const REG_SHM_LEN_LOW: u64 = 0x0b0;
+const REG_SHM_LEN_HIGH: u64 = 0x0b4;
+const REG_SHM_BASE_LOW: u64 = 0x0b8;
+const REG_SHM_BASE_HIGH: u64 = 0x0bc;
 const REG_CONFIG_GENERATION: u64 = 0x0fc;
 const REG_CONFIG_START: u64 = 0x100;
 
@@ -123,6 +132,10 @@ impl Mmio {
             REG_QUEUE_READY => self.current_queue().map(|q| q.ready as u32).unwrap_or(0),
             REG_INTERRUPT_STATUS => self.interrupt_status,
             REG_STATUS => self.status,
+            // 不存在的 SHM region：len 全 1（= u64 -1），base 全 1。driver 據此跳過。
+            REG_SHM_LEN_LOW | REG_SHM_LEN_HIGH | REG_SHM_BASE_LOW | REG_SHM_BASE_HIGH => {
+                0xFFFF_FFFF
+            }
             REG_CONFIG_GENERATION => self.config_generation,
             _ => 0,
         }
@@ -348,5 +361,17 @@ mod tests {
                 value: 0x55,
             }
         );
+    }
+
+    #[test]
+    fn shm_region_reads_as_nonexistent() {
+        // virtio-gpu 查 host-visible SHM region：SHMLen/Base 須讀全 1（len=-1=不存在），
+        // 否則 driver 會嘗試 reserve 一塊不存在的 region 而 probe 失敗（-EBUSY）。
+        let mut m = blk();
+        assert_eq!(m.write(REG_SHM_SEL, 0), MmioAction::None); // 選 shmid 0：no-op
+        assert_eq!(m.read(REG_SHM_LEN_LOW), 0xFFFF_FFFF);
+        assert_eq!(m.read(REG_SHM_LEN_HIGH), 0xFFFF_FFFF);
+        assert_eq!(m.read(REG_SHM_BASE_LOW), 0xFFFF_FFFF);
+        assert_eq!(m.read(REG_SHM_BASE_HIGH), 0xFFFF_FFFF);
     }
 }
