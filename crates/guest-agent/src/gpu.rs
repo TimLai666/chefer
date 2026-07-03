@@ -12,9 +12,9 @@
 //! 未必與 host kernel module 相符，故不能用 image 的。WSL2 則靠 `/usr/lib/wsl/lib`（WSL
 //! 已備相符 libs）免此步。
 //!
-//! **soname**：每個 `libX.so.<ver>` 以多重 bind mount 綁到 versioned + `libX.so.1`（soname，
-//! 執行期 DT_NEEDED 用）+ `libX.so`（dev/dlopen 用）三個容器路徑，取代在容器內建 symlink。
-//! ABI major 假設為 1（涵蓋 CUDA/NVML/compute 常見情形；讀 DT_SONAME 精準化列後續）。
+//! **soname**：每個 `libX.so.<ver>` 以多重 bind mount 綁到 versioned + 真實 **DT_SONAME**
+//! （直接解析 ELF 讀出，如 `libcuda.so.1`；讀不到才退回 `libX.so.1` 假設）+ `libX.so`
+//! （dev/dlopen 用）三個容器路徑，取代在容器內建 symlink。
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -108,7 +108,8 @@ fn parse_nvidia_version(proc_text: &str) -> Option<String> {
 }
 
 /// 找 host 上與 driver 版本相符的 NVIDIA userspace libs（`libcuda`/`libnvidia-*` 且以
-/// `.so.<version>` 結尾），每個綁到容器 `stage` 下的 versioned + `.so.1` + `.so` 三個名字。
+/// `.so.<version>` 結尾），每個綁到容器 `stage` 下的 versioned + soname + `.so`（dev）名字。
+/// soname 優先讀 ELF 的 DT_SONAME（精確），讀不到才退回 `libX.so.1`（ABI major 假設 1）。
 fn nvidia_lib_binds(lib_dirs: &[PathBuf], version: &str, stage: &str) -> Vec<GpuBind> {
     let suffix = format!(".so.{version}");
     let mut binds = Vec::new();
@@ -130,7 +131,14 @@ fn nvidia_lib_binds(lib_dirs: &[PathBuf], version: &str, stage: &str) -> Vec<Gpu
                 continue;
             }
             let host = e.path();
-            for guest_name in [fname.clone(), format!("{base}.so.1"), format!("{base}.so")] {
+            // 真實 DT_SONAME（如 libcuda.so.1）；讀不到（空檔/非 ELF）則退回 .so.1 假設。
+            let soname = read_soname(&host).unwrap_or_else(|| format!("{base}.so.1"));
+            // versioned + soname + dev(.so)；去重（soname 可能等於 versioned）。
+            let mut names: BTreeSet<String> = BTreeSet::new();
+            names.insert(fname.clone());
+            names.insert(soname);
+            names.insert(format!("{base}.so"));
+            for guest_name in names {
                 binds.push(GpuBind {
                     host: host.clone(),
                     guest: format!("{stage}/{guest_name}"),
@@ -141,6 +149,85 @@ fn nvidia_lib_binds(lib_dirs: &[PathBuf], version: &str, stage: &str) -> Vec<Gpu
         }
     }
     binds
+}
+
+fn u16_le(b: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes([b[off], b[off + 1]])
+}
+fn u32_le(b: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+}
+fn u64_le(b: &[u8], off: usize) -> u64 {
+    let mut a = [0u8; 8];
+    a.copy_from_slice(&b[off..off + 8]);
+    u64::from_le_bytes(a)
+}
+
+/// 讀 ELF64-LE 共享物件的 `DT_SONAME`（如 `libcuda.so.1`）。非 ELF64-LE / 無 SONAME → None。
+/// 只 seek+read 需要的區段（不整檔載入；NVIDIA libs 可達數十 MB）。
+fn read_soname(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut hdr = [0u8; 64]; // ELF64 header
+    f.read_exact(&mut hdr).ok()?;
+    if &hdr[0..4] != b"\x7fELF" || hdr[4] != 2 || hdr[5] != 1 {
+        return None; // 只支援 ELF64 little-endian（x86_64 / aarch64 皆是）
+    }
+    let e_phoff = u64_le(&hdr, 32);
+    let e_phentsize = u16_le(&hdr, 54) as usize;
+    let e_phnum = u16_le(&hdr, 56) as usize;
+    if e_phentsize < 56 || e_phnum == 0 || e_phnum > 4096 {
+        return None;
+    }
+    let mut ph = vec![0u8; e_phentsize * e_phnum];
+    f.seek(SeekFrom::Start(e_phoff)).ok()?;
+    f.read_exact(&mut ph).ok()?;
+    let mut dynamic: Option<(u64, u64)> = None; // (offset, filesz)
+    let mut loads: Vec<(u64, u64, u64)> = Vec::new(); // (vaddr, offset, filesz)
+    for i in 0..e_phnum {
+        let b = &ph[i * e_phentsize..];
+        match u32_le(b, 0) {
+            2 => dynamic = Some((u64_le(b, 8), u64_le(b, 32))), // PT_DYNAMIC
+            1 => loads.push((u64_le(b, 16), u64_le(b, 8), u64_le(b, 32))), // PT_LOAD
+            _ => {}
+        }
+    }
+    let (doff, dsize) = dynamic?;
+    if dsize == 0 || dsize > (1 << 20) {
+        return None;
+    }
+    let mut dyn_buf = vec![0u8; dsize as usize];
+    f.seek(SeekFrom::Start(doff)).ok()?;
+    f.read_exact(&mut dyn_buf).ok()?;
+    let mut soname_off: Option<u64> = None;
+    let mut strtab_vaddr: Option<u64> = None;
+    let mut i = 0;
+    while i + 16 <= dyn_buf.len() {
+        let d_tag = i64::from_le_bytes(dyn_buf[i..i + 8].try_into().ok()?);
+        let d_val = u64_le(&dyn_buf, i + 8);
+        match d_tag {
+            0 => break,                      // DT_NULL
+            14 => soname_off = Some(d_val),  // DT_SONAME（strtab 內偏移）
+            5 => strtab_vaddr = Some(d_val), // DT_STRTAB（虛擬位址）
+            _ => {}
+        }
+        i += 16;
+    }
+    let soname_off = soname_off?;
+    let strtab_vaddr = strtab_vaddr?;
+    // strtab 虛擬位址 → 檔內偏移（找涵蓋它的 PT_LOAD）。
+    let strtab_off = loads.iter().find_map(|(v, o, sz)| {
+        (strtab_vaddr >= *v && strtab_vaddr < v.checked_add(*sz)?).then(|| o + (strtab_vaddr - v))
+    })?;
+    let name_off = strtab_off.checked_add(soname_off)?;
+    f.seek(SeekFrom::Start(name_off)).ok()?;
+    let mut nbuf = [0u8; 256];
+    let n = f.read(&mut nbuf).ok()?;
+    let end = nbuf[..n].iter().position(|&b| b == 0).unwrap_or(n);
+    if end == 0 {
+        return None;
+    }
+    std::str::from_utf8(&nbuf[..end]).ok().map(str::to_string)
 }
 
 /// 供測試注入 dev 目錄與 wsl lib 目錄；只依「存在性」判斷（不檢查 device 型別，
@@ -304,6 +391,65 @@ mod tests {
         assert_eq!(binds.len(), 9);
         assert!(binds.iter().all(|b| b.read_only && !b.is_dir));
 
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 造一個最小 ELF64-LE 共享物件，其 `DT_SONAME` = `soname`（PT_LOAD 讓 vaddr==offset）。
+    fn crafted_elf_with_soname(soname: &str) -> Vec<u8> {
+        let dyn_off = 176u64;
+        let strtab_off = 224u64;
+        let mut strtab = vec![0u8]; // 前導 NUL
+        strtab.extend_from_slice(soname.as_bytes());
+        strtab.push(0);
+        let total = strtab_off as usize + strtab.len();
+        let mut buf = vec![0u8; total];
+        buf[0..4].copy_from_slice(b"\x7fELF");
+        buf[4] = 2; // ELF64
+        buf[5] = 1; // little-endian
+        buf[16..18].copy_from_slice(&3u16.to_le_bytes()); // e_type ET_DYN
+        buf[18..20].copy_from_slice(&0x3eu16.to_le_bytes()); // e_machine x86_64
+        buf[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version
+        buf[32..40].copy_from_slice(&64u64.to_le_bytes()); // e_phoff
+        buf[52..54].copy_from_slice(&64u16.to_le_bytes()); // e_ehsize
+        buf[54..56].copy_from_slice(&56u16.to_le_bytes()); // e_phentsize
+        buf[56..58].copy_from_slice(&2u16.to_le_bytes()); // e_phnum
+        // PH0 PT_LOAD @64：offset 0 / vaddr 0 / filesz total → vaddr==檔內偏移。
+        let p0 = 64usize;
+        buf[p0..p0 + 4].copy_from_slice(&1u32.to_le_bytes());
+        buf[p0 + 4..p0 + 8].copy_from_slice(&5u32.to_le_bytes());
+        buf[p0 + 32..p0 + 40].copy_from_slice(&(total as u64).to_le_bytes());
+        buf[p0 + 40..p0 + 48].copy_from_slice(&(total as u64).to_le_bytes());
+        // PH1 PT_DYNAMIC @120。
+        let p1 = 120usize;
+        buf[p1..p1 + 4].copy_from_slice(&2u32.to_le_bytes());
+        buf[p1 + 8..p1 + 16].copy_from_slice(&dyn_off.to_le_bytes());
+        buf[p1 + 16..p1 + 24].copy_from_slice(&dyn_off.to_le_bytes());
+        buf[p1 + 32..p1 + 40].copy_from_slice(&48u64.to_le_bytes());
+        buf[p1 + 40..p1 + 48].copy_from_slice(&48u64.to_le_bytes());
+        // dynamic @176：DT_SONAME(14, off=1), DT_STRTAB(5, vaddr=224), DT_NULL(0,0)。
+        let put = |buf: &mut [u8], idx: usize, tag: i64, val: u64| {
+            let o = dyn_off as usize + idx * 16;
+            buf[o..o + 8].copy_from_slice(&tag.to_le_bytes());
+            buf[o + 8..o + 16].copy_from_slice(&val.to_le_bytes());
+        };
+        put(&mut buf, 0, 14, 1);
+        put(&mut buf, 1, 5, strtab_off);
+        put(&mut buf, 2, 0, 0);
+        buf[strtab_off as usize..].copy_from_slice(&strtab);
+        buf
+    }
+
+    #[test]
+    fn reads_dt_soname_from_elf() {
+        let base = std::env::temp_dir().join(format!("chefer-soname-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let p = base.join("libcuda.so.535.183.01");
+        std::fs::write(&p, crafted_elf_with_soname("libcuda.so.1")).unwrap();
+        assert_eq!(read_soname(&p).as_deref(), Some("libcuda.so.1"));
+        // 非 ELF / 空檔 → None（呼叫端 fallback 到 .so.1）。
+        let q = base.join("notelf");
+        std::fs::write(&q, b"not an elf").unwrap();
+        assert_eq!(read_soname(&q), None);
         std::fs::remove_dir_all(&base).ok();
     }
 }
