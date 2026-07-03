@@ -6,7 +6,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use appcipe_spec::{
-    AppCipe, Cmd, ImageFormat, ImagePlatform, ImageSourceOrPath, ImageSourceType, Service,
+    AppCipe, Cmd, ImageFormat, ImagePlatform, ImageSourceOrPath, ImageSourceType, InterfaceMode,
+    Service,
 };
 use chefer_bundle::{CmdSpec, Manifest, layout};
 use chefer_pack::{PackOptions, pack};
@@ -665,4 +666,117 @@ fn pack_refuses_dirty_output_without_clean() {
     opts.clean = true;
     let res = pack(&app, &opts).unwrap();
     assert!(!res.bundle_dir.join("stale.bin").exists());
+}
+
+// ---- GUI overlay 嵌入規則（DESIGN §6「GUI overlay 打包契約」）----
+// 規則：app 有任一 gui/both 服務 × target 為 Windows/macOS → 嵌入 vm/chefer-gui-overlay-<arch>.tar.zst；
+// 其餘組合一律不嵌；kit 缺 overlay 只警告不擋 build。
+
+fn gui_kit(tmp: &Path, arch: &str, with_overlay: bool) -> PathBuf {
+    let kit_dir = tmp.join("kit");
+    std::fs::create_dir_all(&kit_dir).unwrap();
+    std::fs::write(kit_dir.join(format!("guest-agent-{arch}")), b"fake-agent").unwrap();
+    std::fs::write(
+        kit_dir.join(format!("chefer-vmlinuz-{arch}")),
+        b"fake-kernel",
+    )
+    .unwrap();
+    std::fs::write(
+        kit_dir.join(format!("chefer-initramfs-{arch}")),
+        b"fake-ird",
+    )
+    .unwrap();
+    if with_overlay {
+        std::fs::write(
+            kit_dir.join(layout::gui_overlay_name(arch)),
+            b"fake-gui-overlay",
+        )
+        .unwrap();
+    }
+    kit_dir
+}
+
+fn pack_gui_case(
+    tmp: &Path,
+    interface_mode: InterfaceMode,
+    target: &str,
+    with_overlay: bool,
+) -> PathBuf {
+    let (image_tar, _) = build_docker_archive(tmp, "linux", "amd64", None);
+    let kit_dir = gui_kit(tmp, "x86_64", with_overlay);
+    let mut svc = make_service(ImageSourceOrPath::TarPath(
+        image_tar.to_string_lossy().to_string(),
+    ));
+    svc.interface_mode = interface_mode;
+    let app = make_app("GuiOverlayApp", vec![("ui", svc)]);
+    let out = tmp.join("out");
+    let mut opts = default_opts(&out);
+    opts.kit_dirs = vec![kit_dir];
+    opts.target_triples = vec![target.to_string()];
+    let res = pack(&app, &opts).unwrap();
+    layout::vm_dir(&res.bundle_dir).join(layout::gui_overlay_name("x86_64"))
+}
+
+#[test]
+fn gui_overlay_embedded_for_gui_service_on_windows_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let overlay = pack_gui_case(
+        tmp.path(),
+        InterfaceMode::Gui,
+        "x86_64-pc-windows-msvc",
+        true,
+    );
+    assert_eq!(std::fs::read(&overlay).unwrap(), b"fake-gui-overlay");
+}
+
+#[test]
+fn gui_overlay_embedded_for_both_service_on_macos_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let overlay = pack_gui_case(tmp.path(), InterfaceMode::Both, "x86_64-apple-darwin", true);
+    assert_eq!(std::fs::read(&overlay).unwrap(), b"fake-gui-overlay");
+}
+
+#[test]
+fn gui_overlay_not_embedded_without_gui_service() {
+    let tmp = tempfile::tempdir().unwrap();
+    let overlay = pack_gui_case(
+        tmp.path(),
+        InterfaceMode::None,
+        "x86_64-pc-windows-msvc",
+        true,
+    );
+    assert!(
+        !overlay.exists(),
+        "純 server app 不得揹 GUI overlay 體積：{}",
+        overlay.display()
+    );
+}
+
+#[test]
+fn gui_overlay_not_embedded_for_linux_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let overlay = pack_gui_case(
+        tmp.path(),
+        InterfaceMode::Gui,
+        "x86_64-unknown-linux-musl",
+        true,
+    );
+    assert!(
+        !overlay.exists(),
+        "Linux target（原生後端有 host compositor）不得嵌 overlay：{}",
+        overlay.display()
+    );
+}
+
+#[test]
+fn gui_overlay_missing_in_kit_warns_but_does_not_fail() {
+    let tmp = tempfile::tempdir().unwrap();
+    // kit 沒有 overlay：pack 必須成功（警告即可），且 vm/ 沒有 overlay 檔。
+    let overlay = pack_gui_case(
+        tmp.path(),
+        InterfaceMode::Gui,
+        "x86_64-pc-windows-msvc",
+        false,
+    );
+    assert!(!overlay.exists());
 }

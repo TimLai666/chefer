@@ -152,6 +152,11 @@ if [ -n "$guest_ip" ]; then
   report "CHEFER_GUEST_IP=${guest_ip}"
 fi
 
+# VM 內沒有 host compositor：標記給 guest-agent，讓它對 gui/both 服務啟動
+# bundle 內嵌 GUI overlay 的 cage compositor（見 guest-agent/src/gui.rs）。
+# 原生 Linux / WSL2 不經此 init，不受影響。
+export CHEFER_VM_GUI=1
+
 # --udp-bridge：VM 內補起 UDP 埠的 eth0→loopback 橋接（無 UDP 埠時為 no-op）。
 # host 端（macOS vz）的 UDP relay 待實機實作；guest 側先就緒。
 set +e

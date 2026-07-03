@@ -16,6 +16,8 @@ pub mod whiteout;
 #[cfg(target_os = "linux")]
 pub mod exec;
 #[cfg(target_os = "linux")]
+pub mod gui;
+#[cfg(target_os = "linux")]
 pub mod health;
 #[cfg(target_os = "linux")]
 pub mod netns;
@@ -98,6 +100,12 @@ mod linux_impl {
         let order = chefer_bundle::topo_sort(&manifest.services)?;
 
         validate_services(&order)?;
+
+        // VM guest 的 GUI 環境（init 設 CHEFER_VM_GUI=1 且有 gui/both 服務才啟動）：
+        // 解 GUI overlay、起 cage/Xwayland，並設好 DISPLAY/WAYLAND_DISPLAY/XDG_RUNTIME_DIR
+        // 供下方 exec 的既有 GUI socket bind 邏輯使用。_gui_session 存活至函式結束
+        //（Drop 收掉 compositor）。必須在服務 spawn 前完成（env + socket 先就緒）。
+        let _gui_session = crate::gui::maybe_start(&cfg.bundle_dir, &manifest)?;
 
         // 網路模式：shared 沿用共享 netns（現況）；internal/bridge 建立 per-app netns。
         // bridge 另起 pasta 提供出網（找不到 pasta 則退化為 internal，由 setup_app_netns 印訊息）。
