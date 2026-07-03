@@ -101,6 +101,7 @@ mod tests {
                 interface_mode: *m,
                 depends_on: vec![],
                 healthcheck: None,
+                gpu: false,
             })
             .collect();
         Manifest {

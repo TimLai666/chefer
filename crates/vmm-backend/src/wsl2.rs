@@ -133,7 +133,10 @@ fn run_in_distro(ctx: &AppRunContext, distro: &str, agent_bytes: &[u8]) -> Resul
         .arg("--cache")
         .arg("/var/lib/chefer/cache")
         // VM 內補起 UDP 埠的 eth0→loopback 橋接（無 UDP 埠時於 guest 內為 no-op）
-        .arg("--udp-bridge");
+        .arg("--udp-bridge")
+        // WSL2 可觸及 host GPU（/dev/dxg + /usr/lib/wsl/lib）：允許 opt-in GPU passthrough。
+        // 服務未宣告 gpu 時為 no-op；WHP/vz 的 appliance init 不帶此旗標。
+        .arg("--gpu-host");
     if ctx.opts.keep_tmp {
         cmd.arg("--keep-rootfs");
     }

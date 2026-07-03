@@ -55,6 +55,8 @@ impl ExecBackend for NamespacesBackend {
             // 原生 Linux 共享 netns：UDP 埠以 loopback 直接生效，不啟用 VM 內橋接
             // （啟用會綁 eth0/LAN IP，等同把服務暴露到區網）。
             udp_bridge: false,
+            // 原生 Linux 直接觸及 host GPU：允許 opt-in per-service GPU passthrough。
+            gpu_host: true,
         })
     }
 }

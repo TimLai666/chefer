@@ -18,6 +18,8 @@ pub mod clipboard;
 #[cfg(target_os = "linux")]
 pub mod exec;
 #[cfg(target_os = "linux")]
+pub mod gpu;
+#[cfg(target_os = "linux")]
 pub mod gui;
 #[cfg(target_os = "linux")]
 pub mod health;
@@ -47,6 +49,11 @@ pub struct RunConfig {
     /// 橋接（因 wslrelay/VZ NAT 不轉 UDP）。原生 Linux namespaces 後端必須為 false
     /// ——共享 netns 下直接以 loopback 生效，且綁 LAN IP 會把服務暴露到區網。
     pub udp_bridge: bool,
+    /// 此後端能否對容器做 GPU passthrough（見 docs/DESIGN.md「GPU passthrough」）。
+    /// **只有能實際觸及 host GPU 的後端為 true**：原生 Linux（namespaces）與 Windows
+    /// WSL2。WHP / macOS VM 的 appliance 為 false（裸 VM 無 GPU-PV）。`gpu: true` 的服務
+    /// 在 false 的後端會於啟動時收到明確錯誤，而非靜默失敗或綁到 virtio-gpu 的 2D 節點。
+    pub gpu_host: bool,
 }
 
 /// 讀取 bundle 內的 manifest.json（含可行動的錯誤訊息）。
@@ -205,6 +212,7 @@ mod linux_impl {
             &cfg.data_dir,
             app_net.as_ref(),
             &manifest,
+            cfg.gpu_host,
         );
 
         // app 結束：收掉 netns holder（釋放 app netns）。
@@ -309,6 +317,7 @@ mod tests {
             cache_dir: None,
             keep_rootfs: false,
             udp_bridge: false,
+            gpu_host: false,
         };
         let err = run_bundle(&cfg).unwrap_err();
         assert!(format!("{err}").contains("can only run in a Linux"));

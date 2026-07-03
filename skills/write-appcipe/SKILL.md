@@ -80,6 +80,7 @@ service 名規則：`[a-z][a-z0-9_]*`，≤32。
   - `interval`（預設 `2s`）、`timeout`（預設 `5s`）、`start_period`（預設 `0s`）：接受 `<n>ms`/`<n>s`/`<n>m` 或裸整數（秒）。
   - `retries`（預設 `10`）：連續失敗幾次（扣除 start_period 寬限）才算 unhealthy → **fail_fast 拆掉整個 app**。
   - 啟動目前**序列化**：一個服務的 healthcheck 會擋住其後所有服務（含不相依者），通常無感；之後會改成只擋實際 dependents。
+- **`gpu`**（選填，布林，預設 `false`）：opt-in GPU passthrough。開 `gpu: true` → guest-agent 把 host 既有的 GPU 裝置節點（`/dev/dri`、`/dev/nvidia*`、WSL2 的 `/dev/dxg`）與 WSL2 的驅動 libs（`/usr/lib/wsl/lib`）bind 進**這個服務**的容器 → CUDA/OpenCL/Vulkan 計算與硬體算繪。**只在原生 Linux 與 Windows WSL2 後端可行**；Windows WHP micro-VM 與 macOS VM 拿不到 host GPU → 服務啟動時明確報錯（非靜默）。原生 Linux 首版只綁節點，image 需自帶與 host 驅動相符的 userspace libs（WSL2 則由 `/usr/lib/wsl/lib` 提供、免自帶）。**只給真的需要 GPU 的服務開**（其餘服務維持隔離）。
 
 ## 內部網路與「不對外暴露」（重要、實測過）
 

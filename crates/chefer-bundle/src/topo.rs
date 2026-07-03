@@ -93,6 +93,7 @@ mod tests {
             interface_mode: InterfaceMode::None,
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             healthcheck: None,
+            gpu: false,
         }
     }
 

@@ -73,6 +73,11 @@ pub struct ServiceEntry {
     /// 選填健康檢查；驅動 depends_on 的 wait-until-ready（見 docs/DESIGN.md「健康檢查」）。
     #[serde(default)]
     pub healthcheck: Option<HealthCheck>,
+    /// opt-in GPU passthrough（見 docs/DESIGN.md「GPU passthrough」節）。舊 bundle 無此欄位 →
+    /// 反序列化為 `false`。guest-agent 依此決定是否把 host GPU 節點 bind 進此服務容器
+    /// （僅原生 Linux / WSL2 後端；WHP/vz 回明確錯誤）。
+    #[serde(default)]
+    pub gpu: bool,
 }
 
 /// 服務健康檢查（runtime 端解讀）。duration 一律已正規化為毫秒。
@@ -274,6 +279,7 @@ mod tests {
             interface_mode: InterfaceMode::None,
             depends_on: vec![],
             healthcheck: None,
+            gpu: false,
         }
     }
 
