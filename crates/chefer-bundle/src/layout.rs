@@ -52,12 +52,12 @@ pub fn vm_dir(bundle_dir: &Path) -> PathBuf {
     bundle_dir.join("vm")
 }
 
-/// GUI overlay（cage + Xwayland + Mesa 的 rootfs subtree，tar.zst）的檔名
-/// （arch ∈ "x86_64", "aarch64"）。放 `vm/`；只在「app 有 gui/both 服務且 target 為
-/// Windows/macOS」時嵌入（DESIGN §6「GUI overlay 打包契約」）。VM 內由 guest-agent
-/// 解到 tmpfs 根、對介面服務啟動 cage 提供顯示。
+/// GUI overlay（cage + Xwayland + Mesa 的 rootfs subtree，**squashfs**，zstd 壓縮）的
+/// 檔名（arch ∈ "x86_64", "aarch64"）。放 `vm/`；只在「app 有 gui/both 服務且 target 為
+/// Windows/macOS」時嵌入（DESIGN §6「GUI overlay 打包契約」）。VM 內由 guest-agent 以
+/// 唯讀掛載 + overlayfs 疊上 tmpfs 根（免每次開機解壓），對介面服務啟動 cage 提供顯示。
 pub fn gui_overlay_name(arch: &str) -> String {
-    format!("chefer-gui-overlay-{arch}.tar.zst")
+    format!("chefer-gui-overlay-{arch}.sqfs")
 }
 
 /// 預編 Linux kernel 的檔名（arch ∈ "x86_64", "aarch64"）。

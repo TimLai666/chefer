@@ -3,10 +3,11 @@ set -Eeuo pipefail
 
 # 建置 Chefer 的 GUI overlay（DESIGN §6「GUI overlay 打包契約」）：
 # cage（kiosk Wayland compositor）+ Xwayland + Mesa(llvmpipe) + eudev 及其依賴閉包，
-# 打成 rootfs subtree 的 tar.zst。appliance init 於開機時把它解到 tmpfs 根，
-# guest-agent 便能對 gui/both 服務啟動 cage 提供顯示（WHP/vz 共用）。
+# 打成 rootfs subtree 的 **squashfs**（zstd 壓縮）。guest-agent 於開機時把它唯讀掛載並以
+# overlayfs 疊上 VM 的 tmpfs 根（免每次開機解壓 200MB+），便能對 gui/both 服務啟動 cage
+# 提供顯示（WHP/vz 共用）。kernel 需 CONFIG_SQUASHFS + CONFIG_SQUASHFS_ZSTD（見 appliance）。
 #
-# 產物：<out>/chefer-gui-overlay-<arch>.tar.zst（+ .sha256）。
+# 產物：<out>/chefer-gui-overlay-<arch>.sqfs（+ .sha256）。
 # 與 build-pasta.sh 一致：Docker + Alpine（musl 基底、與 appliance busybox 相容），
 # --platform 取得跨架構。以 `apk --root` 安裝到乾淨 staging，得到完整依賴閉包。
 
@@ -79,7 +80,7 @@ main() {
     -v "$out_dir:/out" \
     "$container" \
     sh -eu -c '
-      apk add --no-cache zstd >/dev/null
+      apk add --no-cache squashfs-tools >/dev/null
       root=/overlay
       mkdir -p "$root"
       apk add --root "$root" --initdb --no-cache \
@@ -98,14 +99,17 @@ main() {
       # overlay 會解到 appliance 的 tmpfs 根：不得帶入會蓋掉 /init 或裝置節點的內容。
       rm -rf "$root/init" "$root/dev" "$root/proc" "$root/sys"
       du -sh "$root" >&2
-      ( cd "$root" && tar -cf - . ) | zstd -19 -T0 -f -o "/out/chefer-gui-overlay-${OUT_ARCH}.tar.zst"
-      ls -lh "/out/chefer-gui-overlay-${OUT_ARCH}.tar.zst" >&2
+      # squashfs（zstd）：唯讀、可直接掛載、免每次開機解壓。-all-root 讓檔案屬 root
+      # （overlay lowerdir 用）；-noappend 覆寫；kernel 需 CONFIG_SQUASHFS_ZSTD 才解得開。
+      mksquashfs "$root" "/out/chefer-gui-overlay-${OUT_ARCH}.sqfs" \
+        -comp zstd -noappend -all-root -no-progress >&2
+      ls -lh "/out/chefer-gui-overlay-${OUT_ARCH}.sqfs" >&2
     '
 
-  [[ -f "$out_dir/chefer-gui-overlay-$arch.tar.zst" ]] \
-    || die "建置後找不到產物：$out_dir/chefer-gui-overlay-$arch.tar.zst"
-  ( cd "$out_dir" && sha256sum "chefer-gui-overlay-$arch.tar.zst" > "SHA256SUMS-gui-overlay-$arch" )
-  note "完成：$out_dir/chefer-gui-overlay-$arch.tar.zst"
+  [[ -f "$out_dir/chefer-gui-overlay-$arch.sqfs" ]] \
+    || die "建置後找不到產物：$out_dir/chefer-gui-overlay-$arch.sqfs"
+  ( cd "$out_dir" && sha256sum "chefer-gui-overlay-$arch.sqfs" > "SHA256SUMS-gui-overlay-$arch" )
+  note "完成：$out_dir/chefer-gui-overlay-$arch.sqfs"
 }
 
 main "$@"

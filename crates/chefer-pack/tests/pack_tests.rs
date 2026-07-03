@@ -693,7 +693,7 @@ fn pack_refuses_dirty_output_without_clean() {
 }
 
 // ---- GUI overlay 嵌入規則（DESIGN §6「GUI overlay 打包契約」）----
-// 規則：app 有任一 gui/both 服務 × target 為 Windows/macOS → 嵌入 vm/chefer-gui-overlay-<arch>.tar.zst；
+// 規則：app 有任一 gui/both 服務 × target 為 Windows/macOS → 嵌入 vm/chefer-gui-overlay-<arch>.sqfs；
 // 其餘組合一律不嵌；kit 缺 overlay 只警告不擋 build。
 
 fn gui_kit(tmp: &Path, arch: &str, with_overlay: bool) -> PathBuf {

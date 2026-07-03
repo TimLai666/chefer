@@ -3,9 +3,10 @@
 //! 原生 Linux / WSL2 走「bind host compositor socket」路線（exec.rs 既有邏輯）；
 //! micro-VM（WHP / vz）內沒有 host compositor——由本模組在 guest 內自建：
 //!
-//! 1. 解壓 bundle `vm/chefer-gui-overlay-<arch>.tar.zst`（cage + Xwayland + Mesa
-//!    llvmpipe + eudev 及依賴閉包，Alpine 基底）到根（appliance init 已 switch_root
-//!    到 tmpfs 根，可直接疊上）。
+//! 1. 唯讀掛載 bundle `vm/chefer-gui-overlay-<arch>.sqfs`（squashfs：cage + Xwayland +
+//!    Mesa llvmpipe + eudev 及依賴閉包，Alpine 基底），再以 overlayfs 把其中各 top-level
+//!    目錄疊上 VM 的 tmpfs 根（appliance init 已 switch_root 到 tmpfs 根）——**免每次開機
+//!    解壓 200MB+**，squashfs 頁面按需載入。
 //! 2. 啟動 `udevd` 並 trigger（wlroots 的 DRM/libinput 裝置探索需要 udev）、
 //!    `seatd`（Alpine 的 libseat 沒編 builtin backend）。
 //! 3. 以 `LIBSEAT_BACKEND=seatd` 啟動 `cage`（kiosk Wayland compositor；子行程給
@@ -23,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use chefer_bundle::Manifest;
+use nix::mount::{MsFlags, mount};
 
 /// cage 建立 Wayland socket 的 runtime 目錄（guest 內，appliance tmpfs 上）。
 const GUI_RUNTIME_DIR: &str = "/run/chefer-gui";
@@ -80,8 +82,8 @@ pub fn maybe_start(bundle_dir: &Path, manifest: &Manifest) -> Result<Option<GuiS
         );
     }
 
-    eprintln!("[guest-agent] gui: unpacking the GUI overlay (cage/Xwayland/Mesa) …");
-    unpack_overlay(&overlay).context("failed to unpack the GUI overlay")?;
+    eprintln!("[guest-agent] gui: mounting the GUI overlay (cage/Xwayland/Mesa squashfs) …");
+    mount_overlay(&overlay).context("failed to mount the GUI overlay")?;
 
     let udevd = start_udev();
     let seatd = start_seatd();
@@ -120,19 +122,140 @@ pub fn maybe_start(bundle_dir: &Path, manifest: &Manifest) -> Result<Option<GuiS
     Ok(Some(session))
 }
 
-/// 解壓 overlay（tar.zst 的 rootfs subtree）到 `/`。
-/// 用 ruzstd（純 Rust，與層解壓同一套）+ tar unpack；覆蓋既有檔（Alpine 基底疊上 busybox 根）。
-fn unpack_overlay(overlay: &Path) -> Result<()> {
-    let f = std::fs::File::open(overlay)
-        .with_context(|| format!("failed to open {}", overlay.display()))?;
-    let zst = ruzstd::decoding::StreamingDecoder::new(std::io::BufReader::new(f))
-        .context("failed to start zstd decoding")?;
-    let mut ar = tar::Archive::new(zst);
-    ar.set_preserve_permissions(true);
-    ar.set_unpack_xattrs(false);
-    ar.set_overwrite(true);
-    ar.unpack("/").context("failed to extract to /")?;
+/// overlay 掛載時**不**疊上去的 top-level 目錄：虛擬/掛載點與 appliance 執行期用到的目錄
+/// （尤其 `/run` 內有 guest-agent 執行檔、`/tmp` 內有 rootfs 快取與本 overlay 的 work dir）。
+const OVERLAY_SKIP: &[&str] = &["dev", "proc", "sys", "run", "tmp", "mnt", "newroot", "boot"];
+
+/// 掛載 GUI overlay（squashfs），並以 overlayfs 把其中各 top-level 目錄疊上 VM 的 tmpfs 根。
+///
+/// 取代舊的「每次開機把 tar.zst 解壓 200MB+ 到 `/`」：squashfs 唯讀掛一次、頁面按需載入，
+/// overlay 讓 overlay 內的檔案出現在既有 `/usr`、`/lib`、`/etc` 等路徑（overlay 內容為高
+/// 優先 lower、原內容為低優先 lower、可寫層 upper 放 tmpfs）。免複製、掛載瞬間完成。
+fn mount_overlay(sqfs: &Path) -> Result<()> {
+    let ro = Path::new("/run/chefer/gui-ro");
+    std::fs::create_dir_all(ro).with_context(|| format!("failed to create {}", ro.display()))?;
+    // squashfs 是 block filesystem——掛載檔案須先綁一個 loop 裝置（不能直接 mount 檔案）。
+    let loop_dev = setup_loop(sqfs)?;
+    mnt(
+        Some(&loop_dev),
+        ro,
+        Some("squashfs"),
+        MsFlags::MS_RDONLY,
+        None,
+    )
+    .with_context(|| {
+        format!(
+            "failed to mount the GUI overlay squashfs {} via {} \
+             (the appliance kernel needs CONFIG_SQUASHFS + CONFIG_SQUASHFS_ZSTD)",
+            sqfs.display(),
+            loop_dev.display()
+        )
+    })?;
+
+    // overlay 的 orig 參考點與可寫 upper/work 放 tmpfs（/tmp 已由 rootfs overlay 驗證可當 upper）。
+    let base = Path::new("/tmp/chefer-gui-overlay");
+    let mut overlaid = 0usize;
+    for entry in
+        std::fs::read_dir(ro).with_context(|| format!("failed to read {}", ro.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if OVERLAY_SKIP.contains(&name.as_str()) {
+            continue;
+        }
+        let lower_gui = ro.join(&name);
+        let target = Path::new("/").join(&name);
+        let _ = std::fs::create_dir_all(&target);
+        let orig = base.join(&name).join("orig");
+        let upper = base.join(&name).join("upper");
+        let work = base.join(&name).join("work");
+        for d in [&orig, &upper, &work] {
+            std::fs::create_dir_all(d)
+                .with_context(|| format!("failed to create overlay dir {}", d.display()))?;
+        }
+        // 先把目標原內容 bind 到 orig（overlay 不能拿 mountpoint 自己當 lowerdir）。
+        mnt(
+            Some(&target),
+            &orig,
+            None,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None,
+        )
+        .with_context(|| format!("failed to bind {} aside for overlay", target.display()))?;
+        // gui（squashfs）為高優先 lower、原內容為低優先 lower。
+        let opts = format!(
+            "lowerdir={}:{},upperdir={},workdir={}",
+            lower_gui.display(),
+            orig.display(),
+            upper.display(),
+            work.display()
+        );
+        mnt(
+            Some(Path::new("overlay")),
+            &target,
+            Some("overlay"),
+            MsFlags::empty(),
+            Some(opts.as_str()),
+        )
+        .with_context(|| format!("failed to overlay GUI files onto {}", target.display()))?;
+        overlaid += 1;
+    }
+    if overlaid == 0 {
+        bail!(
+            "the GUI overlay squashfs {} contained no usable directories to mount",
+            sqfs.display()
+        );
+    }
     Ok(())
+}
+
+/// `nix::mount::mount` 的薄封裝（比照 exec.rs），固定各引數型別以免 turbofish。
+fn mnt(
+    src: Option<&Path>,
+    target: &Path,
+    fstype: Option<&str>,
+    flags: MsFlags,
+    data: Option<&str>,
+) -> nix::Result<()> {
+    mount(src, target, fstype, flags, data)
+}
+
+// linux/loop.h ioctl 常數。
+const LOOP_SET_FD: u64 = 0x4C00;
+const LOOP_CTL_GET_FREE: u64 = 0x4C82;
+
+/// 把 squashfs 檔綁到一個 free loop 裝置，回傳其 `/dev/loopN` 路徑（唯讀：backing 以
+/// `O_RDONLY` 開，loop 因而為唯讀）。kernel 需 `CONFIG_BLK_DEV_LOOP`。VM ephemeral，
+/// 不需手動 `LOOP_CLR_FD`（關機即釋放）。
+fn setup_loop(sqfs: &Path) -> Result<PathBuf> {
+    use std::os::fd::AsRawFd;
+    let backing = std::fs::File::open(sqfs)
+        .with_context(|| format!("failed to open GUI overlay {}", sqfs.display()))?;
+    let ctl = std::fs::File::open("/dev/loop-control").context(
+        "failed to open /dev/loop-control (the appliance kernel needs CONFIG_BLK_DEV_LOOP)",
+    )?;
+    let num = unsafe { libc::ioctl(ctl.as_raw_fd(), LOOP_CTL_GET_FREE as _) };
+    if num < 0 {
+        return Err(std::io::Error::last_os_error()).context("LOOP_CTL_GET_FREE ioctl failed");
+    }
+    let loop_path = PathBuf::from(format!("/dev/loop{num}"));
+    // loop 節點以 O_RDWR 開（losetup 慣例，LOOP_SET_FD 相容性較廣）；唯讀性由 backing 的
+    // O_RDONLY 決定（kernel 讓 loop 繼承 backing 的唯讀屬性），故實際仍是唯讀 loop。
+    let loopdev = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&loop_path)
+        .with_context(|| format!("failed to open {}", loop_path.display()))?;
+    let r = unsafe { libc::ioctl(loopdev.as_raw_fd(), LOOP_SET_FD as _, backing.as_raw_fd()) };
+    if r < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("LOOP_SET_FD on {} failed", loop_path.display()));
+    }
+    // LOOP_SET_FD 後 kernel 已持有 backing 檔參考；backing/loopdev fd 於此可關（loop 綁定持續）。
+    Ok(loop_path)
 }
 
 /// 啟動 udevd 並 trigger 一輪裝置事件（best-effort：udev 缺失時 wlroots 多半仍可
@@ -191,7 +314,7 @@ fn start_cage() -> Result<Child> {
     let cage = ["/usr/bin/cage", "/bin/cage"]
         .iter()
         .find(|p| Path::new(p).is_file())
-        .context("cage not found after unpacking the GUI overlay (overlay is incomplete?)")?;
+        .context("cage not found after mounting the GUI overlay (overlay is incomplete?)")?;
     std::fs::create_dir_all(GUI_RUNTIME_DIR)?;
     let mut perm = std::fs::metadata(GUI_RUNTIME_DIR)?.permissions();
     use std::os::unix::fs::PermissionsExt;
