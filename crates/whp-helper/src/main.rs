@@ -19,6 +19,9 @@ mod gui_window;
 // GUI 剪貼簿同步 host 端（M8-e，Win32）。
 #[cfg(windows)]
 mod clipboard_host;
+// 剪貼簿圖片的 CF_DIB ↔ PNG 轉換（純邏輯；供 clipboard_host 與現代/傳統 Windows app 互通）。
+#[cfg(windows)]
+mod dib;
 
 use std::path::PathBuf;
 
