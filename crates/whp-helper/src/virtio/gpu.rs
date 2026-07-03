@@ -114,7 +114,7 @@ impl GpuDevice {
     ) -> Result<u32, String> {
         // 蒐集 readable payload（跨多段 descriptor）。
         let req_len: usize = chain.readable.iter().map(|&(_, l)| l as usize).sum();
-        if req_len < CTRL_HDR_LEN || req_len > MAX_REQ_BYTES {
+        if !(CTRL_HDR_LEN..=MAX_REQ_BYTES).contains(&req_len) {
             return Err(format!("virtio-gpu request len {req_len} out of range"));
         }
         let mut req = vec![0u8; req_len];

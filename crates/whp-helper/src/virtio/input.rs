@@ -183,10 +183,10 @@ impl InputDevice {
     /// config space 寫入（driver 設定 select/subsel；4-byte 對齊寫入時兩者常一起來）。
     pub fn config_write(&mut self, offset: u64, len: u8, value: u32) {
         let bytes = value.to_le_bytes();
-        for i in 0..(len as usize) {
+        for (i, &b) in bytes.iter().enumerate().take(len as usize) {
             match offset as usize + i {
-                0 => self.select = bytes[i],
-                1 => self.subsel = bytes[i],
+                0 => self.select = b,
+                1 => self.subsel = b,
                 _ => {}
             }
         }
