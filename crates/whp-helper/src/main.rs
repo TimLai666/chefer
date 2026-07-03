@@ -182,6 +182,22 @@ mod whp_api {
     const VIRTIO_DATA_MMIO_BASE: u64 = 0xD000_0400;
     const VIRTIO_DATA_MMIO_IRQ: u8 = 7;
     const VIRTIO_DATA_MMIO_CMDLINE: &str = "virtio_mmio.device=0x200@0xd0000400:7";
+    // GUI（M8-c-2，只在 --gui 時掛）：virtio-gpu + virtio-input(keyboard/tablet)。
+    // **IRQ 選 PIC1 的空閒線（1/3/4）而非 8+**：IRQ 8-15 在 PIC2（slave），本 helper 的
+    // deliver_pending_pic_irq 只遞送 PIC1；改用 PIC1 空閒線即沿用 blk/net/data 完全相同的
+    // 單裝置遞送路徑（IRQ1 因 i8042 init 失敗而未被佔用；serial IRQ3/4 在此 8250 不觸發）。
+    const VIRTIO_GPU_MMIO_BASE: u64 = 0xD000_0600;
+    const VIRTIO_GPU_MMIO_IRQ: u8 = 1;
+    const VIRTIO_GPU_MMIO_CMDLINE: &str = "virtio_mmio.device=0x200@0xd0000600:1";
+    const VIRTIO_KBD_MMIO_BASE: u64 = 0xD000_0800;
+    const VIRTIO_KBD_MMIO_IRQ: u8 = 3;
+    const VIRTIO_KBD_MMIO_CMDLINE: &str = "virtio_mmio.device=0x200@0xd0000800:3";
+    const VIRTIO_TABLET_MMIO_BASE: u64 = 0xD000_0A00;
+    const VIRTIO_TABLET_MMIO_IRQ: u8 = 4;
+    const VIRTIO_TABLET_MMIO_CMDLINE: &str = "virtio_mmio.device=0x200@0xd0000a00:4";
+    // 顯示（= guest scanout）尺寸；env CHEFER_WHP_GUI_SIZE=WxH 覆寫。
+    const GUI_DEFAULT_WIDTH: u32 = 1280;
+    const GUI_DEFAULT_HEIGHT: u32 = 800;
     // vdb（data）image 容量上限（host RAM 內的 backing；env CHEFER_WHP_DATA_MIB 覆寫，預設 256MiB）。
     // 必須 ≥ guest 關機 re-tar data_dir 後的 tar 大小，否則回寫 IOERR。
     const VIRTIO_DATA_DEFAULT_MIB: u64 = 256;
@@ -438,6 +454,10 @@ mod whp_api {
         virtio: *mut VirtioMmioDevice,
         data: *mut VirtioMmioDevice,
         net: *mut VirtioNetMmioDevice,
+        // GUI 裝置（M8-c-2）：無 --gui 時為 null。
+        gpu: *mut VirtioGpuMmioDevice,
+        kbd: *mut VirtioInputMmioDevice,
+        tablet: *mut VirtioInputMmioDevice,
         pic1: *mut super::pic::Pic,
         /// 單調毫秒時鐘（boot 起算），供 net backend 的 smoltcp poll。
         now_ms: u64,
@@ -445,6 +465,31 @@ mod whp_api {
         exit_rip: u64,
         exit_gva: u64,
         exit_access_type: u32,
+    }
+
+    /// run_loop 的 GUI 裝置集（僅 --gui 時存在）：三個 MMIO 裝置 + 共享輸入佇列 + 視窗把手。
+    struct GuiDevices<'a> {
+        gpu: &'a mut VirtioGpuMmioDevice,
+        kbd: &'a mut VirtioInputMmioDevice,
+        tablet: &'a mut VirtioInputMmioDevice,
+        input_queue: super::virtio::gui_bridge::SharedInput,
+        window: &'a crate::gui_window::GuiHandle,
+    }
+
+    impl GuiDevices<'_> {
+        /// 把視窗執行緒累積的事件分流到 keyboard/tablet 並填進各自 eventq。每輪 VM loop 呼叫。
+        fn pump(&mut self, host_mem: &mut [u8], pic1: &mut super::pic::Pic) -> Result<(), String> {
+            use super::virtio::gui_bridge::InputTarget;
+            for te in self.input_queue.drain() {
+                match te.target {
+                    InputTarget::Keyboard => self.kbd.push_event(te.event),
+                    InputTarget::Tablet => self.tablet.push_event(te.event),
+                }
+            }
+            self.kbd.pump_events(host_mem, pic1)?;
+            self.tablet.pump_events(host_mem, pic1)?;
+            Ok(())
+        }
     }
 
     unsafe impl Send for WhpApi {}
@@ -616,10 +661,29 @@ mod whp_api {
         !same_subnet && dst[0] < 224
     }
 
-    fn append_virtio_mmio_cmdline(cmdline: &str) -> String {
+    /// 顯示尺寸：`CHEFER_WHP_GUI_SIZE=WxH` 覆寫，否則預設 1280x800。上限夾住避免荒謬值。
+    fn gui_display_size() -> (u32, u32) {
+        if let Ok(v) = std::env::var("CHEFER_WHP_GUI_SIZE")
+            && let Some((w, h)) = v.split_once(['x', 'X'])
+            && let (Ok(w), Ok(h)) = (w.trim().parse::<u32>(), h.trim().parse::<u32>())
+            && (16..=16384).contains(&w)
+            && (16..=16384).contains(&h)
+        {
+            return (w, h);
+        }
+        (GUI_DEFAULT_WIDTH, GUI_DEFAULT_HEIGHT)
+    }
+
+    fn append_virtio_mmio_cmdline(cmdline: &str, gui: bool) -> String {
         // virtio-blk(vda bundle) + virtio-blk(vdb data) + virtio-net，各以 base/IRQ 靜態註冊。
-        let devices =
+        let mut devices =
             format!("{VIRTIO_MMIO_CMDLINE} {VIRTIO_DATA_MMIO_CMDLINE} {VIRTIO_NET_MMIO_CMDLINE}");
+        // GUI：額外掛 virtio-gpu + virtio-input(keyboard/tablet)。
+        if gui {
+            devices.push_str(&format!(
+                " {VIRTIO_GPU_MMIO_CMDLINE} {VIRTIO_KBD_MMIO_CMDLINE} {VIRTIO_TABLET_MMIO_CMDLINE}"
+            ));
+        }
         if cmdline.contains("virtio_mmio.device=") {
             cmdline.to_string()
         } else if cmdline.trim().is_empty() {
@@ -1040,6 +1104,302 @@ mod whp_api {
         }
     }
 
+    /// virtio-gpu MMIO 裝置（M8-c-2）：2D scanout。control/cursor 兩個 queue；guest 的
+    /// cage/wlroots 送 2D 命令，`RESOURCE_FLUSH` 後把 scanout 拷貝進 [`SharedFrame`]
+    /// 供 Win32 視窗執行緒 blit。
+    struct VirtioGpuMmioDevice {
+        base: u64,
+        irq: u8,
+        mmio: super::virtio::mmio::Mmio,
+        gpu: super::virtio::gpu::GpuDevice,
+        frame: super::virtio::gui_bridge::SharedFrame,
+        /// avail ring 已處理位置：[0]=control queue、[1]=cursor queue。
+        last_avail: [u16; 2],
+    }
+
+    impl VirtioGpuMmioDevice {
+        fn new(width: u32, height: u32, frame: super::virtio::gui_bridge::SharedFrame) -> Self {
+            Self {
+                base: VIRTIO_GPU_MMIO_BASE,
+                irq: VIRTIO_GPU_MMIO_IRQ,
+                mmio: super::virtio::mmio::Mmio::new(
+                    super::virtio::DEVICE_ID_GPU,
+                    super::virtio::VIRTIO_F_VERSION_1,
+                    2,
+                    256,
+                ),
+                gpu: super::virtio::gpu::GpuDevice::new(width, height),
+                frame,
+                last_avail: [0; 2],
+            }
+        }
+
+        fn contains(&self, gpa: u64) -> bool {
+            (self.base..self.base + VIRTIO_MMIO_SIZE).contains(&gpa)
+        }
+
+        fn read_bytes(&self, offset: u64, len: usize) -> Result<[u8; 8], String> {
+            if len == 0 || len > 8 {
+                return Err(format!("unsupported MMIO read size {len}"));
+            }
+            let mut out = [0u8; 8];
+            for (i, slot) in out.iter_mut().enumerate().take(len) {
+                let cur = offset + i as u64;
+                let aligned = cur & !0x3;
+                let word = if aligned >= 0x100 {
+                    self.gpu.config_read(aligned - 0x100, 4)
+                } else {
+                    self.mmio.read(aligned)
+                };
+                *slot = word.to_le_bytes()[(cur - aligned) as usize];
+            }
+            Ok(out)
+        }
+
+        fn write_bytes(
+            &mut self,
+            offset: u64,
+            data: &[u8],
+            host_mem: &mut [u8],
+            pic1: &mut super::pic::Pic,
+        ) -> Result<(), String> {
+            if data.is_empty() || data.len() > 4 {
+                return Err(format!("unsupported MMIO write size {}", data.len()));
+            }
+            let aligned = offset & !0x3;
+            let byte_off = (offset - aligned) as usize;
+            if byte_off + data.len() > 4 {
+                return Err(format!(
+                    "cross-register MMIO write is unsupported: offset=0x{offset:X} len={}",
+                    data.len()
+                ));
+            }
+            let mut merged = if data.len() == 4 && byte_off == 0 {
+                [0u8; 4]
+            } else if aligned >= 0x100 {
+                self.gpu.config_read(aligned - 0x100, 4).to_le_bytes()
+            } else {
+                self.mmio.read(aligned).to_le_bytes()
+            };
+            merged[byte_off..byte_off + data.len()].copy_from_slice(data);
+            let action = self.mmio.write(aligned, u32::from_le_bytes(merged));
+            match action {
+                super::virtio::mmio::MmioAction::None
+                | super::virtio::mmio::MmioAction::ConfigRead { .. }
+                | super::virtio::mmio::MmioAction::ConfigWrite { .. } => Ok(()),
+                super::virtio::mmio::MmioAction::Reset => {
+                    self.last_avail = [0; 2];
+                    Ok(())
+                }
+                super::virtio::mmio::MmioAction::QueueNotify(_) => self.service(host_mem, pic1),
+            }
+        }
+
+        /// 處理 control(0) 與 cursor(1) 兩個 queue 的命令；FLUSH 後把 scanout 送進 SharedFrame。
+        fn service(
+            &mut self,
+            host_mem: &mut [u8],
+            pic1: &mut super::pic::Pic,
+        ) -> Result<(), String> {
+            let mut used_any = false;
+            for q in 0..2usize {
+                let Some(cfg) = self.mmio.queue(q).copied() else {
+                    continue;
+                };
+                let mut mem = super::virtio::SliceMem::new(0, host_mem);
+                let mut idx = self.last_avail[q];
+                loop {
+                    let chain = {
+                        let mut split = super::virtio::queue::SplitQueue::new(cfg, &mut mem, idx);
+                        let chain = split.pop_avail()?;
+                        idx = split.last_avail_idx();
+                        chain
+                    };
+                    let Some(chain) = chain else { break };
+                    let written = self.gpu.process_chain(&chain, &mut mem)?;
+                    let mut split = super::virtio::queue::SplitQueue::new(cfg, &mut mem, idx);
+                    split.push_used(chain.head, written)?;
+                    used_any = true;
+                }
+                self.last_avail[q] = idx;
+            }
+            // scanout 有更新 → 拷貝進 SharedFrame（視窗執行緒據 generation blit）。
+            if self.gpu.take_dirty()
+                && let Some((px, w, h, fmt)) = self.gpu.scanout()
+            {
+                self.frame.update(px, w, h, fmt);
+            }
+            if used_any {
+                self.mmio.signal_used();
+                pic1.request_irq(self.irq);
+            }
+            Ok(())
+        }
+    }
+
+    /// virtio-input MMIO 裝置（M8-c-2）：一個 evdev 節點（keyboard 或 tablet）。eventq(0)
+    /// 由 host 視窗執行緒經 [`SharedInput`] 灌入的事件填給 guest；statusq(1) 收掉即可。
+    struct VirtioInputMmioDevice {
+        base: u64,
+        irq: u8,
+        mmio: super::virtio::mmio::Mmio,
+        input: super::virtio::input::InputDevice,
+        last_avail: [u16; 2],
+    }
+
+    impl VirtioInputMmioDevice {
+        fn new(base: u64, irq: u8, kind: super::virtio::input::InputKind) -> Self {
+            Self {
+                base,
+                irq,
+                mmio: super::virtio::mmio::Mmio::new(
+                    super::virtio::DEVICE_ID_INPUT,
+                    super::virtio::VIRTIO_F_VERSION_1,
+                    2,
+                    256,
+                ),
+                input: super::virtio::input::InputDevice::new(kind),
+                last_avail: [0; 2],
+            }
+        }
+
+        fn contains(&self, gpa: u64) -> bool {
+            (self.base..self.base + VIRTIO_MMIO_SIZE).contains(&gpa)
+        }
+
+        fn read_bytes(&self, offset: u64, len: usize) -> Result<[u8; 8], String> {
+            if len == 0 || len > 8 {
+                return Err(format!("unsupported MMIO read size {len}"));
+            }
+            let mut out = [0u8; 8];
+            for (i, slot) in out.iter_mut().enumerate().take(len) {
+                let cur = offset + i as u64;
+                let aligned = cur & !0x3;
+                let word = if aligned >= 0x100 {
+                    self.input.config_read(aligned - 0x100, 4)
+                } else {
+                    self.mmio.read(aligned)
+                };
+                *slot = word.to_le_bytes()[(cur - aligned) as usize];
+            }
+            Ok(out)
+        }
+
+        fn write_bytes(
+            &mut self,
+            offset: u64,
+            data: &[u8],
+            host_mem: &mut [u8],
+            // statusq 消化不需注入 IRQ（driver→device fire-and-forget，如 LED）；保留參數以與
+            // gpu 的 write_bytes 簽章一致，供 callback 統一呼叫。
+            _pic1: &mut super::pic::Pic,
+        ) -> Result<(), String> {
+            if data.is_empty() || data.len() > 4 {
+                return Err(format!("unsupported MMIO write size {}", data.len()));
+            }
+            let aligned = offset & !0x3;
+            let byte_off = (offset - aligned) as usize;
+            if byte_off + data.len() > 4 {
+                return Err(format!(
+                    "cross-register MMIO write is unsupported: offset=0x{offset:X} len={}",
+                    data.len()
+                ));
+            }
+            let mut merged = if data.len() == 4 && byte_off == 0 {
+                [0u8; 4]
+            } else if aligned >= 0x100 {
+                self.input.config_read(aligned - 0x100, 4).to_le_bytes()
+            } else {
+                self.mmio.read(aligned).to_le_bytes()
+            };
+            merged[byte_off..byte_off + data.len()].copy_from_slice(data);
+            let action = self.mmio.write(aligned, u32::from_le_bytes(merged));
+            match action {
+                super::virtio::mmio::MmioAction::None
+                | super::virtio::mmio::MmioAction::ConfigRead { .. } => Ok(()),
+                // virtio-input 的 select/subsel 由 driver 寫 config 查詢裝置能力。
+                super::virtio::mmio::MmioAction::ConfigWrite { offset, len, value } => {
+                    self.input.config_write(offset, len, value);
+                    Ok(())
+                }
+                super::virtio::mmio::MmioAction::Reset => {
+                    self.last_avail = [0; 2];
+                    Ok(())
+                }
+                // statusq notify：收掉 driver→device 的 status buffer（回 used 0）。
+                super::virtio::mmio::MmioAction::QueueNotify(_) => self.drain_status(host_mem),
+            }
+        }
+
+        /// 由 host 視窗執行緒排入一筆 evdev 事件（keyboard 或 tablet，由呼叫端分流）。
+        fn push_event(&mut self, ev: super::virtio::input::InputEvent) {
+            self.input.push_event(ev);
+        }
+
+        /// 把待送事件填進 guest 的 eventq buffer（queue 0）；有進度即注入 IRQ。
+        /// 每輪 VM loop 呼叫（事件由視窗執行緒非同步產生，非 guest notify 觸發）。
+        fn pump_events(
+            &mut self,
+            host_mem: &mut [u8],
+            pic1: &mut super::pic::Pic,
+        ) -> Result<(), String> {
+            const EVENTQ: usize = 0;
+            if !self.input.has_pending() {
+                return Ok(());
+            }
+            let Some(cfg) = self.mmio.queue(EVENTQ).copied() else {
+                return Ok(());
+            };
+            let mut mem = super::virtio::SliceMem::new(0, host_mem);
+            let mut idx = self.last_avail[EVENTQ];
+            let mut any = false;
+            while self.input.has_pending() {
+                let chain = {
+                    let mut split = super::virtio::queue::SplitQueue::new(cfg, &mut mem, idx);
+                    let chain = split.pop_avail()?;
+                    idx = split.last_avail_idx();
+                    chain
+                };
+                let Some(chain) = chain else { break }; // guest 無可用 buffer：留著下輪
+                let Some(written) = self.input.fill_event(&chain, &mut mem)? else {
+                    break;
+                };
+                let mut split = super::virtio::queue::SplitQueue::new(cfg, &mut mem, idx);
+                split.push_used(chain.head, written)?;
+                any = true;
+            }
+            self.last_avail[EVENTQ] = idx;
+            if any {
+                self.mmio.signal_used();
+                pic1.request_irq(self.irq);
+            }
+            Ok(())
+        }
+
+        /// statusq（queue 1，driver→device LED 等）：讀掉並回 used 0。
+        fn drain_status(&mut self, host_mem: &mut [u8]) -> Result<(), String> {
+            const STATUSQ: usize = 1;
+            let Some(cfg) = self.mmio.queue(STATUSQ).copied() else {
+                return Ok(());
+            };
+            let mut mem = super::virtio::SliceMem::new(0, host_mem);
+            let mut idx = self.last_avail[STATUSQ];
+            loop {
+                let chain = {
+                    let mut split = super::virtio::queue::SplitQueue::new(cfg, &mut mem, idx);
+                    let chain = split.pop_avail()?;
+                    idx = split.last_avail_idx();
+                    chain
+                };
+                let Some(chain) = chain else { break };
+                let mut split = super::virtio::queue::SplitQueue::new(cfg, &mut mem, idx);
+                split.push_used(chain.head, 0)?;
+            }
+            self.last_avail[STATUSQ] = idx;
+            Ok(())
+        }
+    }
+
     unsafe extern "system" fn emulator_io_port_callback(
         _context: *mut c_void,
         _io_access: *mut WhvEmulatorIoAccessInfo,
@@ -1225,6 +1585,69 @@ mod whp_api {
                     &format!("access={direction} len={len} offset=0x{offset:X}"),
                 );
                 return 0;
+            }
+
+            // GUI 裝置（M8-c-2；僅 --gui 時非 null）。
+            if !ctx.gpu.is_null() {
+                let gpu = &mut *ctx.gpu;
+                if gpu.contains(access.gpa_address) {
+                    let offset = access.gpa_address - gpu.base;
+                    if access.direction == EMULATOR_DIRECTION_WRITE {
+                        let host = std::slice::from_raw_parts_mut(ctx.host_mem, ctx.host_mem_len);
+                        let pic1 = &mut *ctx.pic1;
+                        if let Err(err) = gpu.write_bytes(offset, &access.data[..len], host, pic1) {
+                            eprintln!(
+                                "virtio-gpu write failed at 0x{:X}: {err}",
+                                access.gpa_address
+                            );
+                            return E_FAIL;
+                        }
+                    } else {
+                        match gpu.read_bytes(offset, len) {
+                            Ok(bytes) => access.data[..len].copy_from_slice(&bytes[..len]),
+                            Err(err) => {
+                                eprintln!(
+                                    "virtio-gpu read failed at 0x{:X}: {err}",
+                                    access.gpa_address
+                                );
+                                return E_FAIL;
+                            }
+                        }
+                    }
+                    return 0;
+                }
+            }
+            for input_ptr in [ctx.kbd, ctx.tablet] {
+                if input_ptr.is_null() {
+                    continue;
+                }
+                let dev = &mut *input_ptr;
+                if dev.contains(access.gpa_address) {
+                    let offset = access.gpa_address - dev.base;
+                    if access.direction == EMULATOR_DIRECTION_WRITE {
+                        let host = std::slice::from_raw_parts_mut(ctx.host_mem, ctx.host_mem_len);
+                        let pic1 = &mut *ctx.pic1;
+                        if let Err(err) = dev.write_bytes(offset, &access.data[..len], host, pic1) {
+                            eprintln!(
+                                "virtio-input write failed at 0x{:X}: {err}",
+                                access.gpa_address
+                            );
+                            return E_FAIL;
+                        }
+                    } else {
+                        match dev.read_bytes(offset, len) {
+                            Ok(bytes) => access.data[..len].copy_from_slice(&bytes[..len]),
+                            Err(err) => {
+                                eprintln!(
+                                    "virtio-input read failed at 0x{:X}: {err}",
+                                    access.gpa_address
+                                );
+                                return E_FAIL;
+                            }
+                        }
+                    }
+                    return 0;
+                }
             }
 
             let Some(end) = access.gpa_address.checked_add(len as u64) else {
@@ -1510,7 +1933,7 @@ mod whp_api {
             .map_err(|e| format!("Failed to read kernel {}: {e}", req.kernel.display()))?;
         let initramfs_data = std::fs::read(&req.initramfs)
             .map_err(|e| format!("Failed to read initramfs {}: {e}", req.initramfs.display()))?;
-        let cmdline = append_virtio_mmio_cmdline(&req.cmdline);
+        let cmdline = append_virtio_mmio_cmdline(&req.cmdline, req.gui);
         let bundle_image = super::virtio::image::pack_dir(&req.bundle_dir).map_err(|e| {
             format!(
                 "Failed to pack bundle dir {}: {e}",
@@ -1659,6 +2082,35 @@ mod whp_api {
             VIRTIO_DATA_MMIO_IRQ,
         );
         let mut virtio_net = VirtioNetMmioDevice::new(&req.forwards, &req.udp_forwards);
+
+        // GUI 裝置（M8-c-2，僅 --gui）：virtio-gpu + keyboard/tablet + Win32 顯示視窗。
+        let (mut gpu_dev, mut kbd_dev, mut tablet_dev, gui_window, gui_input) = if req.gui {
+            let (gw, gh) = gui_display_size();
+            let frame = super::virtio::gui_bridge::SharedFrame::new();
+            let input = super::virtio::gui_bridge::SharedInput::new();
+            let gpu = VirtioGpuMmioDevice::new(gw, gh, frame.clone());
+            let kbd = VirtioInputMmioDevice::new(
+                VIRTIO_KBD_MMIO_BASE,
+                VIRTIO_KBD_MMIO_IRQ,
+                super::virtio::input::InputKind::Keyboard,
+            );
+            let tablet = VirtioInputMmioDevice::new(
+                VIRTIO_TABLET_MMIO_BASE,
+                VIRTIO_TABLET_MMIO_IRQ,
+                super::virtio::input::InputKind::Tablet,
+            );
+            let window = crate::gui_window::spawn("Chefer", frame, input.clone(), gw, gh);
+            (
+                Some(gpu),
+                Some(kbd),
+                Some(tablet),
+                Some(window),
+                Some(input),
+            )
+        } else {
+            (None, None, None, None, None)
+        };
+
         let emulator = WhpEmulator::new(&emulation)?;
 
         // 5b. 映射 LAPIC MMIO 頁面（GPA 0xFEE00000, 4KB）
@@ -1764,6 +2216,26 @@ mod whp_api {
         let mut pit = super::pic::Pit::new();
         let mut last_printed: usize = 0;
 
+        // GUI 裝置集：把 --gui 時建好的三個裝置 + 輸入佇列 + 視窗把手綁成 run_loop 的一個參數。
+        let mut gui = match (
+            gpu_dev.as_mut(),
+            kbd_dev.as_mut(),
+            tablet_dev.as_mut(),
+            gui_window.as_ref(),
+            gui_input.as_ref(),
+        ) {
+            (Some(gpu), Some(kbd), Some(tablet), Some(window), Some(input_queue)) => {
+                Some(GuiDevices {
+                    gpu,
+                    kbd,
+                    tablet,
+                    input_queue: input_queue.clone(),
+                    window,
+                })
+            }
+            _ => None,
+        };
+
         let result = run_loop(
             &api,
             partition,
@@ -1772,6 +2244,7 @@ mod whp_api {
             &mut virtio_blk,
             &mut virtio_data,
             &mut virtio_net,
+            gui.as_mut(),
             &mut serial_port,
             &mut cmos_addr,
             &mut pic1,
@@ -1785,6 +2258,11 @@ mod whp_api {
         // 13. 停止 timer 執行緒
         stop_timer.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = timer_thread.join();
+        // 收掉顯示視窗（guest 已結束 → 反向關窗並等執行緒收尾）。
+        drop(gui);
+        if let Some(window) = gui_window {
+            window.join();
+        }
 
         // 14. 印出剩餘 serial 輸出
         flush_serial(&serial_port, &mut last_printed);
@@ -1877,6 +2355,7 @@ mod whp_api {
         virtio_blk: &mut VirtioMmioDevice,
         virtio_data: &mut VirtioMmioDevice,
         virtio_net: &mut VirtioNetMmioDevice,
+        mut gui: Option<&mut GuiDevices<'_>>,
         serial: &mut super::serial::SerialPort,
         cmos_addr: &mut u8,
         pic1: &mut super::pic::Pic,
@@ -2021,6 +2500,17 @@ mod whp_api {
                     if let Err(e) = virtio_net.service(host_mem, pic1, now_ms) {
                         return Err(format!("virtio-net service failed: {e}"));
                     }
+                    // GUI：使用者關視窗 = 介面服務結束語意 → 收掉整個 app（乾淨返回）；
+                    // 否則把視窗執行緒累積的鍵鼠事件灌進 virtio-input eventq。
+                    if let Some(g) = gui.as_deref_mut() {
+                        if g.window.closed_by_user() {
+                            eprintln!("[whp-gui] display window closed by user; stopping the app.");
+                            return Ok(());
+                        }
+                        if let Err(e) = g.pump(host_mem, pic1) {
+                            return Err(format!("virtio-input pump failed: {e}"));
+                        }
+                    }
                     if rflags & 0x200 != 0 {
                         pic1.request_irq(0);
                         let _ = deliver_pending_pic_irq(api, partition, pic1);
@@ -2049,9 +2539,26 @@ mod whp_api {
                         rip,
                         &format!("exit_access={}", access_type_name(access_type)),
                     );
+                    // GUI 裝置指標（無 --gui 時全 null）；同時併入 GPA 視窗歸屬判斷。
+                    let (gpu_ptr, kbd_ptr, tablet_ptr) = match gui.as_deref_mut() {
+                        Some(g) => (
+                            g.gpu as *mut VirtioGpuMmioDevice,
+                            g.kbd as *mut VirtioInputMmioDevice,
+                            g.tablet as *mut VirtioInputMmioDevice,
+                        ),
+                        None => (
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                            std::ptr::null_mut(),
+                        ),
+                    };
+                    let in_gui = (!gpu_ptr.is_null() && unsafe { (*gpu_ptr).contains(gpa) })
+                        || (!kbd_ptr.is_null() && unsafe { (*kbd_ptr).contains(gpa) })
+                        || (!tablet_ptr.is_null() && unsafe { (*tablet_ptr).contains(gpa) });
                     if !virtio_blk.contains(gpa)
                         && !virtio_data.contains(gpa)
                         && !virtio_net.contains(gpa)
+                        && !in_gui
                     {
                         return Err(format!(
                             "Memory access fault at GPA 0x{gpa:016X} (RIP=0x{rip:016X})"
@@ -2068,6 +2575,9 @@ mod whp_api {
                         virtio: virtio_blk as *mut VirtioMmioDevice,
                         data: virtio_data as *mut VirtioMmioDevice,
                         net: virtio_net as *mut VirtioNetMmioDevice,
+                        gpu: gpu_ptr,
+                        kbd: kbd_ptr,
+                        tablet: tablet_ptr,
                         pic1: pic1 as *mut super::pic::Pic,
                         now_ms: start.elapsed().as_millis() as u64,
                         trace_seq,
@@ -2320,17 +2830,27 @@ mod whp_api {
 
         #[test]
         fn cmdline_appends_both_blk_and_net_devices() {
-            let out = append_virtio_mmio_cmdline("console=ttyS0");
+            let out = append_virtio_mmio_cmdline("console=ttyS0", false);
             assert!(out.starts_with("console=ttyS0 "));
             assert!(out.contains("virtio_mmio.device=0x200@0xd0000000:5")); // blk vda (bundle)
             assert!(out.contains("virtio_mmio.device=0x200@0xd0000400:7")); // blk vdb (data)
             assert!(out.contains("virtio_mmio.device=0x200@0xd0000200:6")); // net
+            // 非 GUI：不掛 gpu/input。
+            assert!(!out.contains("0xd0000600"));
+        }
+
+        #[test]
+        fn cmdline_appends_gui_devices_when_enabled() {
+            let out = append_virtio_mmio_cmdline("console=ttyS0", true);
+            assert!(out.contains("virtio_mmio.device=0x200@0xd0000600:1")); // gpu
+            assert!(out.contains("virtio_mmio.device=0x200@0xd0000800:3")); // keyboard
+            assert!(out.contains("virtio_mmio.device=0x200@0xd0000a00:4")); // tablet
         }
 
         #[test]
         fn cmdline_preserves_caller_supplied_devices() {
             let custom = "virtio_mmio.device=0x200@0xdeadbeef:9";
-            assert_eq!(append_virtio_mmio_cmdline(custom), custom);
+            assert_eq!(append_virtio_mmio_cmdline(custom, false), custom);
         }
     }
 }
@@ -2353,6 +2873,8 @@ struct HelperRequest {
     forwards: Vec<(u16, u16)>,
     /// host→guest UDP 埠轉發 `(host_port, guest_port)`（`--forward-udp host:guest`，可重複）。
     udp_forwards: Vec<(u16, u16)>,
+    /// `--gui`：app 有介面服務時由 vmm-backend 帶入 → 掛 virtio-gpu/input 並開顯示視窗。
+    gui: bool,
 }
 
 impl HelperRequest {
@@ -2376,6 +2898,7 @@ impl HelperRequest {
             let raw = parser.value("--forward-udp")?;
             udp_forwards.push(parse_forward(&raw)?);
         }
+        let gui = parser.take_flag("--gui");
         let request = HelperRequest {
             kernel: parser.path("--kernel")?,
             initramfs: parser.path("--initramfs")?,
@@ -2387,6 +2910,7 @@ impl HelperRequest {
             timeout_secs,
             forwards,
             udp_forwards,
+            gui,
         };
         parser.finish()?;
         Ok(request)
@@ -2404,6 +2928,16 @@ impl ArgParser {
 
     fn has(&self, flag: &str) -> bool {
         self.args.iter().any(|a| a == flag)
+    }
+
+    /// 移除並回報一個布林旗標是否存在（無值參數，如 `--gui`）。
+    fn take_flag(&mut self, flag: &str) -> bool {
+        if let Some(pos) = self.args.iter().position(|a| a == flag) {
+            self.args.remove(pos);
+            true
+        } else {
+            false
+        }
     }
 
     fn value(&mut self, flag: &str) -> Result<String, String> {

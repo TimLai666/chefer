@@ -91,6 +91,12 @@ impl ExecBackend for WhpBackend {
         }
         invocation.forwards = tcp_forwards;
         invocation.udp_forwards = udp_forwards;
+        // app 有 gui/both 服務 → helper 掛 virtio-gpu/input 並開顯示視窗（M8-c-2）。
+        invocation.gui = ctx
+            .manifest
+            .services
+            .iter()
+            .any(|s| s.interface_mode.wants_gui());
 
         std::fs::create_dir_all(ctx.data_dir).with_context(|| {
             format!(
