@@ -50,10 +50,10 @@ fn read_cmdline_clip() -> Option<(String, u16)> {
     let mut token = None;
     let mut port = CLIP_PORT;
     for tok in cmdline.split_whitespace() {
-        if let Some(v) = tok.strip_prefix("chefer.clip_token=") {
-            if !v.is_empty() {
-                token = Some(v.to_string());
-            }
+        if let Some(v) = tok.strip_prefix("chefer.clip_token=")
+            && !v.is_empty()
+        {
+            token = Some(v.to_string());
         } else if let Some(v) = tok.strip_prefix("chefer.clip_port=")
             && let Ok(p) = v.parse::<u16>()
         {
@@ -292,14 +292,14 @@ mod tests {
             let mut token = None;
             let mut port = CLIP_PORT;
             for tok in s.split_whitespace() {
-                if let Some(v) = tok.strip_prefix("chefer.clip_token=") {
-                    if !v.is_empty() {
-                        token = Some(v.to_string());
-                    }
-                } else if let Some(v) = tok.strip_prefix("chefer.clip_port=") {
-                    if let Ok(p) = v.parse::<u16>() {
-                        port = p;
-                    }
+                if let Some(v) = tok.strip_prefix("chefer.clip_token=")
+                    && !v.is_empty()
+                {
+                    token = Some(v.to_string());
+                } else if let Some(v) = tok.strip_prefix("chefer.clip_port=")
+                    && let Ok(p) = v.parse::<u16>()
+                {
+                    port = p;
                 }
             }
             token.map(|t| (t, port))
