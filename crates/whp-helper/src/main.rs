@@ -16,6 +16,9 @@ mod virtio;
 // GUI 顯示視窗（M8-c，Win32；非 Windows 為空）。
 #[cfg(windows)]
 mod gui_window;
+// GUI 剪貼簿同步 host 端（M8-e，Win32）。
+#[cfg(windows)]
+mod clipboard_host;
 
 use std::path::PathBuf;
 
@@ -198,6 +201,9 @@ mod whp_api {
     // 顯示（= guest scanout）尺寸；env CHEFER_WHP_GUI_SIZE=WxH 覆寫。
     const GUI_DEFAULT_WIDTH: u32 = 1280;
     const GUI_DEFAULT_HEIGHT: u32 = 800;
+    // 剪貼簿同步埠（M8-e）：guest 服務監聽、helper 以同埠轉發並連入。須與
+    // guest-agent::clipboard::CLIP_PORT 一致。
+    const CLIP_PORT: u16 = 55381;
     // vdb（data）image 容量上限（host RAM 內的 backing；env CHEFER_WHP_DATA_MIB 覆寫，預設 256MiB）。
     // 必須 ≥ guest 關機 re-tar data_dir 後的 tar 大小，否則回寫 IOERR。
     const VIRTIO_DATA_DEFAULT_MIB: u64 = 256;
@@ -1948,7 +1954,18 @@ mod whp_api {
             .map_err(|e| format!("Failed to read kernel {}: {e}", req.kernel.display()))?;
         let initramfs_data = std::fs::read(&req.initramfs)
             .map_err(|e| format!("Failed to read initramfs {}: {e}", req.initramfs.display()))?;
-        let cmdline = append_virtio_mmio_cmdline(&req.cmdline, req.gui);
+        // 剪貼簿（M8-e，僅 gui）：產 token、傳 guest（cmdline）、helper 以同埠轉發連入。
+        let clip_token = if req.gui {
+            Some(crate::clipboard_host::generate_token())
+        } else {
+            None
+        };
+        let mut cmdline = append_virtio_mmio_cmdline(&req.cmdline, req.gui);
+        if let Some(token) = &clip_token {
+            cmdline.push_str(&format!(
+                " chefer.clip_token={token} chefer.clip_port={CLIP_PORT}"
+            ));
+        }
         let bundle_image = super::virtio::image::pack_dir(&req.bundle_dir).map_err(|e| {
             format!(
                 "Failed to pack bundle dir {}: {e}",
@@ -2096,7 +2113,19 @@ mod whp_api {
             VIRTIO_DATA_MMIO_BASE,
             VIRTIO_DATA_MMIO_IRQ,
         );
-        let mut virtio_net = VirtioNetMmioDevice::new(&req.forwards, &req.udp_forwards);
+        // gui：對剪貼簿埠加一條 host→guest 轉發（[::1]:CLIP_PORT → guest eth0:CLIP_PORT），
+        // helper 的剪貼簿執行緒隨後連 [::1]:CLIP_PORT 就會經 smoltcp 到達 guest 服務。
+        let mut net_forwards = req.forwards.clone();
+        if req.gui {
+            net_forwards.push((CLIP_PORT, CLIP_PORT));
+        }
+        let mut virtio_net = VirtioNetMmioDevice::new(&net_forwards, &req.udp_forwards);
+
+        // 剪貼簿 host 執行緒（僅 gui）：連 [::1]:CLIP_PORT（重試至 guest 服務起來）、送 token、
+        // 雙向同步 Windows↔cage 剪貼簿。_clip_host 存活至函式結束（Drop 停執行緒）。
+        let _clip_host = clip_token
+            .as_ref()
+            .map(|t| crate::clipboard_host::spawn(t.clone(), CLIP_PORT));
 
         // GUI 裝置（M8-c-2，僅 --gui）：virtio-gpu + keyboard/tablet + Win32 顯示視窗。
         let (mut gpu_dev, mut kbd_dev, mut tablet_dev, gui_window, gui_input) = if req.gui {
