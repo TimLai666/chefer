@@ -1379,6 +1379,12 @@ mod whp_api {
             }
             self.last_avail[EVENTQ] = idx;
             if any {
+                if std::env::var_os("CHEFER_WHP_TRACE_INPUT").is_some() {
+                    eprintln!(
+                        "[whp-input] delivered events to guest eventq (base=0x{:X}, irq={})",
+                        self.base, self.irq
+                    );
+                }
                 self.mmio.signal_used();
                 pic1.request_irq(self.irq);
             }
