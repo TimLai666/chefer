@@ -212,8 +212,8 @@ pub fn vk_to_evdev(vk: u16) -> Option<u16> {
         0x5A => 44,
         // 功能鍵 F1..F12（VK 0x70..0x7B）
         0x70..=0x79 => vk - 0x70 + 59, // F1→59 .. F10→68
-        0x7A => 87,                             // F11
-        0x7B => 88,                             // F12
+        0x7A => 87,                    // F11
+        0x7B => 88,                    // F12
         // 常用符號（OEM，US 佈局）
         0xBA => 39, // ; :  → SEMICOLON
         0xBB => 13, // = +  → EQUAL
