@@ -328,6 +328,7 @@ fn check_kit(extra_kit_dirs: &[PathBuf]) -> Vec<DoctorCheck> {
         checks.push(check_appliance(&kit_dirs, arch));
         checks.push(check_vz_helper(&kit_dirs, arch));
         checks.push(check_whp_helper(&kit_dirs, arch));
+        checks.push(check_gui_overlay(&kit_dirs, arch));
     }
 
     checks
@@ -428,6 +429,24 @@ fn check_whp_helper(kit_dirs: &[PathBuf], arch: &str) -> DoctorCheck {
                 chefer_bundle::layout::whp_helper_name(arch)
             ),
             "Windows without WSL2 needs the WHP helper to boot the micro-VM. Set CHEFER_BACKEND=whp to force this backend.",
+        ),
+    }
+}
+
+fn check_gui_overlay(kit_dirs: &[PathBuf], arch: &str) -> DoctorCheck {
+    match chefer_bundle::kit::find_gui_overlay(kit_dirs, arch) {
+        Some(path) => DoctorCheck::pass(
+            "Kit: GUI overlay",
+            format!("Found {}.", path.display()),
+            "No action needed.",
+        ),
+        None => DoctorCheck::warn(
+            "Kit: GUI overlay",
+            format!(
+                "{} was not found.",
+                chefer_bundle::layout::gui_overlay_name(arch)
+            ),
+            "Packaging a GUI app (interface_mode gui/both) for a Windows/macOS target embeds this overlay (cage/Xwayland/Mesa) so the WHP micro-VM and macOS VM can render a window; without it those backends print an actionable error and GUI degrades. Add it from the latest release kit.",
         ),
     }
 }
