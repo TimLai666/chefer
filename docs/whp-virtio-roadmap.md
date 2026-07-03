@@ -76,9 +76,12 @@ M1-M7（blk/persist/net/NAT 含預設 bridge）皆已實機完成後，WHP 僅�
 指標用 virtio-input tablet（絕對座標）；剪貼簿走既有網路通道 + cmdline token
 （不做 virtio-vsock）。
 
-1. **M8-a（QEMU，CI 可跑，與 vz 共用）**：kernel 加 DRM/DRM_VIRTIO_GPU/INPUT_EVDEV；
-   `scripts/build-gui-overlay.sh`（容器內收 Alpine 套件閉包）；init 解 overlay 到 tmpfs 根；
-   guest-agent 以 `cage --` 包 gui 服務。QEMU 加 `-device virtio-gpu` 等驗真的算繪出畫面。
+1. ✅ **M8-a（QEMU 驗證達成，與 vz 共用）**：kernel DRM config + `build-gui-overlay.sh` +
+   guest-agent `gui.rs`（解 overlay、udevd/seatd/cage、等 socket、設 env）。QEMU(KVM) 實測
+   xclock 全螢幕算繪。踩雷與解法（seatd 必要、Xwayland `-ac` shim、cage sleep 佔位、
+   `WLR_RENDERER=pixman`）詳 DESIGN §6 M8-a。**在 WSL 內以 QEMU 迭代 guest 側的流程**：
+   bundle 目錄 tar 成 vda（`tar -cf bundle.tar -C bundle .`）→ qemu -kernel/-initrd + 三個
+   virtio 裝置 + `-serial file:` + `-monitor unix:` → `screendump` 驗畫面（本檔尾附完整指令形）。
 2. **M8-b（純邏輯，與 M8-a 並行）**：`whp-helper/src/virtio/{gpu,input}.rs` + 單元測試。
 3. **M8-c**：helper Win32 視窗執行緒（blit + WM→virtio-input；關窗=app 結束語意）。
 4. **M8-d**：實機接線（gpu `0xD000_0600`/IRQ 8、input `0xD000_0800`/IRQ 9 起排）。

@@ -131,7 +131,7 @@ pub fn pack(app: &AppCipe, opts: &PackOptions) -> Result<PackResult> {
     }
 
     copy_agents(&bundle_dir, &manifest, opts)?;
-    copy_vm_assets(&bundle_dir, opts)?;
+    copy_vm_assets(&bundle_dir, &manifest, opts)?;
 
     Ok(PackResult {
         bundle_dir,
@@ -408,13 +408,49 @@ fn copy_agents(bundle_dir: &Path, manifest: &Manifest, opts: &PackOptions) -> Re
 ///
 /// VM 資產依 DESIGN §2 採 best-effort：缺少時警告但不阻斷建置；產物仍可 assemble，
 /// 只是在執行時由對應後端回報明確不可用原因。
-fn copy_vm_assets(bundle_dir: &Path, opts: &PackOptions) -> Result<()> {
-    copy_macos_vm_assets(bundle_dir, opts)?;
-    copy_windows_whp_vm_assets(bundle_dir, opts)?;
+fn copy_vm_assets(bundle_dir: &Path, manifest: &Manifest, opts: &PackOptions) -> Result<()> {
+    // GUI overlay 嵌入規則（DESIGN §6「GUI overlay 打包契約」）：app 有任一 gui/both
+    // 服務才嵌（純 server app 不揹體積）；target 維度由各 VM assets 函式判斷
+    // （Windows/macOS target 才會走到 vm/ 複製）。
+    let wants_gui = manifest
+        .services
+        .iter()
+        .any(|s| s.interface_mode.wants_gui());
+    copy_macos_vm_assets(bundle_dir, wants_gui, opts)?;
+    copy_windows_whp_vm_assets(bundle_dir, wants_gui, opts)?;
     Ok(())
 }
 
-fn copy_macos_vm_assets(bundle_dir: &Path, opts: &PackOptions) -> Result<()> {
+/// 依嵌入規則把 GUI overlay 複製進 bundle `vm/`。缺件（kit 沒有 overlay）警告不阻斷：
+/// 執行期 VM 後端遇 gui 服務會回報明確錯誤（不得無聲黑屏），wsl2 後端不受影響。
+fn copy_gui_overlay_for_arch(
+    kit_dirs: &[PathBuf],
+    vm_dir: &Path,
+    arch: &str,
+    runtime_label: &str,
+) -> Result<()> {
+    let name = layout::gui_overlay_name(arch);
+    match kit::find_gui_overlay(kit_dirs, arch) {
+        Some(src) => {
+            fs::create_dir_all(vm_dir)?;
+            let dst = vm_dir.join(&name);
+            fs::copy(&src, &dst)
+                .with_context(|| format!("failed to copy GUI overlay: {}", src.display()))?;
+        }
+        None => {
+            eprintln!(
+                "warning: GUI overlay not found (need {name}). Searched kit directories: {}. \
+                 This app has a gui/both service; without the overlay it cannot display a GUI \
+                 on the {runtime_label} micro-VM backend (other backends are unaffected). \
+                 Add {name} to the kit (built by scripts/build-gui-overlay.sh) and repack to enable it.",
+                format_kit_dirs(kit_dirs),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn copy_macos_vm_assets(bundle_dir: &Path, wants_gui: bool, opts: &PackOptions) -> Result<()> {
     let mut arches: BTreeSet<&'static str> = BTreeSet::new();
     for target in &opts.target_triples {
         if let Some(arch) = macos_target_arch(target) {
@@ -437,6 +473,9 @@ fn copy_macos_vm_assets(bundle_dir: &Path, opts: &PackOptions) -> Result<()> {
             "macOS micro-VM appliance",
             "macOS",
         )?;
+        if wants_gui {
+            copy_gui_overlay_for_arch(&kit_dirs, &vm_dir, arch, "macOS vz")?;
+        }
 
         // vz 開機 helper（host macho，已於 release 以 virtualization entitlement 簽章）→ agents/。
         // best-effort：缺少時警告但不阻斷（執行期 vz 後端會回報 helper 缺失，或可用 CHEFER_VZ_HELPER）。
@@ -470,7 +509,11 @@ fn copy_macos_vm_assets(bundle_dir: &Path, opts: &PackOptions) -> Result<()> {
     Ok(())
 }
 
-fn copy_windows_whp_vm_assets(bundle_dir: &Path, opts: &PackOptions) -> Result<()> {
+fn copy_windows_whp_vm_assets(
+    bundle_dir: &Path,
+    wants_gui: bool,
+    opts: &PackOptions,
+) -> Result<()> {
     let mut arches: BTreeSet<&'static str> = BTreeSet::new();
     for target in &opts.target_triples {
         if let Some(arch) = windows_target_arch(target) {
@@ -493,6 +536,9 @@ fn copy_windows_whp_vm_assets(bundle_dir: &Path, opts: &PackOptions) -> Result<(
             "Windows WHP micro-VM appliance",
             "Windows WHP",
         )?;
+        if wants_gui {
+            copy_gui_overlay_for_arch(&kit_dirs, &vm_dir, arch, "Windows WHP")?;
+        }
 
         // WHP helper（host Windows exe）→ agents/。
         // 目前是 contract skeleton；缺少時只警告，執行期 whp 後端仍會明確 Unavailable。

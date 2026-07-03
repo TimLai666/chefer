@@ -66,6 +66,13 @@ pub fn find_appliance(kit_dirs: &[PathBuf], arch: &str) -> Option<(PathBuf, Path
     Some((kernel, initramfs))
 }
 
+/// 尋找指定 guest 架構的 GUI overlay（`chefer-gui-overlay-<arch>.tar.zst`；可選——
+/// 缺少時「gui/both 服務 × Windows/macOS target」的 bundle 在 VM 後端無法顯示 GUI，
+/// build 時應印明確警告）。供 chefer-pack 依 DESIGN §6 的嵌入規則放進 bundle `vm/`。
+pub fn find_gui_overlay(kit_dirs: &[PathBuf], arch: &str) -> Option<PathBuf> {
+    find_first(kit_dirs, &[crate::layout::gui_overlay_name(arch)])
+}
+
 /// 尋找 macOS vz 開機 helper（`chefer-vz-helper-<arch>`，host macho）。
 /// 供 chefer-pack 在打包 macOS 目標時內嵌進 bundle 的 `agents/`。
 pub fn find_vz_helper(kit_dirs: &[PathBuf], arch: &str) -> Option<PathBuf> {

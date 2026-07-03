@@ -1,0 +1,227 @@
+//! VM guest 的 GUI 顯示環境（DESIGN §6「GUI overlay 打包契約」「WHP GUI」）。
+//!
+//! 原生 Linux / WSL2 走「bind host compositor socket」路線（exec.rs 既有邏輯）；
+//! micro-VM（WHP / vz）內沒有 host compositor——由本模組在 guest 內自建：
+//!
+//! 1. 解壓 bundle `vm/chefer-gui-overlay-<arch>.tar.zst`（cage + Xwayland + Mesa
+//!    llvmpipe + eudev 及依賴閉包，Alpine 基底）到根（appliance init 已 switch_root
+//!    到 tmpfs 根，可直接疊上）。
+//! 2. 啟動 `udevd` 並 trigger（wlroots 的 DRM/libinput 裝置探索需要 udev）、
+//!    `seatd`（Alpine 的 libseat 沒編 builtin backend）。
+//! 3. 以 `LIBSEAT_BACKEND=seatd` 啟動 `cage`（kiosk Wayland compositor；子行程給
+//!    長眠 sleep 佔位，介面服務其後以一般 Wayland/X11 client 連上），等待
+//!    `$XDG_RUNTIME_DIR/wayland-0`（與 Xwayland 的 `/tmp/.X11-unix/X0`）出現。
+//! 4. 設定 `XDG_RUNTIME_DIR`/`WAYLAND_DISPLAY`/`DISPLAY` 供 exec.rs 既有的
+//!    GUI socket bind 邏輯把 socket 掛進服務容器。
+//!
+//! 觸發條件（`maybe_start`）：appliance init 設 `CHEFER_VM_GUI=1` **且** manifest
+//! 有 gui/both 服務。overlay 缺失 → 硬錯誤（依契約不得無聲黑屏）。
+
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail};
+use chefer_bundle::Manifest;
+
+/// cage 建立 Wayland socket 的 runtime 目錄（guest 內，appliance tmpfs 上）。
+const GUI_RUNTIME_DIR: &str = "/run/chefer-gui";
+/// 等 compositor socket 出現的上限。llvmpipe 首次啟動慢，放寬一點。
+const SOCKET_WAIT: Duration = Duration::from_secs(20);
+
+/// 存活中的 GUI 環境；Drop 時收掉 cage / seatd / udevd。
+pub struct GuiSession {
+    cage: Child,
+    seatd: Option<Child>,
+    udevd: Option<Child>,
+}
+
+impl Drop for GuiSession {
+    fn drop(&mut self) {
+        let _ = self.cage.kill();
+        let _ = self.cage.wait();
+        for c in [self.seatd.take(), self.udevd.take()].into_iter().flatten() {
+            let mut c = c;
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+
+/// 需要時建立 VM 內 GUI 環境。回傳 `Ok(None)` 表示不適用（非 VM GUI 情境）。
+pub fn maybe_start(bundle_dir: &Path, manifest: &Manifest) -> Result<Option<GuiSession>> {
+    if std::env::var_os("CHEFER_VM_GUI").is_none_or(|v| v != "1") {
+        return Ok(None);
+    }
+    if !manifest
+        .services
+        .iter()
+        .any(|s| s.interface_mode.wants_gui())
+    {
+        return Ok(None);
+    }
+
+    let overlay = chefer_bundle::layout::vm_dir(bundle_dir).join(
+        chefer_bundle::layout::gui_overlay_name(std::env::consts::ARCH),
+    );
+    if !overlay.is_file() {
+        // 契約：缺 overlay 的 GUI app 在 VM 後端必須得到可行動錯誤，不得無聲黑屏。
+        bail!(
+            "this app has a GUI service, but the bundle has no GUI overlay ({}). \
+             It was probably packed with a kit that lacks chefer-gui-overlay-{} \
+             (see the warning printed by `chefer build`). Repack with a complete kit \
+             (built by scripts/build-gui-overlay.sh, shipped in releases) to show a GUI here.",
+            overlay.display(),
+            std::env::consts::ARCH,
+        );
+    }
+
+    eprintln!("[guest-agent] gui: unpacking the GUI overlay (cage/Xwayland/Mesa) …");
+    unpack_overlay(&overlay).context("failed to unpack the GUI overlay")?;
+
+    let udevd = start_udev();
+    let seatd = start_seatd();
+    let cage = start_cage().context("failed to start the in-VM compositor (cage)")?;
+    let mut session = GuiSession { cage, seatd, udevd };
+
+    let wayland = PathBuf::from(GUI_RUNTIME_DIR).join("wayland-0");
+    wait_for_socket(&wayland, &mut session)?;
+    // SAFETY: 服務尚未 spawn、supervisor 執行緒尚未啟動的單執行緒早期階段。
+    unsafe {
+        std::env::set_var("XDG_RUNTIME_DIR", GUI_RUNTIME_DIR);
+        std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+    }
+    // Xwayland（X11 app 支援）：cage/wlroots 啟用時會先建立 X0 socket（lazy 啟動仍先佔位）。
+    // 沒編 Xwayland 的 cage 也不致命——純 Wayland app 仍可用，X11 app 會連不到 DISPLAY。
+    let x0 = Path::new("/tmp/.X11-unix/X0");
+    if x0.exists() {
+        // SAFETY: 同上，仍在單執行緒階段。
+        // access control 已由 overlay 的 Xwayland shim 以 `-ac` 關閉（安全邊界是
+        // micro-VM 本身；實測不帶 cookie 的同 uid 本機連線也會被拒，見 build-gui-overlay.sh）。
+        unsafe { std::env::set_var("DISPLAY", ":0") };
+    } else {
+        eprintln!(
+            "[guest-agent] gui: Xwayland socket not present; X11-only apps will not find a DISPLAY (Wayland apps are unaffected)"
+        );
+    }
+    eprintln!("[guest-agent] gui: compositor ready (WAYLAND_DISPLAY=wayland-0)");
+    Ok(Some(session))
+}
+
+/// 解壓 overlay（tar.zst 的 rootfs subtree）到 `/`。
+/// 用 ruzstd（純 Rust，與層解壓同一套）+ tar unpack；覆蓋既有檔（Alpine 基底疊上 busybox 根）。
+fn unpack_overlay(overlay: &Path) -> Result<()> {
+    let f = std::fs::File::open(overlay)
+        .with_context(|| format!("failed to open {}", overlay.display()))?;
+    let zst = ruzstd::decoding::StreamingDecoder::new(std::io::BufReader::new(f))
+        .context("failed to start zstd decoding")?;
+    let mut ar = tar::Archive::new(zst);
+    ar.set_preserve_permissions(true);
+    ar.set_unpack_xattrs(false);
+    ar.set_overwrite(true);
+    ar.unpack("/").context("failed to extract to /")?;
+    Ok(())
+}
+
+/// 啟動 udevd 並 trigger 一輪裝置事件（best-effort：udev 缺失時 wlroots 多半仍可
+/// 直接開 /dev/dri，僅 libinput 熱插拔受影響——印訊息不致命）。
+fn start_udev() -> Option<Child> {
+    let udevd = ["/sbin/udevd", "/usr/sbin/udevd", "/sbin/eudevd"]
+        .iter()
+        .find(|p| Path::new(p).is_file())?;
+    let child = Command::new(udevd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| eprintln!("[guest-agent] gui: udevd failed to start ({e}); continuing"))
+        .ok()?;
+    for args in [
+        &["trigger", "--action=add"][..],
+        &["settle", "--timeout=5"][..],
+    ] {
+        let _ = Command::new("/bin/udevadm")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    Some(child)
+}
+
+/// 啟動 seatd（libseat 的 seat 管理 daemon）。Alpine 的 libseat 沒編 builtin backend
+/// （實測 cage 直接退出：`No backend matched name 'builtin'`），故起 seatd、等它的
+/// socket 就緒。失敗回 None（cage 隨後會失敗並給出可行動錯誤）。
+fn start_seatd() -> Option<Child> {
+    let seatd = ["/usr/bin/seatd", "/bin/seatd"]
+        .iter()
+        .find(|p| Path::new(p).is_file())?;
+    let child = Command::new(seatd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| eprintln!("[guest-agent] gui: seatd failed to start ({e})"))
+        .ok()?;
+    // 等 /run/seatd.sock 出現（最多 3 秒；沒等到也讓 cage 自己再試）。
+    let sock = Path::new("/run/seatd.sock");
+    let start = Instant::now();
+    while !sock.exists() && start.elapsed() < Duration::from_secs(3) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Some(child)
+}
+
+/// 啟動 cage。子行程用長眠 sleep 佔位（cage 需要一個 client 引數；真正的介面服務
+/// 稍後以一般 client 連上 Wayland/X11 socket）。
+fn start_cage() -> Result<Child> {
+    let cage = ["/usr/bin/cage", "/bin/cage"]
+        .iter()
+        .find(|p| Path::new(p).is_file())
+        .context("cage not found after unpacking the GUI overlay (overlay is incomplete?)")?;
+    std::fs::create_dir_all(GUI_RUNTIME_DIR)?;
+    let mut perm = std::fs::metadata(GUI_RUNTIME_DIR)?.permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perm.set_mode(0o700);
+    std::fs::set_permissions(GUI_RUNTIME_DIR, perm)?;
+
+    let child = Command::new(cage)
+        .arg("--")
+        .arg("/bin/sleep")
+        .arg("2147483647")
+        .env("XDG_RUNTIME_DIR", GUI_RUNTIME_DIR)
+        .env("WLR_RENDERER", "pixman") // VM 無 GPU：強制軟算繪，避免 GLES 探測失敗
+        .env("LIBSEAT_BACKEND", "seatd") // Alpine libseat 無 builtin backend → 走 seatd
+        .stdin(Stdio::null())
+        // cage/wlroots 的啟動失敗原因（缺 DRM、keymap…）只會出現在 stderr——
+        // 沿用 guest-agent stderr（VM console/診斷通道），別吞掉。
+        .spawn()?;
+    Ok(child)
+}
+
+/// 等 compositor socket 出現；cage 提前退出時把 exit status 化為錯誤。
+fn wait_for_socket(sock: &Path, session: &mut GuiSession) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        if sock.exists() {
+            return Ok(());
+        }
+        if let Some(status) = session.cage.try_wait()? {
+            bail!(
+                "the in-VM compositor (cage) exited during startup ({status}); \
+                 GUI cannot be shown. Check the guest log for wlroots errors \
+                 (missing /dev/dri usually means the appliance kernel lacks virtio-gpu, \
+                 or the VM host did not attach a virtio-gpu device)."
+            );
+        }
+        if start.elapsed() > SOCKET_WAIT {
+            bail!(
+                "timed out waiting for the compositor socket {} ({}s); GUI cannot be shown",
+                sock.display(),
+                SOCKET_WAIT.as_secs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}

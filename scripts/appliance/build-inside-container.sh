@@ -48,6 +48,12 @@ enable_kernel_options() {
   # pasta（bridge 出網 NAT）要在 app netns 內建立 tap 裝置；x86_64 defconfig 不含 TUN，
   # 缺了它 pasta 起不來、bridge 會靜默降級成 internal（只有 lo、無出網）。
   "$cfg" --enable TUN
+  # GUI（M8）：virtio-gpu scanout（cage/wlroots 的 DRM/KMS backend）與 virtio-input
+  # （WHP host 視窗轉入的鍵鼠 evdev 事件）。見 DESIGN §6「WHP GUI」。
+  "$cfg" --enable DRM
+  "$cfg" --enable DRM_VIRTIO_GPU
+  "$cfg" --enable INPUT_EVDEV
+  "$cfg" --enable VIRTIO_INPUT
   "$cfg" --enable DAX
   "$cfg" --enable FS_DAX
   "$cfg" --enable FUSE_FS
