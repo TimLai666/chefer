@@ -390,16 +390,16 @@ AppCipe 新增 app 級欄位 **`network`**（appcipe-spec enum，serde rename �
 **平台界線（架構限制，非未實作）**——只在能實際觸及 host GPU 的後端可行：
 
 - **原生 Linux（namespaces）**：bind `/dev/dri`（DRM render/display）+ `/dev/nvidia*`（NVIDIA）。userspace 驅動 libs 的版本必須與 host kernel module 相符（類 NVIDIA Container Toolkit）；**首版只做節點綁定**，image 需自帶相符 libs，否則 app 於 dlopen 時失敗（錯誤來自 app 本身）。相符 libs 的自動注入列後續階段。
-- **Windows WSL2**：bind `/dev/dxg`（Microsoft GPU-PV）+ `/dev/dri` + host `/usr/lib/wsl/lib`（內含 host 版本相符的 `libcuda`/`libdxcore` 等），並把 `/usr/lib/wsl/lib` 加進容器 `LD_LIBRARY_PATH` → CUDA/DirectML/OpenCL/Vulkan 直接可用（繞過原生 Linux 的版本對齊難題）。
+- **Windows WSL2**：bind `/dev/dxg`（Microsoft GPU-PV）+（存在時）`/dev/dri` + host `/usr/lib/wsl/lib` **與 `/usr/lib/wsl/drivers`**（後者為 Windows DriverStore，WSL 以 9p 掛入），並把 `/usr/lib/wsl/lib` 加進容器 `LD_LIBRARY_PATH` → CUDA/DirectML/OpenCL/Vulkan 直接可用（繞過原生 Linux 的版本對齊難題）。**`/usr/lib/wsl/lib` 內的 `libcuda`/`libnvidia-ml` 是 loader shim，執行期 dlopen 真正的驅動實作於 `/usr/lib/wsl/drivers`（`libcuda_loader.so`/`libnvidia-ptxjitcompiler.so`/`nvcubins.bin` 等），故兩個目錄都要綁——只綁 `lib` 而漏綁 `drivers`，容器內 CUDA/`nvidia-smi` 會回「couldn't communicate with the NVIDIA driver / Driver Not Loaded」**（一般 WSL distro 兩者皆由 WSL 自動掛載；容器換了 mount namespace 故須一併帶入，同 nvidia-container-toolkit 的 WSL 模式）。此機 WSL kernel（6.6.87.2）未暴露 `/dev/dri`——CUDA 走 `/dev/dxg` 不需之。
 - **不支援**：Windows WHP micro-VM 與 macOS vz——裸 WHP/VZ VM 拿不到 Microsoft/Apple 的 GPU 半虛擬化（那套綁 WSL2/Sandbox/Hyper-V-GPU-P），virtio-gpu 只有顯示、無 compute。這些後端上 `gpu: true` → **服務啟動時明確錯誤**（不靜默綁到 virtio-gpu 的 2D `/dev/dri`）。
 
 **後端可否 GPU 的訊號**：沿用 `udp_bridge` 的接線範式——`RunConfig` 加 `gpu_host: bool`、guest-agent bin 加 `--gpu-host` 旗標。namespaces 後端設 `true`；wsl2 後端呼叫 guest-agent 時帶 `--gpu-host`；whp/vz 的 appliance init **不帶**（→ `false`）。guest-agent 對 `gpu: true` 的服務：`gpu_host == false` → 明確「此後端不支援 GPU passthrough」錯誤；`gpu_host == true` → 探測並 bind 存在的節點，一個都沒有 → 明確「找不到 GPU 節點（已搜尋 …）」錯誤（附「需 GPU 驅動 / WSL GPU-PV」提示）。
 
-**節點探測與綁定**（`guest-agent/src/gpu.rs`）：探測 host 的 `/dev/dxg`、`/dev/dri`、`/dev/nvidia*`（`nvidia0…`/`nvidiactl`/`nvidia-uvm`/`nvidia-uvm-tools`/`nvidia-modeset`/`nvidia-caps`）、`/usr/lib/wsl/lib`；存在者以既有 `BindEntry` 機制綁進容器（裝置節點可讀寫、lib 目錄唯讀），在 `setup_dev` 建好 `/dev` tmpfs 之後套用（節點落進該 tmpfs）。**只綁存在者**（沿用 host 基本裝置「不存在略過」的慣例）。rootless 原生 Linux 綁 root 擁有的 `/dev/nvidia*` 受節點權限限制（多為 0666 可用；失敗則透傳 mount 錯誤）。
+**節點探測與綁定**（`guest-agent/src/gpu.rs`）：探測 host 的 `/dev/dxg`、`/dev/dri`、`/dev/nvidia*`（`nvidia0…`/`nvidiactl`/`nvidia-uvm`/`nvidia-uvm-tools`/`nvidia-modeset`/`nvidia-caps`）、`/usr/lib/wsl/lib`（存在時連同兄弟目錄 `/usr/lib/wsl/drivers` 一併綁，見上）；存在者以既有 `BindEntry` 機制綁進容器（裝置節點可讀寫、lib/drivers 目錄唯讀），在 `setup_dev` 建好 `/dev` tmpfs 之後套用（節點落進該 tmpfs）。**只綁存在者**（沿用 host 基本裝置「不存在略過」的慣例）。rootless 原生 Linux 綁 root 擁有的 `/dev/nvidia*` 受節點權限限制（多為 0666 可用；失敗則透傳 mount 錯誤）。
 
 **版本**：`gpu` 為相容加法（可選欄位、預設關；舊 recipe/bundle 缺欄位 → `false`）→ `APPCIPE_SPEC_VERSION`、`MANIFEST_FORMAT_VERSION`、`appcipe-spec`/`appcipe-normalize` 版號**皆不動**（同 `network`/`console`/`healthcheck` 當年加入時）。
 
-**分階段**：① 契約 + spec/manifest/pack 欄位 + guest-agent 節點綁定 + WSL2 lib 綁定/LD path + 後端界線錯誤（本 PR；**WSL2 實機已驗證**：`gpu: true` 的容器內見 `/dev/dxg`、`/dev/dri`（card0/renderD128）、`/usr/lib/wsl/lib`，`LD_LIBRARY_PATH` 指向驅動 libs，服務 exit 0）→ ② 原生 Linux 的 host 相符 userspace lib 自動注入（類 NVIDIA Container Toolkit；最難，獨立 PR）。
+**分階段**：① 契約 + spec/manifest/pack 欄位 + guest-agent 節點綁定 + WSL2 lib/drivers 綁定/LD path + 後端界線錯誤（本 PR；**WSL2 實機已驗證真 GPU 計算**：`gpu: true` 的容器內 `nvidia-smi` 完整列出 host GPU（含即時溫度/用量），且 `nvcc` 編出的 CUDA vectorAdd 在 GPU 上算出正確結果——`NVIDIA GeForce GT 1030`、`sm_61`、driver 582.66、`vectorAdd n=1048576 mismatches=0 → PASS`、exit 0。**首版曾只綁 `/usr/lib/wsl/lib` 而漏綁 `/usr/lib/wsl/drivers`，導致 `nvidia-smi` 回「Driver Not Loaded」；補綁 drivers store 後修正**，見上「平台界線」節）→ ② 原生 Linux 的 host 相符 userspace lib 自動注入（類 NVIDIA Container Toolkit；最難，獨立 PR）。
 
 ### Dockerfile build（`source: dockerfile`）— 設計
 
