@@ -14,16 +14,62 @@ pub const MANIFEST_FORMAT_VERSION: u32 = 1;
 
 /// per-service GPU 請求：關 / 全部 / 指定 NVIDIA 卡索引（硬隔離）。
 ///
-/// serde untagged，向後相容舊的布林寫法：`false` = 關、`true` = 全部 GPU、
-/// `[0, 2]` = 只綁 `/dev/nvidia0`、`/dev/nvidia2`（其餘 nvidia 數字節點不綁）。
-/// 舊 recipe/manifest 的 `gpu: true`/`false` 照樣解析成 `All(_)`，故 spec/manifest 版號不動。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// 接受：`false`/`true`、字串 `"all"`/`"none"`（Docker `--gpus all` 慣用，不分大小寫）、
+/// 或索引清單 `[0, 2]`（只綁 `/dev/nvidia0`、`/dev/nvidia2`）。舊 recipe/manifest 的
+/// `gpu: true`/`false` 照樣解析成 `All(_)`，故 spec/manifest 版號不動。序列化採 untagged
+/// （`All(true)` → `true`、`Devices` → `[…]`；`"all"` 只是輸入糖，manifest 存正規形 `true`）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum GpuRequest {
     /// `false` = 關；`true` = 全部 GPU。
     All(bool),
     /// 指定的 host NVIDIA 卡索引（對應 `/dev/nvidia<N>`）；硬隔離，其餘 nvidia 節點不進容器。
     Devices(Vec<u32>),
+}
+
+impl<'de> Deserialize<'de> for GpuRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct GpuVisitor;
+        impl<'de> serde::de::Visitor<'de> for GpuVisitor {
+            type Value = GpuRequest;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(
+                    "`false`/`true`, `\"all\"`/`\"none\"`, or a list of GPU card indices like `[0, 2]`",
+                )
+            }
+            fn visit_bool<E>(self, v: bool) -> Result<GpuRequest, E> {
+                Ok(GpuRequest::All(v))
+            }
+            fn visit_str<E>(self, v: &str) -> Result<GpuRequest, E>
+            where
+                E: serde::de::Error,
+            {
+                if v.eq_ignore_ascii_case("all") {
+                    Ok(GpuRequest::All(true))
+                } else if v.eq_ignore_ascii_case("none") {
+                    Ok(GpuRequest::All(false))
+                } else {
+                    Err(E::custom(format!(
+                        "invalid gpu value {v:?}; use false/true, \"all\"/\"none\", or a list like [0, 2]"
+                    )))
+                }
+            }
+            fn visit_seq<A>(self, mut seq: A) -> Result<GpuRequest, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut v = Vec::new();
+                while let Some(x) = seq.next_element::<u32>()? {
+                    v.push(x);
+                }
+                Ok(GpuRequest::Devices(v))
+            }
+        }
+        deserializer.deserialize_any(GpuVisitor)
+    }
 }
 
 impl Default for GpuRequest {
@@ -302,6 +348,31 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_request_parses_all_forms() {
+        let p = |s: &str| serde_json::from_str::<GpuRequest>(s).unwrap();
+        assert_eq!(p("false"), GpuRequest::All(false));
+        assert_eq!(p("true"), GpuRequest::All(true));
+        assert_eq!(p("\"all\""), GpuRequest::All(true)); // Docker-style alias
+        assert_eq!(p("\"ALL\""), GpuRequest::All(true)); // case-insensitive
+        assert_eq!(p("\"none\""), GpuRequest::All(false));
+        assert_eq!(p("[0, 2]"), GpuRequest::Devices(vec![0, 2]));
+        // 無效字串明確報錯（非靜默）。
+        assert!(serde_json::from_str::<GpuRequest>("\"yes\"").is_err());
+        // 序列化採 untagged，`"all"` 只是輸入糖 → manifest 存正規形。
+        assert_eq!(
+            serde_json::to_string(&GpuRequest::All(true)).unwrap(),
+            "true"
+        );
+        assert_eq!(
+            serde_json::to_string(&GpuRequest::Devices(vec![0, 2])).unwrap(),
+            "[0,2]"
+        );
+        // enabled/devices 語意不變。
+        assert!(GpuRequest::All(true).enabled());
+        assert_eq!(GpuRequest::Devices(vec![1]).devices(), Some(&[1u32][..]));
+    }
 
     fn svc(name: &str) -> ServiceEntry {
         ServiceEntry {
