@@ -70,6 +70,7 @@ kernel（例如 vectorAdd）。已實測 chefer 於 WSL2 + GT 1030 上：`nvcc -
 
 - ✅ **`nvidia-smi`**：容器內 `command -v nvidia-smi → /usr/bin/nvidia-smi`，列出 RTX 4070。
 - ✅ **真 CUDA**：`nvidia/cuda:*-devel` 的 `nvcc -arch=sm_89` vectorAdd → `n=1048576 mismatches=0 → PASS`、exit 0。
+- ✅ **ML 框架（PyTorch）**：`pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime` + `gpu: true` → `torch.cuda.is_available()==True`、偵測到 RTX 4070、GPU matmul 正確、一個真訓練迴圈 loss 下降、`PYTORCH_GPU_PASS`、exit 0（映像自帶 cuDNN/cuBLAS，chefer 只注入 driver）。
 - ✅ **NVENC 視訊**：容器內 `ffmpeg -c:v h264_nvenc` 編碼成功（`libnvidia-encode`/`libnvcuvid` 走 dlopen，不需圖形環境）。
 - ⚠️ **OpenGL / Vulkan 算繪**：**無頭容器不支援**——NVIDIA 的 GL/Vulkan userspace 需要實際的圖形/X server 環境
   才能初始化（連 `docker --gpus all` + nvidia-container-toolkit 於無頭 host 亦同樣失敗，退回 `llvmpipe`），

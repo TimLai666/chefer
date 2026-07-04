@@ -241,7 +241,7 @@ Honest list of what doesn't work (yet):
 
 | Vendor | What Chefer binds | Compute that works | Hardware-validated? |
 |---|---|---|---|
-| **NVIDIA** | native: `/dev/nvidia*` + host-driver-matched lib injection (`/run/chefer-nvidia`) + `nvidia-smi`; WSL2: `/dev/dxg` + `/usr/lib/wsl/lib` + `/usr/lib/wsl/drivers` | CUDA, NVENC/NVDEC video, `nvidia-smi` | ✅ **yes** — native RTX 4070 (CUDA vectorAdd + `h264_nvenc` + nvidia-smi) & WSL2 GT 1030 (CUDA vectorAdd + nvidia-smi) |
+| **NVIDIA** | native: `/dev/nvidia*` + host-driver-matched lib injection (`/run/chefer-nvidia`) + `nvidia-smi`; WSL2: `/dev/dxg` + `/usr/lib/wsl/lib` + `/usr/lib/wsl/drivers` | CUDA, **ML frameworks (PyTorch)**, NVENC/NVDEC video, `nvidia-smi` | ✅ **yes** — native RTX 4070 (CUDA vectorAdd + **PyTorch 2.4 GPU training** + `h264_nvenc` + nvidia-smi) & WSL2 GT 1030 (CUDA vectorAdd + nvidia-smi) |
 | **AMD** | `/dev/kfd` + `/dev/dri`; ROCm/HIP userspace from the image | ROCm/HIP, OpenCL | ⚠️ **no** — implemented, no AMD GPU to test on |
 | **Intel** | `/dev/dri`; oneAPI/Level-Zero userspace from the image | oneAPI/Level-Zero, OpenCL | ⚠️ **no** — implemented, no native-Linux Intel GPU to test on |
 
