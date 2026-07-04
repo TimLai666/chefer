@@ -404,7 +404,7 @@ AppCipe 新增 app 級欄位 **`network`**（appcipe-spec enum，serde rename �
 **② 實機驗證結果**（Ubuntu 24.04、GeForce RTX 4070、driver 570.211.01；namespaces 後端）：
 - **注入**：`gpu: true` 的容器內 `/run/chefer-nvidia/` 見注入的 `libcuda.so.{,1,570.211.01}`、`libnvidia-ptxjitcompiler`、`libnvidia-nvvm.so.4`（**DT_SONAME 非 major-1 正確解出**，非退回 `.so.1`）等 versioned+soname+`.so` 三名字組；`LD_LIBRARY_PATH` 含 `/run/chefer-nvidia`；`/dev/nvidia*` 節點在。
 - **真 CUDA**：映像（`nvidia/cuda:*-devel`）**本身不含 libcuda**，仍以 `nvcc -arch=sm_89` 編出的 vectorAdd 在 GPU 上算出 `device0=NVIDIA GeForce RTX 4070`、`n=1048576 mismatches=0 → PASS`、exit 0——證明 CUDA 純靠注入的 host 驅動庫即可運行。
-- **庫集完整性**：注入集對齊 `nvidia-container-cli list`（CUDA 計算 + NVENC/NVDEC 視訊 + OptiX + GL）。`nvidia-smi` 二進位不注入（僅 libs；in-container `nvidia-smi` 需另 bind `/usr/bin/nvidia-smi`，屬 follow-up，不影響 CUDA）。
+- **庫集完整性**：注入集對齊 `nvidia-container-cli list`（CUDA 計算 + NVENC/NVDEC 視訊 + OptiX + GL）。`nvidia-smi` 二進位也綁進容器 `/usr/bin/nvidia-smi`（native 從 `/usr/bin/nvidia-smi`、WSL2 從 `/usr/lib/wsl/lib/nvidia-smi`），故容器內可直接執行 `nvidia-smi`（實測 native RTX 4070 與 WSL2 GT 1030 皆 `command -v nvidia-smi → /usr/bin/nvidia-smi` 且列出 GPU、exit 0）。
 - **執行注記**：Ubuntu 24.04 預設以 AppArmor 擋非特權 user namespace 且該機無 `uidmap` 工具，rootless namespaces 不可用——以 root（`sudo`）執行 root 後端（真 namespace、免 userns）；nvidia/cuda 映像本就以 root 跑。
 
 ### Dockerfile build（`source: dockerfile`）— 設計
