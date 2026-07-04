@@ -389,7 +389,7 @@ AppCipe 新增 app 級欄位 **`network`**（appcipe-spec enum，serde rename �
 
 **平台界線（架構限制，非未實作）**——只在能實際觸及 host GPU 的後端可行：
 
-- **原生 Linux（namespaces）**：bind `/dev/dri`（DRM render/display）+ `/dev/nvidia*`（NVIDIA）。userspace 驅動 libs 的版本必須與 host kernel module 相符（類 NVIDIA Container Toolkit）；**首版只做節點綁定**，image 需自帶相符 libs，否則 app 於 dlopen 時失敗（錯誤來自 app 本身）。相符 libs 的自動注入列後續階段。
+- **原生 Linux（namespaces）**：bind `/dev/dri`（DRM render/display）+ `/dev/nvidia*`（NVIDIA）。userspace 驅動 libs 的版本必須與 host kernel module 相符（image 自帶的未必相符）——**已做 host 相符 lib 自動注入**（類 NVIDIA Container Toolkit）：`gpu.rs` 讀 `/proc/driver/nvidia/version` 取 driver 版本，掃標準 lib 目錄找版本相符（以 `.so.<driver-version>` 結尾）的 NVIDIA 驅動庫——涵蓋 `libcuda`/`libnvidia-*`（CUDA/NVML/PTX JIT/NVVM/OpenCL…）、`libnvcuvid`（NVENC/NVDEC）、`libnvoptix`（OptiX）、`libGLX_nvidia`/`libEGL_nvidia`/`libGLESv*_nvidia`（GL），對齊 `nvidia-container-cli list` 的庫集，每個以多重 bind mount 綁到容器 `/run/chefer-nvidia/` 下的 versioned + **真實 DT_SONAME**（解析 ELF 讀出，如 `libcuda.so.1`、`libnvidia-nvvm.so.4`；讀不到才退回 `.so.1` 假設）+ `.so`（dev）三個名字，並把該目錄加進 `LD_LIBRARY_PATH`（免在容器內建 symlink）。**已於原生 NVIDIA Linux 實機驗證真 CUDA 計算**（見下「分階段 ②」）。
 - **Windows WSL2**：bind `/dev/dxg`（Microsoft GPU-PV）+（存在時）`/dev/dri` + host `/usr/lib/wsl/lib` **與 `/usr/lib/wsl/drivers`**（後者為 Windows DriverStore，WSL 以 9p 掛入），並把 `/usr/lib/wsl/lib` 加進容器 `LD_LIBRARY_PATH` → CUDA/DirectML/OpenCL/Vulkan 直接可用（繞過原生 Linux 的版本對齊難題）。**`/usr/lib/wsl/lib` 內的 `libcuda`/`libnvidia-ml` 是 loader shim，執行期 dlopen 真正的驅動實作於 `/usr/lib/wsl/drivers`（`libcuda_loader.so`/`libnvidia-ptxjitcompiler.so`/`nvcubins.bin` 等），故兩個目錄都要綁——只綁 `lib` 而漏綁 `drivers`，容器內 CUDA/`nvidia-smi` 會回「couldn't communicate with the NVIDIA driver / Driver Not Loaded」**（一般 WSL distro 兩者皆由 WSL 自動掛載；容器換了 mount namespace 故須一併帶入，同 nvidia-container-toolkit 的 WSL 模式）。此機 WSL kernel（6.6.87.2）未暴露 `/dev/dri`——CUDA 走 `/dev/dxg` 不需之。
 - **不支援**：Windows WHP micro-VM 與 macOS vz——裸 WHP/VZ VM 拿不到 Microsoft/Apple 的 GPU 半虛擬化（那套綁 WSL2/Sandbox/Hyper-V-GPU-P），virtio-gpu 只有顯示、無 compute。這些後端上 `gpu: true` → **服務啟動時明確錯誤**（不靜默綁到 virtio-gpu 的 2D `/dev/dri`）。
 
@@ -399,7 +399,13 @@ AppCipe 新增 app 級欄位 **`network`**（appcipe-spec enum，serde rename �
 
 **版本**：`gpu` 為相容加法（可選欄位、預設關；舊 recipe/bundle 缺欄位 → `false`）→ `APPCIPE_SPEC_VERSION`、`MANIFEST_FORMAT_VERSION`、`appcipe-spec`/`appcipe-normalize` 版號**皆不動**（同 `network`/`console`/`healthcheck` 當年加入時）。
 
-**分階段**：① 契約 + spec/manifest/pack 欄位 + guest-agent 節點綁定 + WSL2 lib/drivers 綁定/LD path + 後端界線錯誤（本 PR；**WSL2 實機已驗證真 GPU 計算**：`gpu: true` 的容器內 `nvidia-smi` 完整列出 host GPU（含即時溫度/用量），且 `nvcc` 編出的 CUDA vectorAdd 在 GPU 上算出正確結果——`NVIDIA GeForce GT 1030`、`sm_61`、driver 582.66、`vectorAdd n=1048576 mismatches=0 → PASS`、exit 0。**首版曾只綁 `/usr/lib/wsl/lib` 而漏綁 `/usr/lib/wsl/drivers`，導致 `nvidia-smi` 回「Driver Not Loaded」；補綁 drivers store 後修正**，見上「平台界線」節）→ ② 原生 Linux 的 host 相符 userspace lib 自動注入（類 NVIDIA Container Toolkit；最難，獨立 PR）。
+**分階段**：① 契約 + spec/manifest/pack 欄位 + guest-agent 節點綁定 + WSL2 lib/drivers 綁定/LD path + 後端界線錯誤（**WSL2 實機已驗證真 GPU 計算**：`gpu: true` 的容器內 `nvidia-smi` 完整列出 host GPU（含即時溫度/用量），且 `nvcc` 編出的 CUDA vectorAdd 在 GPU 上算出正確結果——`NVIDIA GeForce GT 1030`、`sm_61`、driver 582.66、`vectorAdd n=1048576 mismatches=0 → PASS`、exit 0。**首版曾只綁 `/usr/lib/wsl/lib` 而漏綁 `/usr/lib/wsl/drivers`，導致 `nvidia-smi` 回「Driver Not Loaded」；補綁 drivers store 後修正**，見上「平台界線」節）→ ② 原生 Linux 的 host 相符 userspace lib 自動注入（類 NVIDIA Container Toolkit）——**已實作（`gpu.rs` `parse_nvidia_version`/`nvidia_lib_binds`/`read_soname`，含單元測試）並於原生 NVIDIA Linux 實機驗證真 CUDA 計算**。
+
+**② 實機驗證結果**（Ubuntu 24.04、GeForce RTX 4070、driver 570.211.01；namespaces 後端）：
+- **注入**：`gpu: true` 的容器內 `/run/chefer-nvidia/` 見注入的 `libcuda.so.{,1,570.211.01}`、`libnvidia-ptxjitcompiler`、`libnvidia-nvvm.so.4`（**DT_SONAME 非 major-1 正確解出**，非退回 `.so.1`）等 versioned+soname+`.so` 三名字組；`LD_LIBRARY_PATH` 含 `/run/chefer-nvidia`；`/dev/nvidia*` 節點在。
+- **真 CUDA**：映像（`nvidia/cuda:*-devel`）**本身不含 libcuda**，仍以 `nvcc -arch=sm_89` 編出的 vectorAdd 在 GPU 上算出 `device0=NVIDIA GeForce RTX 4070`、`n=1048576 mismatches=0 → PASS`、exit 0——證明 CUDA 純靠注入的 host 驅動庫即可運行。
+- **庫集完整性**：注入集對齊 `nvidia-container-cli list`（CUDA 計算 + NVENC/NVDEC 視訊 + OptiX + GL）。`nvidia-smi` 二進位不注入（僅 libs；in-container `nvidia-smi` 需另 bind `/usr/bin/nvidia-smi`，屬 follow-up，不影響 CUDA）。
+- **執行注記**：Ubuntu 24.04 預設以 AppArmor 擋非特權 user namespace 且該機無 `uidmap` 工具，rootless namespaces 不可用——以 root（`sudo`）執行 root 後端（真 namespace、免 userns）；nvidia/cuda 映像本就以 root 跑。
 
 ### Dockerfile build（`source: dockerfile`）— 設計
 
