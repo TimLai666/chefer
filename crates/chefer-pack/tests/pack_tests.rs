@@ -182,7 +182,7 @@ fn make_service(image: ImageSourceOrPath) -> Service {
         interface_mode: Default::default(),
         depends_on: vec![],
         healthcheck: None,
-        gpu: false,
+        gpu: Default::default(),
     }
 }
 
@@ -325,16 +325,27 @@ fn pack_maps_gpu_flag_to_manifest() {
     ));
     let app = make_app("GpuOff", vec![("api", svc)]);
     let res = pack(&app, &default_opts(&tmp.path().join("off"))).unwrap();
-    assert!(!res.manifest.services[0].gpu);
+    assert!(!res.manifest.services[0].gpu.enabled());
 
-    // 顯式 gpu: true → manifest gpu == true
+    // 顯式 gpu: true → manifest gpu enabled
     let mut svc = make_service(ImageSourceOrPath::TarPath(
         image_tar.to_string_lossy().to_string(),
     ));
-    svc.gpu = true;
+    svc.gpu = chefer_bundle::GpuRequest::All(true);
     let app = make_app("GpuOn", vec![("api", svc)]);
     let res = pack(&app, &default_opts(&tmp.path().join("on"))).unwrap();
-    assert!(res.manifest.services[0].gpu);
+    assert!(res.manifest.services[0].gpu.enabled());
+    assert_eq!(res.manifest.services[0].gpu.devices(), None);
+
+    // gpu: [0, 2] → 卡索引清單原樣傳進 manifest。
+    let mut svc = make_service(ImageSourceOrPath::TarPath(
+        image_tar.to_string_lossy().to_string(),
+    ));
+    svc.gpu = chefer_bundle::GpuRequest::Devices(vec![0, 2]);
+    let app = make_app("GpuCards", vec![("api", svc)]);
+    let res = pack(&app, &default_opts(&tmp.path().join("cards"))).unwrap();
+    assert!(res.manifest.services[0].gpu.enabled());
+    assert_eq!(res.manifest.services[0].gpu.devices(), Some(&[0u32, 2][..]));
 }
 
 #[test]

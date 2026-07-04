@@ -12,6 +12,44 @@ use crate::ports::PortSpec;
 /// 目前的 manifest 格式版本。
 pub const MANIFEST_FORMAT_VERSION: u32 = 1;
 
+/// per-service GPU 請求：關 / 全部 / 指定 NVIDIA 卡索引（硬隔離）。
+///
+/// serde untagged，向後相容舊的布林寫法：`false` = 關、`true` = 全部 GPU、
+/// `[0, 2]` = 只綁 `/dev/nvidia0`、`/dev/nvidia2`（其餘 nvidia 數字節點不綁）。
+/// 舊 recipe/manifest 的 `gpu: true`/`false` 照樣解析成 `All(_)`，故 spec/manifest 版號不動。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GpuRequest {
+    /// `false` = 關；`true` = 全部 GPU。
+    All(bool),
+    /// 指定的 host NVIDIA 卡索引（對應 `/dev/nvidia<N>`）；硬隔離，其餘 nvidia 節點不進容器。
+    Devices(Vec<u32>),
+}
+
+impl Default for GpuRequest {
+    fn default() -> Self {
+        GpuRequest::All(false)
+    }
+}
+
+impl GpuRequest {
+    /// 是否要 GPU passthrough（`true` 或非空清單）。
+    pub fn enabled(&self) -> bool {
+        match self {
+            GpuRequest::All(b) => *b,
+            GpuRequest::Devices(d) => !d.is_empty(),
+        }
+    }
+
+    /// 指定的卡索引（`None` = 全部；`Some(&[])` 不會出現，見 `enabled`）。
+    pub fn devices(&self) -> Option<&[u32]> {
+        match self {
+            GpuRequest::Devices(d) => Some(d),
+            GpuRequest::All(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     pub format_version: u32,
@@ -74,10 +112,11 @@ pub struct ServiceEntry {
     #[serde(default)]
     pub healthcheck: Option<HealthCheck>,
     /// opt-in GPU passthrough（見 docs/DESIGN.md「GPU passthrough」節）。舊 bundle 無此欄位 →
-    /// 反序列化為 `false`。guest-agent 依此決定是否把 host GPU 節點 bind 進此服務容器
+    /// 反序列化為 `All(false)`。`true` = 全部 GPU、`[0,2]` = 只綁指定 NVIDIA 卡（硬隔離）。
+    /// guest-agent 依此決定要把哪些 host GPU 節點 bind 進此服務容器
     /// （僅原生 Linux / WSL2 後端；WHP/vz 回明確錯誤）。
     #[serde(default)]
-    pub gpu: bool,
+    pub gpu: GpuRequest,
 }
 
 /// 服務健康檢查（runtime 端解讀）。duration 一律已正規化為毫秒。
@@ -279,7 +318,7 @@ mod tests {
             interface_mode: InterfaceMode::None,
             depends_on: vec![],
             healthcheck: None,
-            gpu: false,
+            gpu: GpuRequest::All(false),
         }
     }
 

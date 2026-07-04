@@ -97,8 +97,11 @@ fn push_nvidia_smi(out: &mut GpuPassthrough, host_smi: &Path) {
 }
 
 /// 以真實 host 路徑探測（`/dev` + `/usr/lib/wsl/lib` + 原生 NVIDIA userspace libs）。
-pub fn collect() -> GpuPassthrough {
-    let mut out = collect_from(Path::new("/dev"), Path::new("/usr/lib/wsl/lib"));
+///
+/// `devices = Some(&[i, …])`：只綁指定索引的 `/dev/nvidia<i>`（硬隔離）；`None` = 全部 nvidia
+/// 數字節點。控制/共用節點（`nvidiactl`/`nvidia-uvm`/…、`dri`/`dxg`/`kfd`）與 lib 注入不受影響。
+pub fn collect(devices: Option<&[u32]>) -> GpuPassthrough {
+    let mut out = collect_from(Path::new("/dev"), Path::new("/usr/lib/wsl/lib"), devices);
     // 原生 NVIDIA：driver 已載入（/proc 有版本）→ 注入版本相符的 userspace libs。
     if let Ok(text) = std::fs::read_to_string(NVIDIA_VERSION_PROC)
         && let Some(ver) = parse_nvidia_version(&text)
@@ -267,7 +270,8 @@ fn read_soname(path: &Path) -> Option<String> {
 
 /// 供測試注入 dev 目錄與 wsl lib 目錄；只依「存在性」判斷（不檢查 device 型別，
 /// 便於單元測試以一般檔案模擬節點——真實 host 上這些本就是裝置節點）。
-pub fn collect_from(dev_dir: &Path, wsl_lib_dir: &Path) -> GpuPassthrough {
+/// `devices = Some(&[i,…])` 時只綁指定索引的 `/dev/nvidia<i>`（`None` = 全部）。
+pub fn collect_from(dev_dir: &Path, wsl_lib_dir: &Path, devices: Option<&[u32]>) -> GpuPassthrough {
     let mut out = GpuPassthrough::default();
     let mut seen: BTreeSet<String> = BTreeSet::new();
 
@@ -275,7 +279,7 @@ pub fn collect_from(dev_dir: &Path, wsl_lib_dir: &Path) -> GpuPassthrough {
         push_node(dev_dir, name, &mut out, &mut seen);
     }
 
-    // nvidia 數字節點（nvidia0, nvidia1, …）——執行期列舉 `/dev`。
+    // nvidia 數字節點（nvidia0, nvidia1, …）——執行期列舉 `/dev`；有指定卡索引時只綁那幾張。
     if let Ok(rd) = std::fs::read_dir(dev_dir) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
@@ -283,6 +287,13 @@ pub fn collect_from(dev_dir: &Path, wsl_lib_dir: &Path) -> GpuPassthrough {
                 && !rest.is_empty()
                 && rest.chars().all(|c| c.is_ascii_digit())
             {
+                // 硬隔離：指定清單時，索引不在清單內就跳過（解析失敗也跳過）。
+                if let Some(sel) = devices {
+                    match rest.parse::<u32>() {
+                        Ok(idx) if sel.contains(&idx) => {}
+                        _ => continue,
+                    }
+                }
                 push_node(dev_dir, &name, &mut out, &mut seen);
             }
         }
@@ -364,7 +375,7 @@ mod tests {
             std::fs::File::create(dev.join(n)).unwrap();
         }
 
-        let pt = collect_from(&dev, &wsl);
+        let pt = collect_from(&dev, &wsl, None);
         let guests: BTreeSet<String> = pt.binds.iter().map(|b| b.guest.clone()).collect();
         assert!(guests.contains("/dev/dxg"));
         assert!(guests.contains("/dev/dri"));
@@ -417,9 +428,39 @@ mod tests {
         std::fs::create_dir_all(&dev).unwrap();
         let missing_wsl = base.join("nope");
 
-        let pt = collect_from(&dev, &missing_wsl);
+        let pt = collect_from(&dev, &missing_wsl, None);
         assert!(pt.is_empty());
         assert!(pt.ld_library_paths.is_empty());
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn binds_only_selected_nvidia_cards() {
+        let base = std::env::temp_dir().join(format!("chefer-gpu-sel-{}", std::process::id()));
+        let dev = base.join("dev");
+        std::fs::create_dir_all(&dev).unwrap();
+        for n in ["nvidia0", "nvidia1", "nvidia2", "nvidiactl", "nvidia-uvm"] {
+            std::fs::File::create(dev.join(n)).unwrap();
+        }
+        let missing_wsl = base.join("nope");
+
+        // gpu: [0, 2] → 只綁 nvidia0、nvidia2；nvidia1 不綁；控制節點仍綁。
+        let pt = collect_from(&dev, &missing_wsl, Some(&[0, 2]));
+        let g: BTreeSet<String> = pt.binds.iter().map(|b| b.guest.clone()).collect();
+        assert!(g.contains("/dev/nvidia0"));
+        assert!(g.contains("/dev/nvidia2"));
+        assert!(!g.contains("/dev/nvidia1"), "nvidia1 應被硬隔離排除");
+        assert!(g.contains("/dev/nvidiactl"), "控制節點仍綁");
+        assert!(g.contains("/dev/nvidia-uvm"));
+
+        // None → 全部 nvidia 數字節點都綁。
+        let all: BTreeSet<String> = collect_from(&dev, &missing_wsl, None)
+            .binds
+            .iter()
+            .map(|b| b.guest.clone())
+            .collect();
+        assert!(all.contains("/dev/nvidia1"));
 
         std::fs::remove_dir_all(&base).ok();
     }
