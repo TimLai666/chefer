@@ -1,0 +1,33 @@
+# Chefer GPU Demo：把 GPU 加速程式打包成單檔
+#
+# 一個服務、開 `gpu: true`，在容器內跑 nvidia-smi，證明 host 的 NVIDIA GPU 真的通進了容器。
+# 映像由 chefer 於 build 時直接從 registry 拉取（釘版；免 docker save）。
+version: "0.1"
+name: gpu-demo
+app_version: "1.0.0"
+network: internal                                # 執行期不需出網（映像已在 build 時拉好）
+
+services:
+  gpu:
+    image: nvidia/cuda:12.4.1-base-ubuntu22.04   # 官方 CUDA base 映像，registry 拉取（釘版，非 latest）
+    gpu: true                                     # opt-in：把 host GPU 節點 + 驅動 libs 綁進「這個」服務的容器
+    interface_mode: none                          # 一次性任務：印完即結束（crash: fail_fast 下 exit 0 = 正常收尾）
+    cmd:
+      - sh
+      - -c
+      - |
+        echo "== GPU 裝置節點 =="
+        ls -l /dev/dxg 2>/dev/null || echo "(無 /dev/dxg —— 非 WSL2 後端)"
+        ls -l /dev/nvidia* 2>/dev/null || true
+        echo
+        echo "== nvidia-smi（GPU 是否真的通到容器）=="
+        # WSL2：host 的 nvidia-smi 在 /usr/lib/wsl/lib，chefer 已把該目錄與 /usr/lib/wsl/drivers
+        #        綁進容器並加進 LD_LIBRARY_PATH。原生 Linux：nvidia-smi 由 image / host 提供。
+        if command -v nvidia-smi >/dev/null 2>&1; then
+          nvidia-smi
+        elif [ -x /usr/lib/wsl/lib/nvidia-smi ]; then
+          /usr/lib/wsl/lib/nvidia-smi
+        else
+          echo "nvidia-smi 不可用（確認已裝 GPU 驅動 / WSL GPU-PV）"
+          exit 1
+        fi
