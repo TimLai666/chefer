@@ -107,7 +107,20 @@ fn parse_nvidia_version(proc_text: &str) -> Option<String> {
     None
 }
 
-/// 找 host 上與 driver 版本相符的 NVIDIA userspace libs（`libcuda`/`libnvidia-*` 且以
+/// 是否為 NVIDIA 驅動的 userspace lib（`base` 已去掉 `.so.<version>` 尾巴）。對齊
+/// `nvidia-container-cli list` 的庫集：CUDA/NVML/PTX-JIT/NVVM/OpenCL（`libcuda*`/`libnvidia-*`）、
+/// NVENC/NVDEC（`libnvcuvid`）、OptiX（`libnvoptix`）、GLVND 廠商庫
+/// （`libGLX_nvidia`/`libEGL_nvidia`/`libGLESv*_nvidia`）。搭配 `.so.<driver-version>` 尾巴的
+/// 前置過濾，只會命中驅動版號的庫（`libcudart` 等 toolkit 庫版號不同、不會誤中）。
+fn is_nvidia_driver_lib(base: &str) -> bool {
+    base.starts_with("libcuda")        // libcuda, libcudadebugger
+        || base.starts_with("libnvidia-")
+        || base.starts_with("libnvcuvid") // NVENC/NVDEC
+        || base.starts_with("libnvoptix") // OptiX
+        || base.ends_with("_nvidia") // libGLX_nvidia / libEGL_nvidia / libGLESv*_nvidia
+}
+
+/// 找 host 上與 driver 版本相符的 NVIDIA userspace libs（`is_nvidia_driver_lib` 認定，且以
 /// `.so.<version>` 結尾），每個綁到容器 `stage` 下的 versioned + soname + `.so`（dev）名字。
 /// soname 優先讀 ELF 的 DT_SONAME（精確），讀不到才退回 `libX.so.1`（ABI major 假設 1）。
 fn nvidia_lib_binds(lib_dirs: &[PathBuf], version: &str, stage: &str) -> Vec<GpuBind> {
@@ -120,14 +133,12 @@ fn nvidia_lib_binds(lib_dirs: &[PathBuf], version: &str, stage: &str) -> Vec<Gpu
         };
         for e in rd.flatten() {
             let fname = e.file_name().to_string_lossy().into_owned();
-            if !(fname.starts_with("libcuda.so.") || fname.starts_with("libnvidia-")) {
-                continue;
-            }
             let Some(base) = fname.strip_suffix(&suffix) else {
                 continue;
             };
-            // base 不含更多 '.'（避免 libnvidia-ml.so.<ver>.extra 之類誤配）。
-            if base.contains(".so") || !seen.insert(fname.clone()) {
+            // base 不含更多 '.'（避免 libnvidia-ml.so.<ver>.extra 之類誤配）；
+            // 且須為 NVIDIA 驅動庫（對齊 nvidia-container-cli list）。
+            if base.contains(".so") || !is_nvidia_driver_lib(base) || !seen.insert(fname.clone()) {
                 continue;
             }
             let host = e.path();
@@ -386,12 +397,19 @@ mod tests {
         let d = base.join("lib");
         std::fs::create_dir_all(&d).unwrap();
         let ver = "535.183.01";
-        for n in [
-            "libcuda.so.535.183.01",
-            "libnvidia-ml.so.535.183.01",
-            "libnvidia-ptxjitcompiler.so.535.183.01",
-        ] {
-            std::fs::File::create(d.join(n)).unwrap();
+        // 涵蓋 nvidia-container-cli list 的庫集：CUDA/NVML/PTX-JIT + NVENC(libnvcuvid) +
+        // OptiX(libnvoptix) + GL 廠商庫(libGLX_nvidia) + libcuda* 家族(libcudadebugger)。
+        let matched = [
+            "libcuda",
+            "libcudadebugger",
+            "libnvidia-ml",
+            "libnvidia-ptxjitcompiler",
+            "libnvcuvid",
+            "libnvoptix",
+            "libGLX_nvidia",
+        ];
+        for m in matched {
+            std::fs::File::create(d.join(format!("{m}.so.535.183.01"))).unwrap();
         }
         // 不相符/非 nvidia/非 versioned：不選。
         std::fs::File::create(d.join("libcuda.so.470.1.2")).unwrap(); // 舊版本
@@ -406,14 +424,19 @@ mod tests {
         assert!(guests.contains("/run/chefer-nvidia/libcuda.so"));
         assert!(guests.contains("/run/chefer-nvidia/libnvidia-ml.so.1"));
         assert!(guests.contains("/run/chefer-nvidia/libnvidia-ptxjitcompiler.so.1"));
+        // 擴充庫集（此前被漏掉的）：NVENC/OptiX/GL/libcuda* 家族皆入選。
+        assert!(guests.contains("/run/chefer-nvidia/libnvcuvid.so"));
+        assert!(guests.contains("/run/chefer-nvidia/libnvoptix.so"));
+        assert!(guests.contains("/run/chefer-nvidia/libGLX_nvidia.so"));
+        assert!(guests.contains("/run/chefer-nvidia/libcudadebugger.so"));
         // 舊版本/非 nvidia 不選。
         assert!(
             !guests
                 .iter()
                 .any(|g| g.contains("470") || g.contains("libfoo"))
         );
-        // 3 個相符 lib × 3 名 = 9；全唯讀、非目錄。
-        assert_eq!(binds.len(), 9);
+        // 7 個相符 lib × 3 名 = 21；全唯讀、非目錄。
+        assert_eq!(binds.len(), 21);
         assert!(binds.iter().all(|b| b.read_only && !b.is_dir));
 
         std::fs::remove_dir_all(&base).ok();
