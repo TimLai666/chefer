@@ -1,10 +1,14 @@
 //! GPU passthrough（opt-in per-service `gpu: true`）——見 docs/DESIGN.md「GPU passthrough」節。
 //!
-//! 探測 host 既有的 GPU 裝置節點（`/dev/dxg`、`/dev/dri`、`/dev/nvidia*`）與 WSL2 的
-//! host 驅動 userspace libs（`/usr/lib/wsl/lib`），把存在者 bind 進服務容器，讓容器內的
-//! app 能做 GPU 計算/算繪。**只在能實際觸及 host GPU 的後端有意義**：原生 Linux
+//! 探測 host 既有的 GPU 裝置節點（`/dev/dxg`、`/dev/dri`、`/dev/kfd`、`/dev/nvidia*`）與
+//! WSL2 的 host 驅動 userspace libs（`/usr/lib/wsl/lib`），把存在者 bind 進服務容器，讓容器內
+//! 的 app 能做 GPU 計算/算繪。**只在能實際觸及 host GPU 的後端有意義**：原生 Linux
 //! （namespaces）與 Windows WSL2。WHP / macOS VM 的 appliance host 沒有這些節點；
 //! guest-agent 以 `gpu_host` 旗標把關（見 exec.rs / lib.rs），在那些後端回明確錯誤。
+//!
+//! **廠商**：NVIDIA 需注入 host 相符的驅動庫（見下，`libcuda` 必須與 kernel module 同版）；
+//! **AMD（ROCm，`/dev/kfd` + `/dev/dri`）與 Intel（`/dev/dri`）則只綁節點**——其 userspace
+//! （ROCm/HIP、oneAPI/Level-Zero/OpenCL）由容器映像自帶，kernel ABI 較穩定，不需 host 庫注入。
 //!
 //! **原生 NVIDIA userspace lib 注入**（`/proc/driver/nvidia/version` 存在時）：把 host 上與
 //! driver 版本相符的 `libcuda`/`libnvidia-*`（`.so.<driver-version>`，如 NVIDIA Container
@@ -50,7 +54,8 @@ impl GpuPassthrough {
 /// 固定候選節點名稱（`/dev/<name>`）——存在才綁；nvidia 數字節點於執行期列舉補上。
 const DEV_NODES: &[&str] = &[
     "dxg",        // WSL2 GPU-PV
-    "dri",        // DRM render/display（目錄）
+    "dri",        // DRM render/display（目錄）——Intel/AMD 計算與算繪走此 render node
+    "kfd",        // AMD ROCm 計算裝置——ROCm/HIP 由映像自帶 userspace（免 host 庫注入）
     "nvidiactl",  // NVIDIA control
     "nvidia-uvm", // NVIDIA unified memory
     "nvidia-uvm-tools",
@@ -348,7 +353,14 @@ mod tests {
         std::fs::create_dir_all(&drivers).unwrap();
         std::fs::File::create(wsl.join("nvidia-smi")).unwrap(); // WSL 的 nvidia-smi
         // 以一般檔案模擬 char device 節點。
-        for n in ["dxg", "nvidiactl", "nvidia-uvm", "nvidia0", "nvidia1"] {
+        for n in [
+            "dxg",
+            "kfd",
+            "nvidiactl",
+            "nvidia-uvm",
+            "nvidia0",
+            "nvidia1",
+        ] {
             std::fs::File::create(dev.join(n)).unwrap();
         }
 
@@ -369,6 +381,9 @@ mod tests {
         assert!(dri_bind.is_dir && !dri_bind.read_only);
         let dxg_bind = pt.binds.iter().find(|b| b.guest == "/dev/dxg").unwrap();
         assert!(!dxg_bind.is_dir && !dxg_bind.read_only);
+        // AMD ROCm 計算裝置 /dev/kfd（char device，可讀寫）。
+        let kfd_bind = pt.binds.iter().find(|b| b.guest == "/dev/kfd").unwrap();
+        assert!(!kfd_bind.is_dir && !kfd_bind.read_only);
         let wsl_bind = pt
             .binds
             .iter()
