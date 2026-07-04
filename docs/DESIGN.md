@@ -401,6 +401,13 @@ AppCipe 新增 app 級欄位 **`network`**（appcipe-spec enum，serde rename �
 
 **分階段**：① 契約 + spec/manifest/pack 欄位 + guest-agent 節點綁定 + WSL2 lib 綁定/LD path + 後端界線錯誤（本 PR；**WSL2 實機已驗證**：`gpu: true` 的容器內見 `/dev/dxg`、`/dev/dri`（card0/renderD128）、`/usr/lib/wsl/lib`，`LD_LIBRARY_PATH` 指向驅動 libs，服務 exit 0）→ ② 原生 Linux 的 host 相符 userspace lib 自動注入（類 NVIDIA Container Toolkit）——**已實作（`gpu.rs` `parse_nvidia_version`/`nvidia_lib_binds`，含單元測試），但需原生 NVIDIA Linux 機器實機驗證 CUDA 於容器可用後才 merge**（同 macOS VZ 項目 gated on real hardware 的慣例；本開發機為 WSL2 無原生 NVIDIA）。
 
+**② 的驗證步驟（在裝好 NVIDIA driver 的原生 Linux 上做；接手 PR #103 用）**：
+1. `git checkout gpu-nvidia-libs`；`cargo build --release -p chefer-cli -p chefer-runtime`（原生 Linux 走 namespaces 後端，guest-agent 已編進 chefer-runtime，**免另備 guest-agent 二進位**）。kit 只需該 linux triple 的 `chefer-runtime`。
+2. 寫 `gpu: true` 的 appcipe（`image: nvidia/cuda:12.4.1-base-ubuntu22.04` 之類**釘版** registry ref、`network: shared`、`interface_mode: none`）。
+3. **先驗注入**：`cmd: ["sh","-c","ls -l /run/chefer-nvidia/; echo LDLP=$LD_LIBRARY_PATH; ls -l /dev/nvidia*"]` → 應見 `libcuda.so.1`/`libnvidia-ml.so.1` 等 bind 進 `/run/chefer-nvidia/`、`LD_LIBRARY_PATH` 含該目錄、`/dev/nvidia*` 節點在。
+4. **再驗真 CUDA**：用 `nvidia/cuda:*-devel` 跑 `deviceQuery`/`vectorAdd`（或任何呼叫 `cuInit`/`cudaGetDeviceCount` 的程式）→ 應偵測到 GPU 並算出結果、exit 0。
+5. **待檢查的已知風險**：(a) `nvidia-smi` **二進位未注入**（只注入 libs；要 in-container `nvidia-smi` 需另 bind `/usr/bin/nvidia-smi`，屬 follow-up，不影響 CUDA)；(b) 非 major-1 的 lib soname（DT_SONAME 已讀，但少見庫仍要覆核）；(c) lib 清單完整性——對照 `nvidia-container-cli list`，確認沒漏關鍵庫（如 `libnvidia-ptxjitcompiler`/`libnvidia-nvvm`）。3–4 通過、5 無漏即可 merge #103。
+
 ### Dockerfile build（`source: dockerfile`）— 設計
 
 讓使用者直接給 Dockerfile，由 `chefer build` 代為建置成 image，省掉手動 `docker build` + `docker save`。
