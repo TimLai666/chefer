@@ -75,6 +75,21 @@ const NVIDIA_LIB_DIRS: &[&str] = &[
 ];
 /// 注入的 NVIDIA libs 在容器內的暫存目錄（加進 LD_LIBRARY_PATH）。
 const NVIDIA_STAGE: &str = "/run/chefer-nvidia";
+/// 原生 Linux 上 `nvidia-smi` 二進位的標準位置（首個存在者為準）。
+const NVIDIA_SMI_PATHS: &[&str] = &["/usr/bin/nvidia-smi", "/bin/nvidia-smi"];
+
+/// host 的 `nvidia-smi`（存在且為檔案才綁）→ 容器 `/usr/bin/nvidia-smi`，讓容器內可直接以
+/// `nvidia-smi` 執行（其 NVML 依 `LD_LIBRARY_PATH` 找已綁/已注入的 `libnvidia-ml`）。
+fn push_nvidia_smi(out: &mut GpuPassthrough, host_smi: &Path) {
+    if host_smi.is_file() {
+        out.binds.push(GpuBind {
+            host: host_smi.to_path_buf(),
+            guest: "/usr/bin/nvidia-smi".to_string(),
+            read_only: true,
+            is_dir: false,
+        });
+    }
+}
 
 /// 以真實 host 路徑探測（`/dev` + `/usr/lib/wsl/lib` + 原生 NVIDIA userspace libs）。
 pub fn collect() -> GpuPassthrough {
@@ -88,6 +103,10 @@ pub fn collect() -> GpuPassthrough {
         if !libs.is_empty() {
             out.binds.extend(libs);
             out.ld_library_paths.push(NVIDIA_STAGE.to_string());
+            // 原生 host 的 nvidia-smi 二進位一併綁進去（NVML client；找不到 libs 就別綁了）。
+            if let Some(smi) = NVIDIA_SMI_PATHS.iter().map(Path::new).find(|p| p.is_file()) {
+                push_nvidia_smi(&mut out, smi);
+            }
         }
     }
     out
@@ -289,6 +308,9 @@ pub fn collect_from(dev_dir: &Path, wsl_lib_dir: &Path) -> GpuPassthrough {
                 is_dir: true,
             });
         }
+        // WSL 的 nvidia-smi 在 `/usr/lib/wsl/lib/nvidia-smi`（不在 PATH 上）；一併綁到
+        // `/usr/bin/nvidia-smi`，讓容器內可直接以 `nvidia-smi` 執行（同 native）。
+        push_nvidia_smi(&mut out, &wsl_lib_dir.join("nvidia-smi"));
     }
 
     out
@@ -324,6 +346,7 @@ mod tests {
         std::fs::create_dir_all(&dri).unwrap();
         std::fs::create_dir_all(&wsl).unwrap();
         std::fs::create_dir_all(&drivers).unwrap();
+        std::fs::File::create(wsl.join("nvidia-smi")).unwrap(); // WSL 的 nvidia-smi
         // 以一般檔案模擬 char device 節點。
         for n in ["dxg", "nvidiactl", "nvidia-uvm", "nvidia0", "nvidia1"] {
             std::fs::File::create(dev.join(n)).unwrap();
@@ -360,6 +383,14 @@ mod tests {
             .find(|b| b.guest == "/usr/lib/wsl/drivers")
             .expect("WSL drivers store should be bound alongside /usr/lib/wsl/lib");
         assert!(drv_bind.is_dir && drv_bind.read_only);
+        // WSL 的 nvidia-smi → 容器 /usr/bin/nvidia-smi（唯讀檔案綁定）。
+        let smi_bind = pt
+            .binds
+            .iter()
+            .find(|b| b.guest == "/usr/bin/nvidia-smi")
+            .expect("WSL nvidia-smi should be bound to /usr/bin/nvidia-smi");
+        assert!(!smi_bind.is_dir && smi_bind.read_only);
+        assert_eq!(smi_bind.host, wsl.join("nvidia-smi"));
 
         std::fs::remove_dir_all(&base).ok();
     }
