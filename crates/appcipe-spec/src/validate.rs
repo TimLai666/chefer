@@ -204,6 +204,13 @@ impl AppCipe {
                 }
             }
 
+            // --- gpu：空的卡索引清單多半是筆誤（要關請用 gpu: false）---
+            if matches!(&svc.gpu, chefer_bundle::GpuRequest::Devices(d) if d.is_empty()) {
+                errs.push(format!(
+                    "service `{name}` gpu: [] is empty — use `gpu: false` to disable, or list GPU card indices like `gpu: [0, 2]`"
+                ));
+            }
+
             // --- interface_mode 統計 ---
             if matches!(
                 svc.interface_mode,

@@ -72,11 +72,14 @@ services:
     interface_mode: none                           # Optional: gui | terminal | both | none (default none)
 
     # --- GPU passthrough (optional; opt-in per service, default off) ---
-    # gpu: true                                    # Bind host GPU device nodes (+ WSL2 driver libs) into this
-                                                   #   service's container -> CUDA/OpenCL/Vulkan compute & hardware render.
-                                                   #   Only works on native Linux (/dev/nvidia*, /dev/dri) and the Windows
-                                                   #   WSL2 backend (/dev/dxg + host /usr/lib/wsl/lib). The Windows WHP
-                                                   #   micro-VM and the macOS VM cannot expose a host GPU -> clear error.
+    # gpu: true                                    # true = all GPUs; [0, 2] = only NVIDIA cards 0 and 2 (hard isolation).
+                                                   #   Binds host GPU device nodes (+ WSL2/host driver libs) into this
+                                                   #   service's container -> CUDA/ROCm/OpenCL compute & NVENC/NVDEC video.
+                                                   #   Only works on native Linux (/dev/nvidia*, /dev/dri, AMD /dev/kfd) and
+                                                   #   the Windows WSL2 backend (/dev/dxg + host /usr/lib/wsl/lib). WHP
+                                                   #   micro-VM & macOS VM cannot expose a host GPU -> clear error.
+                                                   #   Card-index isolation is native-NVIDIA only; on WSL2/AMD/Intel use
+                                                   #   env: CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES / ZE_AFFINITY_MASK.
 
   ui:
     # Short-form example: image is a tar path directly (equivalent to source: tar + format: auto + default platform)

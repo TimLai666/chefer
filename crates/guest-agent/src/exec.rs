@@ -250,25 +250,43 @@ fn build_plan(spec: &SpawnSpec) -> Result<ChildPlan> {
     // 只在能實際觸及 host GPU 的後端可行（原生 Linux / WSL2）；WHP/vz VM 明確報錯，
     // 不靜默綁到 virtio-gpu 的 2D `/dev/dri`。探測到的節點/libs 以既有 bind 流程套用
     //（在 setup_dev 建好 /dev tmpfs 之後）。
-    if svc.gpu {
+    if svc.gpu.enabled() {
         if !spec.gpu_host {
             bail!(
-                "service `{}` requests `gpu: true`, but GPU passthrough is not available on this backend. \
+                "service `{}` requests GPU passthrough, but it is not available on this backend. \
 It works only on native Linux and the Windows WSL2 backend; the Windows WHP micro-VM and the macOS VM cannot expose a host GPU to a Linux container. \
 On Windows, use the WSL2 backend for GPU (a bare WHP micro-VM has no GPU paravirtualization).",
                 svc.name
             );
         }
-        let gpu = crate::gpu::collect();
+        // `gpu: [i, …]` → 只綁指定的 `/dev/nvidia<i>`（硬隔離）；`gpu: true` → 全部。
+        let gpu = crate::gpu::collect(svc.gpu.devices());
         if gpu.is_empty() {
             bail!(
-                "service `{}` requests `gpu: true`, but no GPU device nodes were found on the host \
+                "service `{}` requests GPU passthrough, but no GPU device nodes were found on the host \
 (searched /dev/dxg, /dev/dri, /dev/kfd, /dev/nvidia*). \
 Ensure a GPU with drivers is present: on native Linux install the vendor driver \
 (NVIDIA exposes /dev/nvidia*; AMD ROCm exposes /dev/kfd + /dev/dri; Intel exposes /dev/dri); \
 on WSL2 use a recent GPU driver with WSL support so /dev/dxg appears.",
                 svc.name
             );
+        }
+        // 指定卡索引時，確認至少綁到一張要求的 NVIDIA 卡（否則索引不存在／該後端無 nvidia 節點）。
+        if let Some(devs) = svc.gpu.devices() {
+            let bound_numbered = gpu.binds.iter().any(|b| {
+                b.guest
+                    .strip_prefix("/dev/nvidia")
+                    .is_some_and(|r| !r.is_empty() && r.bytes().all(|c| c.is_ascii_digit()))
+            });
+            if !bound_numbered {
+                bail!(
+                    "service `{}` requests GPU cards {:?}, but none of those /dev/nvidia<N> nodes exist on the host. \
+Card-index selection is native-NVIDIA only; on WSL2 / AMD / Intel use per-service env instead \
+(CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES / ZE_AFFINITY_MASK).",
+                    svc.name,
+                    devs
+                );
+            }
         }
         for b in &gpu.binds {
             binds.push(BindEntry {

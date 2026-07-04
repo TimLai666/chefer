@@ -104,10 +104,12 @@ pub struct Service {
     pub healthcheck: Option<HealthCheck>,
 
     /// opt-in GPU passthrough（見 docs/DESIGN.md「GPU passthrough」節）。預設關；
-    /// 開啟後 guest-agent 把 host GPU 裝置節點（+ WSL2 的驅動 libs）bind 進此服務容器。
-    /// **僅原生 Linux 與 Windows WSL2 後端可行**（WHP/vz VM 會於啟動時回明確錯誤）。
+    /// `true` = 全部 GPU、`[0, 2]` = 只綁指定 NVIDIA 卡（硬隔離）。開啟後 guest-agent 把對應的
+    /// host GPU 裝置節點（+ WSL2 的驅動 libs）bind 進此服務容器。
+    /// **僅原生 Linux 與 Windows WSL2 後端可行**（WHP/vz VM 會於啟動時回明確錯誤）；
+    /// 卡索引硬隔離僅原生 NVIDIA 有效（WSL2/AMD/Intel 請用 `env` 的 `CUDA_VISIBLE_DEVICES` 等）。
     #[serde(default)]
-    pub gpu: bool,
+    pub gpu: chefer_bundle::GpuRequest,
 }
 
 /// 服務健康檢查（見 docs/DESIGN.md「健康檢查」節）。duration 欄位接受 `<n>(ms|s|m)`

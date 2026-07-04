@@ -324,6 +324,14 @@ fn render_manifest_summary(
         } else {
             svc.depends_on.join(", ")
         };
+        let gpu_label = match &svc.gpu {
+            chefer_bundle::GpuRequest::Devices(d) if !d.is_empty() => format!(
+                "cards {}",
+                d.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
+            ),
+            g if g.enabled() => "yes".to_string(),
+            _ => "no".to_string(),
+        };
         t.add_row(vec![
             Cell::new(&svc.name).fg(Color::Cyan),
             Cell::new(&svc.platform),
@@ -338,7 +346,7 @@ fn render_manifest_summary(
             } else {
                 "no"
             }),
-            Cell::new(if svc.gpu { "yes" } else { "no" }).fg(if svc.gpu {
+            Cell::new(&gpu_label).fg(if svc.gpu.enabled() {
                 Color::Green
             } else {
                 Color::Reset
@@ -484,7 +492,7 @@ mod tests {
                     retries: 1,
                     start_period_ms: 0,
                 }),
-                gpu: false,
+                gpu: Default::default(),
             }],
         };
         m.save(&chefer_bundle::layout::manifest_path(&bundle))

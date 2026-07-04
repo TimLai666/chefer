@@ -385,7 +385,9 @@ AppCipe 新增 app 級欄位 **`network`**（appcipe-spec enum，serde rename �
 
 ### GPU passthrough（opt-in `gpu`）— 設計
 
-服務可選 per-service 欄位 **`gpu`**（appcipe-spec `Service.gpu: bool`，預設 `false`；寫進 manifest `ServiceEntry.gpu`）。開啟後，guest-agent 於該服務的容器啟動時把 **host 既有的 GPU 裝置節點與（WSL2）host 驅動 userspace libs** bind 進容器——讓容器內的 app 能做 GPU 計算（CUDA/ROCm/OpenCL/Vulkan）與硬體算繪/視訊編解碼。**預設關**：不開時容器 `/dev` 維持固定 allowlist（`null`/`zero`/`random`/`urandom`/`tty` + pts/shm），不破壞既有隔離。
+服務可選 per-service 欄位 **`gpu`**（`chefer_bundle::GpuRequest`，spec 與 manifest 共用同型別；serde **untagged**：`false`=關（預設）、`true`=全部 GPU、`[0, 2]`=只綁指定 NVIDIA 卡；舊布林寫法照樣解析，**故 spec/manifest 版號不動**）。開啟後，guest-agent 於該服務的容器啟動時把 **host 既有的 GPU 裝置節點與（WSL2）host 驅動 userspace libs** bind 進容器——讓容器內的 app 能做 GPU 計算（CUDA/ROCm/OpenCL/Vulkan）與硬體算繪/視訊編解碼。**預設關**：不開時容器 `/dev` 維持固定 allowlist（`null`/`zero`/`random`/`urandom`/`tty` + pts/shm），不破壞既有隔離。
+
+**卡索引硬隔離（`gpu: [0, 2]`）**：只把 `/dev/nvidia0`、`/dev/nvidia2` 綁進該服務容器（其餘 `/dev/nvidia<N>` 不進去 → 容器內的 CUDA 只看得到這幾張，等同 nvidia-container-toolkit 的 `NVIDIA_VISIBLE_DEVICES`），控制/共用節點（`nvidiactl`/`nvidia-uvm`/`nvidia-uvm-tools`/`nvidia-modeset`/`nvidia-caps`、`dri`）仍綁。**僅原生 NVIDIA 有效**（索引對應 `/dev/nvidia<N>`）；WSL2（`/dev/dxg` 抽象、無數字節點）與 AMD/Intel 沒有 `/dev/nvidia<N>` 可篩，請改用 per-service `env` 的 `CUDA_VISIBLE_DEVICES`／`HIP_VISIBLE_DEVICES`／`ZE_AFFINITY_MASK`（軟選擇）。指定的卡一張都不存在 → 服務啟動時明確報錯；`gpu: []`（空清單）於 validate 階段報錯（要關請用 `gpu: false`）。`collect(devices)`／`collect_from` 帶 `Option<&[u32]>` 過濾 nvidia 數字節點（含單元測試）。**索引過濾邏輯有單元測試；但多卡硬隔離尚未實機驗證（驗證機皆單卡）。**
 
 **平台界線（架構限制，非未實作）**——只在能實際觸及 host GPU 的後端可行：
 

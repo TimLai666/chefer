@@ -303,7 +303,7 @@ fn pack_service(
         interface_mode: convert::to_interface_mode(&svc.interface_mode),
         depends_on: svc.depends_on.clone(),
         healthcheck: svc.healthcheck.as_ref().map(map_healthcheck),
-        gpu: svc.gpu,
+        gpu: svc.gpu.clone(),
     })
 }
 
