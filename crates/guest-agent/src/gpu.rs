@@ -262,6 +262,22 @@ pub fn collect_from(dev_dir: &Path, wsl_lib_dir: &Path) -> GpuPassthrough {
             is_dir: true,
         });
         out.ld_library_paths.push("/usr/lib/wsl/lib".to_string());
+        // `/usr/lib/wsl/lib` 內的 `libcuda`/`libnvidia-ml` 其實是 loader shim，會 dlopen
+        // 真正的驅動實作（`/usr/lib/wsl/drivers/<inf>/…`，來自 Windows DriverStore，經 WSL
+        // 以 9p 掛在 `/usr/lib/wsl/drivers`）。只綁 lib 而不綁這個 drivers store，容器內
+        // 的 CUDA/nvidia-smi 會回「couldn't communicate with the NVIDIA driver / Driver Not
+        // Loaded」。一般 WSL distro 兩者皆由 WSL 自動掛載；容器換了 mount namespace，須把
+        // drivers store 一併帶入（nvidia-container-toolkit 的 WSL 模式亦綁此目錄）。
+        if let Some(drivers) = wsl_lib_dir.parent().map(|p| p.join("drivers"))
+            && drivers.is_dir()
+        {
+            out.binds.push(GpuBind {
+                host: drivers,
+                guest: "/usr/lib/wsl/drivers".to_string(),
+                read_only: true,
+                is_dir: true,
+            });
+        }
     }
 
     out
@@ -293,8 +309,10 @@ mod tests {
         let dev = base.join("dev");
         let dri = dev.join("dri");
         let wsl = base.join("wsl-lib");
+        let drivers = base.join("drivers"); // wsl_lib_dir 的兄弟目錄 → /usr/lib/wsl/drivers
         std::fs::create_dir_all(&dri).unwrap();
         std::fs::create_dir_all(&wsl).unwrap();
+        std::fs::create_dir_all(&drivers).unwrap();
         // 以一般檔案模擬 char device 節點。
         for n in ["dxg", "nvidiactl", "nvidia-uvm", "nvidia0", "nvidia1"] {
             std::fs::File::create(dev.join(n)).unwrap();
@@ -324,6 +342,13 @@ mod tests {
             .unwrap();
         assert!(wsl_bind.is_dir && wsl_bind.read_only);
         assert_eq!(pt.ld_library_paths, vec!["/usr/lib/wsl/lib".to_string()]);
+        // WSL 驅動 store（loader shim dlopen 真驅動之處）也要一併綁進容器。
+        let drv_bind = pt
+            .binds
+            .iter()
+            .find(|b| b.guest == "/usr/lib/wsl/drivers")
+            .expect("WSL drivers store should be bound alongside /usr/lib/wsl/lib");
+        assert!(drv_bind.is_dir && drv_bind.read_only);
 
         std::fs::remove_dir_all(&base).ok();
     }
