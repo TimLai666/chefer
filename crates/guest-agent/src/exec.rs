@@ -263,8 +263,9 @@ On Windows, use the WSL2 backend for GPU (a bare WHP micro-VM has no GPU paravir
         if gpu.is_empty() {
             bail!(
                 "service `{}` requests `gpu: true`, but no GPU device nodes were found on the host \
-(searched /dev/dxg, /dev/dri, /dev/nvidia*). \
-Ensure a GPU with drivers is present: on native Linux install the vendor driver (exposes /dev/nvidia* and/or /dev/dri); \
+(searched /dev/dxg, /dev/dri, /dev/kfd, /dev/nvidia*). \
+Ensure a GPU with drivers is present: on native Linux install the vendor driver \
+(NVIDIA exposes /dev/nvidia*; AMD ROCm exposes /dev/kfd + /dev/dri; Intel exposes /dev/dri); \
 on WSL2 use a recent GPU driver with WSL support so /dev/dxg appears.",
                 svc.name
             );
