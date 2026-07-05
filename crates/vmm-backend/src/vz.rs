@@ -98,29 +98,36 @@ impl ExecBackend for VzBackend {
             .and_then(|s| s.parse::<u64>().ok());
         let res = vz_util::VmResources::compute(host_cpus, mem_override);
         let cmdline = vz_util::kernel_command_line(ctx.opts.keep_tmp);
+        // app 有 gui/both 服務 → helper 掛 virtio-gpu/鍵盤/指標並開 VZVirtualMachineView
+        // 視窗（guest 側 cage overlay 與 WHP 完全共用；剪貼簿 token 由 helper 產生附進
+        // cmdline，host 端經 NAT 直連 guest IP 同步）。
+        let gui = ctx
+            .manifest
+            .services
+            .iter()
+            .any(|s| s.interface_mode.wants_gui());
 
         eprintln!(
-            "[chefer] starting macOS micro-VM via {} (cpus={}, mem={}MiB)",
+            "[chefer] starting macOS micro-VM via {} (cpus={}, mem={}MiB{})",
             helper.display(),
             res.cpu_count,
-            res.memory_mib
+            res.memory_mib,
+            if gui { ", gui" } else { "" }
         );
 
+        let args = vz_util::helper_args(
+            &appliance.kernel,
+            &appliance.initramfs,
+            &cmdline,
+            ctx.bundle_dir,
+            ctx.data_dir,
+            res.cpu_count,
+            res.memory_mib,
+            gui,
+            &ctx.manifest.app.name,
+        );
         let mut child = Command::new(&helper)
-            .arg("--kernel")
-            .arg(&appliance.kernel)
-            .arg("--initramfs")
-            .arg(&appliance.initramfs)
-            .arg("--cmdline")
-            .arg(&cmdline)
-            .arg("--bundle-dir")
-            .arg(ctx.bundle_dir)
-            .arg("--data-dir")
-            .arg(ctx.data_dir)
-            .arg("--cpus")
-            .arg(res.cpu_count.to_string())
-            .arg("--memory-mib")
-            .arg(res.memory_mib.to_string())
+            .args(&args)
             .stdout(Stdio::piped())
             .spawn()
             .with_context(|| {

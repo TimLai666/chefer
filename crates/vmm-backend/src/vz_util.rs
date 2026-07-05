@@ -98,6 +98,49 @@ pub fn kernel_command_line(keep_rootfs: bool) -> String {
     s
 }
 
+/// vz 開機 helper（`chefer-vz-helper-<arch>`，Swift）的 CLI 參數——與 helper 的解析
+/// 契約一致（鏡像 `whp_util::HelperInvocation::args()` 的做法，抽純函式供跨平台單元測試）。
+/// `gui = true` 時附 `--gui`（helper 掛 virtio-gpu/鍵盤/指標並開 `VZVirtualMachineView`
+/// 視窗；剪貼簿 token 由 helper 自行產生並附加到 kernel cmdline，非本函式責任）；
+/// `app_name` 非空時附 `--gui-title <name>`（視窗標題；空 → helper 用預設 "Chefer"）。
+#[allow(clippy::too_many_arguments)] // CLI 契約的平鋪參數；集中一處、有單元測試鎖住
+pub fn helper_args(
+    kernel: &Path,
+    initramfs: &Path,
+    cmdline: &str,
+    bundle_dir: &Path,
+    data_dir: &Path,
+    cpus: usize,
+    memory_mib: u64,
+    gui: bool,
+    app_name: &str,
+) -> Vec<std::ffi::OsString> {
+    let mut v: Vec<std::ffi::OsString> = vec![
+        "--kernel".into(),
+        kernel.into(),
+        "--initramfs".into(),
+        initramfs.into(),
+        "--cmdline".into(),
+        cmdline.into(),
+        "--bundle-dir".into(),
+        bundle_dir.into(),
+        "--data-dir".into(),
+        data_dir.into(),
+        "--cpus".into(),
+        cpus.to_string().into(),
+        "--memory-mib".into(),
+        memory_mib.to_string().into(),
+    ];
+    if gui {
+        v.push("--gui".into());
+        if !app_name.is_empty() {
+            v.push("--gui-title".into());
+            v.push(app_name.into());
+        }
+    }
+    v
+}
+
 /// 從 guest console 文字解析**最後一個** `CHEFER_GUEST_EXIT=<n>`（容忍前綴與多次列印，
 /// 取最後一個為準；與 qemu-e2e 的 `sed` 子字串比對一致）。
 pub fn parse_guest_exit_code(console: &str) -> Option<i32> {
@@ -221,6 +264,48 @@ mod tests {
         assert!(c.contains(&format!("chefer.data_dir={GUEST_DATA_DIR}")));
         assert!(!c.contains("keep_rootfs"));
         assert!(kernel_command_line(true).contains("chefer.keep_rootfs=1"));
+    }
+
+    #[test]
+    fn helper_args_contract() {
+        let args = |gui: bool, name: &str| {
+            helper_args(
+                Path::new("/k/vmlinuz"),
+                Path::new("/k/initramfs"),
+                "console=hvc0 quiet",
+                Path::new("/b"),
+                Path::new("/d"),
+                2,
+                1536,
+                gui,
+                name,
+            )
+            .into_iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+        };
+        let has_pair =
+            |v: &[String], k: &str, val: &str| v.windows(2).any(|w| w[0] == k && w[1] == val);
+
+        let a = args(false, "");
+        assert!(has_pair(&a, "--kernel", "/k/vmlinuz"));
+        assert!(has_pair(&a, "--initramfs", "/k/initramfs"));
+        assert!(has_pair(&a, "--cmdline", "console=hvc0 quiet"));
+        assert!(has_pair(&a, "--bundle-dir", "/b"));
+        assert!(has_pair(&a, "--data-dir", "/d"));
+        assert!(has_pair(&a, "--cpus", "2"));
+        assert!(has_pair(&a, "--memory-mib", "1536"));
+        // 非 GUI：不帶 --gui / --gui-title。
+        assert!(!a.iter().any(|s| s == "--gui" || s == "--gui-title"));
+
+        // GUI + app 名 → --gui 與 --gui-title <name>。
+        let g = args(true, "MyApp");
+        assert!(g.iter().any(|s| s == "--gui"));
+        assert!(has_pair(&g, "--gui-title", "MyApp"));
+        // GUI 但無名 → 只帶 --gui（helper 用預設標題）。
+        let g2 = args(true, "");
+        assert!(g2.iter().any(|s| s == "--gui"));
+        assert!(!g2.iter().any(|s| s == "--gui-title"));
     }
 
     #[test]
