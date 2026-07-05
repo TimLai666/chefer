@@ -16,6 +16,7 @@ mod dockerfile;
 mod image;
 mod layers;
 mod registry;
+mod registry_auth;
 
 pub use dockerfile::available_builder;
 
