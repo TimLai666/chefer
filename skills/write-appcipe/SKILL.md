@@ -23,7 +23,7 @@ docker build / docker pull  →  docker save -o x.tar <image>   # 取得 image t
 寫 appcipe.yml（image 指向那些 tar）
 chefer build appcipe.yml --out dist                            # 產出單檔
 ```
-image 來源可為 **tar**（`docker save`/OCI archive）、**registry ref**（釘版 tag 或 `@sha256`，build 時匿名拉取）或 **Dockerfile**（打包機需有 docker/podman/nerdctl）。
+image 來源可為 **tar**（`docker save`/OCI archive）、**registry ref**（釘版 tag 或 `@sha256`；公開 image 匿名拉取，**私有 registry** 用 `docker login` 的明文 `auths` 憑證或 `CHEFER_REGISTRY_AUTH=user:pass`——外部 credential helper 不支援）或 **Dockerfile**（打包機需有 docker/podman/nerdctl）。
 
 ## 最小可用範例
 
