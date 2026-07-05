@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.102"
 appcipe-spec = { version = "0.1.0", path = "../appcipe-spec" }
+# 解 docker config.json 的 auths.auth（base64 "user:pass"）；本就在依賴樹（oci-client 傳遞依賴）。
+base64 = "0.22"
 chefer-bundle = { version = "0.4.0", path = "../chefer-bundle" }
 flate2 = "1.1.9"
 fs-err = "3.3.0"

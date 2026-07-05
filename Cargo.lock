@@ -299,6 +299,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "appcipe-spec",
+ "base64",
  "chefer-bundle",
  "flate2",
  "fs-err",

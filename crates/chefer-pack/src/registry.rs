@@ -74,12 +74,21 @@ pub(crate) fn pull_image(reference: &str, platform: &str, tmp: &Path) -> Result<
             ..Default::default()
         };
         let client = Client::new(config);
+        // 私有 registry：有憑證（CHEFER_REGISTRY_AUTH / docker login）就帶 Basic，否則匿名
+        //（公開 image 行為不變）。見 registry_auth.rs。
+        let auth = match crate::registry_auth::resolve(parsed.registry()) {
+            Some(a) => {
+                eprintln!(
+                    "[chefer] using registry credentials for {} (from {})",
+                    parsed.registry(),
+                    a.source
+                );
+                RegistryAuth::Basic(a.user, a.pass)
+            }
+            None => RegistryAuth::Anonymous,
+        };
         client
-            .pull(
-                &parsed,
-                &RegistryAuth::Anonymous,
-                ACCEPTED_LAYER_MEDIA_TYPES.to_vec(),
-            )
+            .pull(&parsed, &auth, ACCEPTED_LAYER_MEDIA_TYPES.to_vec())
             .await
             .map_err(|e| pull_error(reference, platform, &available, e))
     })?;
@@ -191,8 +200,12 @@ fn pull_error(
         )
     } else if has(&["unauthorized", "denied", "authentication", "401", "403"]) {
         anyhow::anyhow!(
-            "registry requires authentication for `{reference}`. Chefer pulls public images \
-             anonymously; private registries are not supported yet."
+            "registry requires authentication (or denied access) for `{reference}`. \
+             For a private registry, either run `docker login <registry>` (Chefer reads the plain \
+             `auths` entries in ~/.docker/config.json — external credential helpers/credsStore are \
+             NOT supported, so on hosts where `docker login` delegates to a helper, use the env \
+             var instead) or set CHEFER_REGISTRY_AUTH=user:pass for this build. If credentials \
+             were provided, they were wrong or lack pull access to this repository."
         )
     } else if has(&["toomanyrequests", "too many requests", "rate limit", "429"]) {
         anyhow::anyhow!(

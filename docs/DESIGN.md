@@ -197,7 +197,7 @@ bundle/
 - 行為：
   0. 取得每個 service 的 image，收斂成同一個 `ResolvedImage`（config + 各層 blob 檔），來源三擇一：
      - **`source: tar`**：image tar 先安全解壓到暫存目錄再解析（OCI blobs 需隨機存取）。
-     - **`source: image`**：以 `oci-client`（rustls）依 `platform` 從 registry 拉 manifest+config+layers（`chefer-pack::registry`，pack 同步流程內 `block_on` 一個 tokio runtime；匿名，僅公開 image），layer blob 寫進暫存目錄。之後與 tar 共用同一條 repack。各層 blob 的解壓/雜湊/重壓全程串流。
+     - **`source: image`**：以 `oci-client`（rustls）依 `platform` 從 registry 拉 manifest+config+layers（`chefer-pack::registry`，pack 同步流程內 `block_on` 一個 tokio runtime），layer blob 寫進暫存目錄。之後與 tar 共用同一條 repack。各層 blob 的解壓/雜湊/重壓全程串流。**私有 registry 認證**（`chefer-pack::registry_auth`，純函式含單元測試）：`CHEFER_REGISTRY_AUTH=user:pass`（套用本次 build 的所有 registry；第一個冒號切分）> docker config（`$DOCKER_CONFIG/config.json` 或 `~/.docker/config.json` 的 `auths`——`auth` base64 與明文 `username`/`password` 皆支援；Docker Hub 歷史別名鍵（`https://index.docker.io/v1/` 等）對映到 `docker.io`）> 匿名（公開 image 行為不變）。**credsStore/credHelpers（外部 helper 程式）不支援**——config 裡沒有可讀憑證，跳過並 fallback 匿名（401/403 錯誤訊息提示兩種可用做法）。
      - **`source: dockerfile`**：在**打包機**上以既有的 container builder 建置（見下方「Dockerfile build」），`save` 成 docker-archive tar 後，**完全併入 `source: tar` 的解析路徑**。
   1. `source: tar` 時**自動偵測格式**（看內容不看副檔名）：
      - docker-archive：根目錄有 `manifest.json`（JSON 陣列，元素含 `Config`/`Layers`）。
