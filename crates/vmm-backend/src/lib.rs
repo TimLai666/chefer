@@ -23,15 +23,15 @@ mod wsl2;
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 mod wsl_util;
 
-// macOS vz 後端的純函式（appliance 查找、VM 資源、kernel cmdline）；跨平台可測。
-// 一律 allow(dead_code)：非 macOS 上僅供測試；macOS 上部分（VmResources、
-// kernel_command_line…）是預留給「待實機驗證」的 VZ 開機 shim、目前尚未接線，
-// 但已被單元測試覆蓋。待 vz.rs 接上後可移除此 allow。
+// macOS vz 後端的純函式（appliance 查找、VM 資源、kernel cmdline、helper CLI contract）；
+// 跨平台可測。vz.rs（僅 macOS 編譯）已全數接上——allow(dead_code) 是給非 macOS 平台
+// （vz.rs 不編譯、函式只被單元測試引用）。
 #[allow(dead_code)]
 mod vz_util;
 
 // Windows WHP 後端的純函式（appliance/helper 查找、helper CLI contract、資源計算）；
-// 跨平台可測。真正 WHP VM boot 尚未實作，故目前多數函式是 contract scaffolding。
+// 跨平台可測。whp.rs（僅 Windows 編譯）已接上——allow(dead_code) 是給非 Windows 平台
+// （函式只被單元測試引用）。
 #[allow(dead_code)]
 mod whp_util;
 
