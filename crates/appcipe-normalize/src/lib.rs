@@ -25,7 +25,7 @@ pub fn normalize(app: &mut AppCipe, base: &Path) -> anyhow::Result<()> {
         app.data_dir = Some(to_abs(base, dir));
     }
 
-    for (_name, svc) in app.services.iter_mut() {
+    for svc in app.services.values_mut() {
         // 簡寫 `image: <字串>`：若看起來是 registry reference（非路徑、帶 tag/digest、檔案不存在），
         // 轉成 `source: image`（compose 風格的 `image: redis:7.2-alpine`）；否則維持 tar 路徑。
         if let ImageSourceOrPath::TarPath(p) = &svc.image
