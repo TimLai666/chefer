@@ -431,12 +431,20 @@ if guiMode {
     view.virtualMachine = vm
     view.autoresizingMask = [.width, .height]
 
-    // 視窗固定 1:1 scanout 尺寸（同 WHP 首版：固定解析度，不縮放失真）。
+    // 視窗預設 1:1 scanout 尺寸。動態解析度（DESIGN ④「縮放」）：macOS 14+ 的
+    // VZVirtualMachineView 支援 automaticallyReconfiguresDisplay——使用者調整視窗
+    // 尺寸時由 VZ 對 guest 的 virtio-gpu 發顯示重組態，guest DRM hotplug 換模式、
+    // cage/wlroots 跟隨新 output 尺寸 → 開放 .resizable。macOS 13 無此 API，
+    // 維持固定尺寸（resize 只會縮放失真，故不開）。
     let window = NSWindow(
         contentRect: NSRect(x: 0, y: 0, width: CGFloat(guiW), height: CGFloat(guiH)),
         styleMask: [.titled, .closable, .miniaturizable],
         backing: .buffered,
         defer: false)
+    if #available(macOS 14.0, *) {
+        view.automaticallyReconfiguresDisplay = true
+        window.styleMask.insert(.resizable)
+    }
     window.title = guiTitle
     window.contentView = view
     // ARC 下的既知陷阱：程式化 NSWindow 預設 isReleasedWhenClosed=true，關窗會對已由

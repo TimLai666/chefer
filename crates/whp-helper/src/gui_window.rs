@@ -24,17 +24,18 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, GWL_STYLE, GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, GetWindowLongW,
-    IDC_ARROW, KillTimer, LoadCursorW, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SW_SHOW,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TranslateMessage, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    DispatchMessageW, GWL_STYLE, GWLP_USERDATA, GetClientRect, GetMessageW, GetWindowLongPtrW,
+    GetWindowLongW, IDC_ARROW, KillTimer, LoadCursorW, MSG, PostMessageW, PostQuitMessage,
+    RegisterClassW, SIZE_MAXIMIZED, SIZE_RESTORED, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOZORDER, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
+    WM_CLOSE, WM_DESTROY, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_PAINT,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW, WS_CAPTION,
-    WS_MINIMIZEBOX, WS_SYSMENU, WS_VISIBLE,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WNDCLASSW,
+    WS_CAPTION, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
 };
 
 use crate::virtio::gui_bridge::{
-    InputTarget, SharedFrame, SharedInput, TargetedEvent, vk_to_evdev,
+    InputTarget, SharedFrame, SharedInput, SharedResize, TargetedEvent, vk_to_evdev,
 };
 use crate::virtio::input::{
     ABS_X, ABS_Y, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, EV_ABS, EV_KEY, EV_REL, EV_SYN, InputEvent,
@@ -44,11 +45,16 @@ use crate::virtio::input::{
 const REPAINT_TIMER_ID: usize = 1;
 /// 重繪輪詢間隔（ms）：~60fps 上限，實際只在 framebuffer 有新 generation 時真的重畫。
 const REPAINT_TIMER_MS: u32 = 16;
+/// 動態解析度：等 guest 換到請求尺寸的上限（WM_TIMER tick 數；16ms × 250 ≈ 4s）。
+/// 逾時（guest 不理/夾住請求）→ 放棄 pending，恢復 resize-to-content 跟隨 guest 實際尺寸。
+const PENDING_RESIZE_TICKS: u32 = 250;
 
 /// 視窗執行緒與 VM 端共用的狀態（存入 GWLP_USERDATA）。
 struct WindowState {
     frame: SharedFrame,
     input: SharedInput,
+    /// 使用者改視窗尺寸時對 VM loop 發出的顯示尺寸請求（動態解析度）。
+    resize: SharedResize,
     width: u32,
     height: u32,
     /// 使用者關視窗時置 true（VM loop 輪詢以收掉 app）。
@@ -59,6 +65,15 @@ struct WindowState {
     snapshot: Vec<u8>,
     snap_w: u32,
     snap_h: u32,
+    /// 使用者互動拖拉中（WM_ENTERSIZEMOVE..WM_EXITSIZEMOVE）；結束時才發 resize 請求。
+    in_sizemove: bool,
+    /// 我們自己的 resize-to-content SetWindowPos 造成的 WM_SIZE 要忽略（防回饋迴圈）。
+    programmatic_resize: bool,
+    /// 已對 guest 發出、尚未看到對應 scanout 尺寸的請求；期間暫停 resize-to-content
+    ///（否則 guest 換模式前的舊尺寸 frame 會把視窗又改回去）。
+    pending_resize: Option<(u32, u32)>,
+    /// pending 的剩餘等待 tick（歸零 = 逾時放棄）。
+    pending_ticks: u32,
 }
 
 /// VM 端持有的視窗把手。
@@ -93,11 +108,13 @@ impl GuiHandle {
     }
 }
 
-/// 啟動 GUI 視窗執行緒。`width`/`height` 為顯示（= guest scanout）尺寸。
+/// 啟動 GUI 視窗執行緒。`width`/`height` 為顯示（= guest scanout）尺寸；使用者改視窗
+/// 尺寸時經 `resize` 請求 guest 換解析度（動態解析度）。
 pub fn spawn(
     title: &str,
     frame: SharedFrame,
     input: SharedInput,
+    resize: SharedResize,
     width: u32,
     height: u32,
 ) -> GuiHandle {
@@ -108,7 +125,9 @@ pub fn spawn(
     let thread = std::thread::Builder::new()
         .name("chefer-gui".into())
         .spawn(move || {
-            window_thread(&title_w, frame, input, width, height, closed_c, hwnd_c);
+            window_thread(
+                &title_w, frame, input, resize, width, height, closed_c, hwnd_c,
+            );
         })
         .expect("failed to spawn GUI window thread");
     GuiHandle {
@@ -118,10 +137,12 @@ pub fn spawn(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // 內部啟動函式；參數即 WindowState 的建構材料
 fn window_thread(
     title_w: &[u16],
     frame: SharedFrame,
     input: SharedInput,
+    resize: SharedResize,
     width: u32,
     height: u32,
     closed_by_user: Arc<AtomicBool>,
@@ -145,8 +166,10 @@ fn window_thread(
         RegisterClassW(&wc);
 
         // 初始 client 區 = 傳入尺寸；首個 frame 後依 guest 實際 scanout 解析度
-        // resize-to-content（見 WM_TIMER），以 1:1 顯示不失真。
-        let style = WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE;
+        // resize-to-content（見 WM_TIMER），以 1:1 顯示不失真。動態解析度：可調大小
+        //（THICKFRAME）+ 最大化——使用者改尺寸時請求 guest 換模式（WM_EXITSIZEMOVE/WM_SIZE）。
+        let style =
+            WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME | WS_VISIBLE;
         let mut rect = windows_sys::Win32::Foundation::RECT {
             left: 0,
             top: 0,
@@ -160,6 +183,7 @@ fn window_thread(
         let state = Box::new(WindowState {
             frame,
             input,
+            resize,
             width,
             height,
             closed_by_user,
@@ -167,6 +191,10 @@ fn window_thread(
             snapshot: Vec::new(),
             snap_w: 0,
             snap_h: 0,
+            in_sizemove: false,
+            programmatic_resize: false,
+            pending_resize: None,
+            pending_ticks: 0,
         });
         let state_ptr = Box::into_raw(state);
 
@@ -235,15 +263,59 @@ unsafe extern "system" fn wnd_proc(
                 state.snap_w = w;
                 state.snap_h = h;
                 state.last_gen = generation;
-                // guest 選定的 scanout 解析度可能 ≠ 初始視窗大小（cage/wlroots 挑的模式）。
+                // 動態解析度 pending：等 guest 換到請求尺寸期間，暫停 resize-to-content
+                //（此刻進來的仍是舊尺寸 frame，跟隨它會把視窗改回去 = 回饋迴圈）。
+                // guest 到位（frame 尺寸 = 請求）或逾時（guest 不理/夾住）→ 解除 pending。
+                if let Some((pw, ph)) = state.pending_resize {
+                    state.pending_ticks = state.pending_ticks.saturating_sub(1);
+                    if (w, h) == (pw, ph) || state.pending_ticks == 0 {
+                        state.pending_resize = None;
+                    }
+                }
+                // guest 選定的 scanout 解析度可能 ≠ 視窗大小（cage/wlroots 挑的模式）。
                 // 視窗 client 區跟著調整為 guest 實際解析度 → 1:1 blit、不放大失真；
                 // 同時讓 abs 座標映射（用 state.width/height）與可見畫面一致。
-                if (w, h) != (state.width, state.height) && w > 0 && h > 0 {
+                if state.pending_resize.is_none()
+                    && (w, h) != (state.width, state.height)
+                    && w > 0
+                    && h > 0
+                {
                     state.width = w;
                     state.height = h;
+                    state.programmatic_resize = true;
                     unsafe { resize_client(hwnd, w, h) };
+                    state.programmatic_resize = false;
                 }
                 unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
+            } else if state.pending_resize.is_some() {
+                // 無新 frame 也要倒數（guest 可能完全沒送新畫面）。
+                state.pending_ticks = state.pending_ticks.saturating_sub(1);
+                if state.pending_ticks == 0 {
+                    state.pending_resize = None;
+                }
+            }
+            0
+        }
+        WM_ENTERSIZEMOVE => {
+            state.in_sizemove = true;
+            0
+        }
+        WM_EXITSIZEMOVE => {
+            // 互動拖拉結束：以最終 client 尺寸請求 guest 換解析度。
+            state.in_sizemove = false;
+            unsafe { user_resize_request(hwnd, state) };
+            0
+        }
+        WM_SIZE => {
+            // 最大化/還原沒有 sizemove 迴圈，直接在 WM_SIZE 觸發；拖拉中（in_sizemove）與
+            // 我們自己 resize-to-content 造成的 WM_SIZE 略過（後者靠 programmatic_resize +
+            // user_resize_request 的「尺寸沒變就不請求」雙重防護）。
+            let kind = wparam as u32;
+            if !state.in_sizemove
+                && !state.programmatic_resize
+                && (kind == SIZE_MAXIMIZED || kind == SIZE_RESTORED)
+            {
+                unsafe { user_resize_request(hwnd, state) };
             }
             0
         }
@@ -331,6 +403,35 @@ unsafe extern "system" fn wnd_proc(
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
+}
+
+/// 使用者改了視窗尺寸（拖拉結束/最大化/還原）：以目前 client 區尺寸向 guest 請求換
+/// 解析度。尺寸沒變或荒謬（最小化 0×0）→ 不請求。請求後進入 pending（見 WM_TIMER）。
+unsafe fn user_resize_request(hwnd: HWND, state: &mut WindowState) {
+    let mut rect = windows_sys::Win32::Foundation::RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    if unsafe { GetClientRect(hwnd, &mut rect) } == 0 {
+        return;
+    }
+    let w = (rect.right - rect.left).max(0) as u32;
+    let h = (rect.bottom - rect.top).max(0) as u32;
+    // 夾住荒謬值（最小化為 0×0；guest 模式也不該小於可用下限）。
+    let w = w.clamp(320, 7680);
+    let h = h.clamp(240, 4320);
+    if (w, h) == (state.width, state.height) {
+        return; // 沒變（含我們自己 resize-to-content 引出的 WM_SIZE）→ 不請求
+    }
+    // 立刻讓 blit 目標與 abs 座標映射跟上新 client 尺寸（過渡期舊 frame 以拉伸顯示，
+    // 座標按「視窗內比例 = guest 螢幕比例」映射仍正確）。
+    state.width = w;
+    state.height = h;
+    state.pending_resize = Some((w, h));
+    state.pending_ticks = PENDING_RESIZE_TICKS;
+    state.resize.request(w, h);
 }
 
 /// 調整視窗使 client 區為 `w`×`h`（依目前 window style 換算外框；不移動、不改 Z 序）。
@@ -429,15 +530,30 @@ fn wide(s: &str) -> Vec<u16> {
 pub fn gui_selftest() -> Result<(), String> {
     let frame = SharedFrame::new();
     let input = SharedInput::new();
-    let (w, h) = (640u32, 480u32);
-    let handle = spawn("Chefer GUI self-test", frame.clone(), input.clone(), w, h);
+    let resize = SharedResize::new();
+    let (mut w, mut h) = (640u32, 480u32);
+    let handle = spawn(
+        "Chefer GUI self-test",
+        frame.clone(),
+        input.clone(),
+        resize.clone(),
+        w,
+        h,
+    );
     eprintln!(
-        "[whp-gui] self-test window open; move the mouse / press keys, close the window to end."
+        "[whp-gui] self-test window open; move the mouse / press keys / resize the window, \
+         close the window to end."
     );
 
     let mut t: u32 = 0;
     let mut buf = vec![0u8; (w * h * 4) as usize];
     while !handle.closed_by_user() {
+        // 動態解析度：像真 guest 一樣接受 resize 請求（模擬 guest re-modeset）。
+        if let Some((nw, nh)) = resize.take() {
+            eprintln!("[whp-gui] resize request {nw}x{nh}; switching test pattern size");
+            (w, h) = (nw, nh);
+            buf = vec![0u8; (w * h * 4) as usize];
+        }
         // 動畫：垂直彩色帶隨 t 平移（BGRA）。
         for y in 0..h {
             for x in 0..w {
