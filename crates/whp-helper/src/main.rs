@@ -502,19 +502,28 @@ mod whp_api {
         exit_access_type: u32,
     }
 
-    /// run_loop 的 GUI 裝置集（僅 --gui 時存在）：三個 MMIO 裝置 + 共享輸入佇列 + 視窗把手。
+    /// run_loop 的 GUI 裝置集（僅 --gui 時存在）：三個 MMIO 裝置 + 共享輸入佇列 +
+    /// 顯示尺寸請求 + 視窗把手。
     struct GuiDevices<'a> {
         gpu: &'a mut VirtioGpuMmioDevice,
         kbd: &'a mut VirtioInputMmioDevice,
         tablet: &'a mut VirtioInputMmioDevice,
         input_queue: super::virtio::gui_bridge::SharedInput,
+        resize: super::virtio::gui_bridge::SharedResize,
         window: &'a crate::gui_window::GuiHandle,
     }
 
     impl GuiDevices<'_> {
-        /// 把視窗執行緒累積的事件分流到 keyboard/tablet 並填進各自 eventq。每輪 VM loop 呼叫。
+        /// 把視窗執行緒累積的事件分流到 keyboard/tablet 並填進各自 eventq；
+        /// 有顯示尺寸請求（使用者改視窗大小）則對 virtio-gpu 發 display 事件。每輪 VM loop 呼叫。
         fn pump(&mut self, host_mem: &mut [u8], pic1: &mut super::pic::Pic) -> Result<(), String> {
             use super::virtio::gui_bridge::InputTarget;
+            if let Some((w, h)) = self.resize.take() {
+                if std::env::var_os("CHEFER_WHP_TRACE_GPU").is_some() {
+                    eprintln!("[whp-gpu] host window resized; requesting guest mode {w}x{h}");
+                }
+                self.gpu.display_resize(w, h, pic1);
+            }
             for te in self.input_queue.drain() {
                 match te.target {
                     InputTarget::Keyboard => self.kbd.push_event(te.event),
@@ -714,9 +723,10 @@ mod whp_api {
         let mut devices =
             format!("{VIRTIO_MMIO_CMDLINE} {VIRTIO_DATA_MMIO_CMDLINE} {VIRTIO_NET_MMIO_CMDLINE}");
         // GUI：額外掛 virtio-gpu + virtio-input(keyboard/tablet)。
-        // 註：guest 的 cage/wlroots 目前挑 640x480 預設模式（virtio-gpu 無 EDID → connector
-        // 無偏好模式）；host 視窗以 resize-to-content 跟著 1:1 顯示（不失真）。要更大的預設
-        // 視窗需為 virtio-gpu 加 EDID（VIRTIO_GPU_F_EDID + GET_EDID）——列為後續。
+        // 註：virtio-gpu 已宣告 VIRTIO_GPU_F_EDID 並回以 width×height 為偏好模式的 EDID
+        //（guest 據此建 1280×800 等偏好模式，非 640×480 fallback）；host 視窗另以
+        // resize-to-content 跟著 guest 實際 scanout 1:1 顯示。使用者改視窗尺寸則反向
+        // 走動態解析度（display-info/EDID 更新 + config 中斷 → guest re-modeset）。
         if gui {
             devices.push_str(&format!(
                 " {VIRTIO_GPU_MMIO_CMDLINE} {VIRTIO_KBD_MMIO_CMDLINE} {VIRTIO_TABLET_MMIO_CMDLINE}"
@@ -1223,13 +1233,27 @@ mod whp_api {
             let action = self.mmio.write(aligned, u32::from_le_bytes(merged));
             match action {
                 super::virtio::mmio::MmioAction::None
-                | super::virtio::mmio::MmioAction::ConfigRead { .. }
-                | super::virtio::mmio::MmioAction::ConfigWrite { .. } => Ok(()),
+                | super::virtio::mmio::MmioAction::ConfigRead { .. } => Ok(()),
+                // config space 寫入：virtio-gpu 的 events_clear（driver 清除 display 事件）。
+                super::virtio::mmio::MmioAction::ConfigWrite { offset, value, .. } => {
+                    self.gpu.config_write(offset, value);
+                    Ok(())
+                }
                 super::virtio::mmio::MmioAction::Reset => {
                     self.last_avail = [0; 2];
                     Ok(())
                 }
                 super::virtio::mmio::MmioAction::QueueNotify(_) => self.service(host_mem, pic1),
+            }
+        }
+
+        /// 動態解析度：host 視窗被使用者改尺寸 → 更新 virtio-gpu 顯示尺寸（display info /
+        /// EDID 隨之回新值）並發 config-change 中斷。guest driver 讀 events_read 見
+        /// EVENT_DISPLAY → 重讀 display info → DRM hotplug → cage/wlroots re-modeset。
+        fn display_resize(&mut self, w: u32, h: u32, pic1: &mut super::pic::Pic) {
+            if self.gpu.request_display_size(w, h) {
+                self.mmio.signal_config();
+                pic1.request_irq(self.irq);
             }
         }
 
@@ -2157,34 +2181,38 @@ mod whp_api {
             .map(|t| crate::clipboard_host::spawn(t.clone(), CLIP_PORT));
 
         // GUI 裝置（M8-c-2，僅 --gui）：virtio-gpu + keyboard/tablet + Win32 顯示視窗。
-        let (mut gpu_dev, mut kbd_dev, mut tablet_dev, gui_window, gui_input) = if req.gui {
-            let (gw, gh) = gui_display_size();
-            let frame = super::virtio::gui_bridge::SharedFrame::new();
-            let input = super::virtio::gui_bridge::SharedInput::new();
-            let gpu = VirtioGpuMmioDevice::new(gw, gh, frame.clone());
-            let kbd = VirtioInputMmioDevice::new(
-                VIRTIO_KBD_MMIO_BASE,
-                VIRTIO_KBD_MMIO_IRQ,
-                super::virtio::input::InputKind::Keyboard,
-            );
-            let tablet = VirtioInputMmioDevice::new(
-                VIRTIO_TABLET_MMIO_BASE,
-                VIRTIO_TABLET_MMIO_IRQ,
-                super::virtio::input::InputKind::Tablet,
-            );
-            // 視窗標題 = app 名（vmm-backend 帶 --gui-title）；缺省 "Chefer"。
-            let title = req.gui_title.as_deref().unwrap_or("Chefer");
-            let window = crate::gui_window::spawn(title, frame, input.clone(), gw, gh);
-            (
-                Some(gpu),
-                Some(kbd),
-                Some(tablet),
-                Some(window),
-                Some(input),
-            )
-        } else {
-            (None, None, None, None, None)
-        };
+        let (mut gpu_dev, mut kbd_dev, mut tablet_dev, gui_window, gui_input, gui_resize) =
+            if req.gui {
+                let (gw, gh) = gui_display_size();
+                let frame = super::virtio::gui_bridge::SharedFrame::new();
+                let input = super::virtio::gui_bridge::SharedInput::new();
+                let resize = super::virtio::gui_bridge::SharedResize::new();
+                let gpu = VirtioGpuMmioDevice::new(gw, gh, frame.clone());
+                let kbd = VirtioInputMmioDevice::new(
+                    VIRTIO_KBD_MMIO_BASE,
+                    VIRTIO_KBD_MMIO_IRQ,
+                    super::virtio::input::InputKind::Keyboard,
+                );
+                let tablet = VirtioInputMmioDevice::new(
+                    VIRTIO_TABLET_MMIO_BASE,
+                    VIRTIO_TABLET_MMIO_IRQ,
+                    super::virtio::input::InputKind::Tablet,
+                );
+                // 視窗標題 = app 名（vmm-backend 帶 --gui-title）；缺省 "Chefer"。
+                let title = req.gui_title.as_deref().unwrap_or("Chefer");
+                let window =
+                    crate::gui_window::spawn(title, frame, input.clone(), resize.clone(), gw, gh);
+                (
+                    Some(gpu),
+                    Some(kbd),
+                    Some(tablet),
+                    Some(window),
+                    Some(input),
+                    Some(resize),
+                )
+            } else {
+                (None, None, None, None, None, None)
+            };
 
         let emulator = WhpEmulator::new(&emulation)?;
 
@@ -2298,13 +2326,15 @@ mod whp_api {
             tablet_dev.as_mut(),
             gui_window.as_ref(),
             gui_input.as_ref(),
+            gui_resize.as_ref(),
         ) {
-            (Some(gpu), Some(kbd), Some(tablet), Some(window), Some(input_queue)) => {
+            (Some(gpu), Some(kbd), Some(tablet), Some(window), Some(input_queue), Some(resize)) => {
                 Some(GuiDevices {
                     gpu,
                     kbd,
                     tablet,
                     input_queue: input_queue.clone(),
+                    resize: resize.clone(),
                     window,
                 })
             }

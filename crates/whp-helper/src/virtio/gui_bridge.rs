@@ -117,6 +117,27 @@ impl SharedInput {
     }
 }
 
+/// 視窗執行緒 → VM loop 的顯示尺寸請求（動態解析度）。latest-wins：使用者連續拖拉時
+/// 只保留最後一筆，VM loop 每輪 `take` 一次（拿到就對 virtio-gpu 發 display 事件）。
+#[derive(Clone, Default)]
+pub struct SharedResize(Arc<Mutex<Option<(u32, u32)>>>);
+
+impl SharedResize {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 視窗執行緒：請求把 guest 顯示尺寸改為 `w`×`h`（覆蓋未消費的舊請求）。
+    pub fn request(&self, w: u32, h: u32) {
+        *self.0.lock().unwrap() = Some((w, h));
+    }
+
+    /// VM loop：取走最新請求（無請求回 None）。
+    pub fn take(&self) -> Option<(u32, u32)> {
+        self.0.lock().unwrap().take()
+    }
+}
+
 // ── 像素格式轉換（virtio-gpu scanout → Win32 DIB 的 BGRA）──
 
 // virtio-gpu formats（virtio_gpu_formats，spec §5.7.2）。
@@ -318,6 +339,16 @@ mod tests {
         let batch: Vec<_> = std::iter::repeat_n(ev, MAX_QUEUED_EVENTS + 500).collect();
         q.push_batch(&batch);
         assert_eq!(q.drain().len(), MAX_QUEUED_EVENTS);
+    }
+
+    #[test]
+    fn shared_resize_is_latest_wins() {
+        let r = SharedResize::new();
+        assert_eq!(r.take(), None);
+        r.request(800, 600);
+        r.request(1024, 768); // 連續拖拉：只留最後一筆
+        assert_eq!(r.take(), Some((1024, 768)));
+        assert_eq!(r.take(), None); // 消費後清空
     }
 
     #[test]

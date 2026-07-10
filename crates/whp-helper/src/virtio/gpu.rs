@@ -38,6 +38,10 @@ const VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER: u32 = 0x1205;
 
 const VIRTIO_GPU_FLAG_FENCE: u32 = 1 << 0;
 
+/// config space 的 events_read bit：顯示組態變更（driver 收 config 中斷後讀到此 bit，
+/// 會重新 GET_DISPLAY_INFO / GET_EDID 並發 DRM hotplug → wlroots/cage 換模式）。
+const VIRTIO_GPU_EVENT_DISPLAY: u32 = 1 << 0;
+
 /// ctrl header 長度（type+flags+fence_id+ctx_id+ring_idx+padding）。
 const CTRL_HDR_LEN: usize = 24;
 /// GET_DISPLAY_INFO 回應的 pmode 數（spec 固定 16 格）。
@@ -68,6 +72,8 @@ pub struct GpuDevice {
     scanout_res: u32,
     /// RESOURCE_FLUSH 後為 true；host 呈現端以 take_dirty 消費。
     dirty: bool,
+    /// config space 的 events_read（目前僅 EVENT_DISPLAY）；driver 以 events_clear 清除。
+    events_read: u32,
 }
 
 impl GpuDevice {
@@ -78,18 +84,45 @@ impl GpuDevice {
             resources: HashMap::new(),
             scanout_res: 0,
             dirty: false,
+            events_read: 0,
         }
     }
 
     /// config space（virtio_gpu_config：events_read/events_clear/num_scanouts/num_capsets）。
     pub fn config_read(&self, offset: u64, len: u8) -> u32 {
-        let cfg: [u32; 4] = [0, 0, 1, 0]; // events=0、1 個 scanout、0 個 capset
+        let cfg: [u32; 4] = [self.events_read, 0, 1, 0]; // events、(clear=W/O)、1 scanout、0 capset
         let bytes: Vec<u8> = cfg.iter().flat_map(|v| v.to_le_bytes()).collect();
         let mut out = [0u8; 4];
         for (i, slot) in out.iter_mut().enumerate().take(len as usize) {
             *slot = bytes.get(offset as usize + i).copied().unwrap_or(0);
         }
         u32::from_le_bytes(out)
+    }
+
+    /// config space 寫入：offset 4 = events_clear（driver 讀完 events_read 後把已處理的
+    /// bit 寫來清除，virtio-gpu spec §5.7.4）。其餘 offset 唯讀、忽略。
+    pub fn config_write(&mut self, offset: u64, value: u32) {
+        if offset == 4 {
+            self.events_read &= !value;
+        }
+    }
+
+    /// 動態解析度（DESIGN §6「WHP GUI」動態解析度）：host 視窗被使用者改尺寸後呼叫。
+    /// 更新 scanout 0 的顯示尺寸（GET_DISPLAY_INFO / GET_EDID 隨之回新值）並置
+    /// EVENT_DISPLAY——呼叫端接著發 config-change 中斷，guest driver 重讀 display info、
+    /// DRM hotplug → cage/wlroots 以新偏好模式 re-modeset（新的 SET_SCANOUT/FLUSH 進來）。
+    /// 尺寸不變或荒謬（0 / >16384）→ false（呼叫端不需發中斷）。
+    pub fn request_display_size(&mut self, width: u32, height: u32) -> bool {
+        if width == 0 || height == 0 || width > 16384 || height > 16384 {
+            return false;
+        }
+        if (width, height) == (self.width, self.height) {
+            return false;
+        }
+        self.width = width;
+        self.height = height;
+        self.events_read |= VIRTIO_GPU_EVENT_DISPLAY;
+        true
     }
 
     /// 顯示解析度（host 視窗端建立視窗用）。
@@ -612,6 +645,43 @@ mod tests {
         assert_eq!((w, h), (4, 2));
         assert_eq!(&px[..16], &[0xAA; 16]);
         assert_eq!(&px[16..32], &[0xBB; 16]);
+    }
+
+    #[test]
+    fn dynamic_resize_updates_info_edid_and_events() {
+        let mut buf = vec![0u8; 1 << 20];
+        let mut mem = SliceMem::new(0, &mut buf);
+        let mut dev = GpuDevice::new(1280, 800);
+        // 初始：無 pending event。
+        assert_eq!(dev.config_read(0, 4), 0);
+
+        // 同尺寸 / 荒謬尺寸 → 拒絕、不置 event。
+        assert!(!dev.request_display_size(1280, 800));
+        assert!(!dev.request_display_size(0, 600));
+        assert!(!dev.request_display_size(20000, 600));
+        assert_eq!(dev.config_read(0, 4), 0);
+
+        // 真的改尺寸 → events_read 含 EVENT_DISPLAY，display info / EDID 回新值。
+        assert!(dev.request_display_size(1024, 768));
+        assert_eq!(dev.config_read(0, 4), VIRTIO_GPU_EVENT_DISPLAY);
+        let resp = run_cmd(
+            &mut dev,
+            &mut mem,
+            &hdr(VIRTIO_GPU_CMD_GET_DISPLAY_INFO),
+            4096,
+        );
+        assert_eq!(u32_at(&resp, CTRL_HDR_LEN + 8), 1024);
+        assert_eq!(u32_at(&resp, CTRL_HDR_LEN + 12), 768);
+        let resp = run_cmd(&mut dev, &mut mem, &hdr(VIRTIO_GPU_CMD_GET_EDID), 2048);
+        let dt = &resp[CTRL_HDR_LEN + 8 + 54..CTRL_HDR_LEN + 8 + 72];
+        assert_eq!((dt[2] as u32) | (((dt[4] >> 4) as u32) << 8), 1024);
+        assert_eq!((dt[5] as u32) | (((dt[7] >> 4) as u32) << 8), 768);
+
+        // driver 以 events_clear（config offset 4）清除；其他 offset 寫入被忽略。
+        dev.config_write(0, 0xFFFF_FFFF);
+        assert_eq!(dev.config_read(0, 4), VIRTIO_GPU_EVENT_DISPLAY);
+        dev.config_write(4, VIRTIO_GPU_EVENT_DISPLAY);
+        assert_eq!(dev.config_read(0, 4), 0);
     }
 
     #[test]

@@ -47,6 +47,8 @@ const VENDOR_ID_CHEFER: u32 = 0x4645_4843; // "CHEF"
 
 /// InterruptStatus bit：used buffer notification（virtio spec §4.2.2）。
 pub const INT_USED_BUFFER: u32 = 0x1;
+/// InterruptStatus bit：device configuration change（virtio spec §4.2.2）。
+pub const INT_CONFIG_CHANGE: u32 = 0x2;
 
 /// 單一 virtqueue 的 transport 設定（位址由 driver 透過 MMIO 寫入）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -218,6 +220,13 @@ impl Mmio {
         self.interrupt_status |= INT_USED_BUFFER;
     }
 
+    /// 標記一次 device config 變更（接線層注入 IRQ 前呼叫）：置 config-change 中斷位並
+    /// bump ConfigGeneration（driver 以 generation 前後一致確保讀到原子的 config 快照）。
+    pub fn signal_config(&mut self) {
+        self.interrupt_status |= INT_CONFIG_CHANGE;
+        self.config_generation = self.config_generation.wrapping_add(1);
+    }
+
     fn reset(&mut self) {
         self.status = 0;
         self.driver_features = 0;
@@ -348,6 +357,23 @@ mod tests {
         assert_eq!(m.read(REG_INTERRUPT_STATUS), INT_USED_BUFFER);
         m.write(REG_INTERRUPT_ACK, INT_USED_BUFFER);
         assert_eq!(m.read(REG_INTERRUPT_STATUS), 0);
+    }
+
+    #[test]
+    fn config_change_signal_sets_bit_and_bumps_generation() {
+        let mut m = blk();
+        let g0 = m.read(REG_CONFIG_GENERATION);
+        m.signal_config();
+        assert_eq!(m.read(REG_INTERRUPT_STATUS), INT_CONFIG_CHANGE);
+        assert_eq!(m.read(REG_CONFIG_GENERATION), g0.wrapping_add(1));
+        // 與 used 位元互不干擾；ack 分別清除。
+        m.signal_used();
+        assert_eq!(
+            m.read(REG_INTERRUPT_STATUS),
+            INT_CONFIG_CHANGE | INT_USED_BUFFER
+        );
+        m.write(REG_INTERRUPT_ACK, INT_CONFIG_CHANGE);
+        assert_eq!(m.read(REG_INTERRUPT_STATUS), INT_USED_BUFFER);
     }
 
     #[test]
