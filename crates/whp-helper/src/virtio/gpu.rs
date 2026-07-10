@@ -103,14 +103,21 @@ impl GpuDevice {
     /// bit 寫來清除，virtio-gpu spec §5.7.4）。其餘 offset 唯讀、忽略。
     pub fn config_write(&mut self, offset: u64, value: u32) {
         if offset == 4 {
+            // 低頻（config 事件 ack）；trace 供動態解析度實機診斷。
+            if std::env::var_os("CHEFER_WHP_TRACE_GPU").is_some() {
+                eprintln!("[whp-gpu] guest events_clear {value:#x}");
+            }
             self.events_read &= !value;
         }
     }
 
     /// 動態解析度（DESIGN §6「WHP GUI」動態解析度）：host 視窗被使用者改尺寸後呼叫。
     /// 更新 scanout 0 的顯示尺寸（GET_DISPLAY_INFO / GET_EDID 隨之回新值）並置
-    /// EVENT_DISPLAY——呼叫端接著發 config-change 中斷，guest driver 重讀 display info、
-    /// DRM hotplug → cage/wlroots 以新偏好模式 re-modeset（新的 SET_SCANOUT/FLUSH 進來）。
+    /// EVENT_DISPLAY——呼叫端接著發 config-change 中斷，guest driver 重讀 display info
+    /// 與 EDID。**會跟模式的 guest compositor** 據此 re-modeset；cage 這種固定模式 kiosk
+    /// 不會（實機驗證：driver 有重抓、userspace 不動；host 視窗端以縮放顯示因應——見
+    /// gui_window。曾試過「回報 disabled→enabled」的 replug 模擬拔插：connector 短暫
+    /// disconnected 會讓 cage 拆輸出 → 介面 app 隨之退出 → fail_fast 收掉整個 app，故不採）。
     /// 尺寸不變或荒謬（0 / >16384）→ false（呼叫端不需發中斷）。
     pub fn request_display_size(&mut self, width: u32, height: u32) -> bool {
         if width == 0 || height == 0 || width > 16384 || height > 16384 {
@@ -196,11 +203,23 @@ impl GpuDevice {
     fn execute<M: GuestMemory>(&mut self, cmd: u32, req: &[u8], mem: &mut M) -> (u32, Vec<u8>) {
         match cmd {
             VIRTIO_GPU_CMD_GET_DISPLAY_INFO => {
+                // 低頻命令（probe / config 事件後）；trace 供動態解析度實機診斷。
+                if std::env::var_os("CHEFER_WHP_TRACE_GPU").is_some() {
+                    eprintln!(
+                        "[whp-gpu] guest GET_DISPLAY_INFO -> {}x{}",
+                        self.width, self.height
+                    );
+                }
                 (VIRTIO_GPU_RESP_OK_DISPLAY_INFO, self.display_info_payload())
             }
             // GET_EDID：回一份描述 width×height 偏好模式的 EDID，讓 guest 的 DRM connector
             // 取得正確偏好解析度（否則 cage/wlroots 無 EDID 時挑 640×480）。
-            VIRTIO_GPU_CMD_GET_EDID => (VIRTIO_GPU_RESP_OK_EDID, self.edid_payload()),
+            VIRTIO_GPU_CMD_GET_EDID => {
+                if std::env::var_os("CHEFER_WHP_TRACE_GPU").is_some() {
+                    eprintln!("[whp-gpu] guest GET_EDID -> {}x{}", self.width, self.height);
+                }
+                (VIRTIO_GPU_RESP_OK_EDID, self.edid_payload())
+            }
             VIRTIO_GPU_CMD_RESOURCE_CREATE_2D => self.cmd_create_2d(req),
             VIRTIO_GPU_CMD_RESOURCE_UNREF => {
                 let res_id = u32_at(req, CTRL_HDR_LEN);
@@ -661,7 +680,7 @@ mod tests {
         assert!(!dev.request_display_size(20000, 600));
         assert_eq!(dev.config_read(0, 4), 0);
 
-        // 真的改尺寸 → events_read 含 EVENT_DISPLAY，display info / EDID 回新值。
+        // 真的改尺寸 → EVENT_DISPLAY 置位、display info（保持 enabled）與 EDID 回新值。
         assert!(dev.request_display_size(1024, 768));
         assert_eq!(dev.config_read(0, 4), VIRTIO_GPU_EVENT_DISPLAY);
         let resp = run_cmd(
@@ -672,6 +691,9 @@ mod tests {
         );
         assert_eq!(u32_at(&resp, CTRL_HDR_LEN + 8), 1024);
         assert_eq!(u32_at(&resp, CTRL_HDR_LEN + 12), 768);
+        // scanout 0 全程 enabled——絕不能模擬拔除（實機驗證：connector 短暫 disconnected
+        // 會讓 cage 拆輸出 → 介面 app 退出 → fail_fast 收掉整個 app）。
+        assert_eq!(u32_at(&resp, CTRL_HDR_LEN + 16), 1, "scanout stays enabled");
         let resp = run_cmd(&mut dev, &mut mem, &hdr(VIRTIO_GPU_CMD_GET_EDID), 2048);
         let dt = &resp[CTRL_HDR_LEN + 8 + 54..CTRL_HDR_LEN + 8 + 72];
         assert_eq!((dt[2] as u32) | (((dt[4] >> 4) as u32) << 8), 1024);
