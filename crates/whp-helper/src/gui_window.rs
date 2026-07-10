@@ -45,9 +45,6 @@ use crate::virtio::input::{
 const REPAINT_TIMER_ID: usize = 1;
 /// 重繪輪詢間隔（ms）：~60fps 上限，實際只在 framebuffer 有新 generation 時真的重畫。
 const REPAINT_TIMER_MS: u32 = 16;
-/// 動態解析度：等 guest 換到請求尺寸的上限（WM_TIMER tick 數；16ms × 250 ≈ 4s）。
-/// 逾時（guest 不理/夾住請求）→ 放棄 pending，恢復 resize-to-content 跟隨 guest 實際尺寸。
-const PENDING_RESIZE_TICKS: u32 = 250;
 
 /// 視窗執行緒與 VM 端共用的狀態（存入 GWLP_USERDATA）。
 struct WindowState {
@@ -69,11 +66,11 @@ struct WindowState {
     in_sizemove: bool,
     /// 我們自己的 resize-to-content SetWindowPos 造成的 WM_SIZE 要忽略（防回饋迴圈）。
     programmatic_resize: bool,
-    /// 已對 guest 發出、尚未看到對應 scanout 尺寸的請求；期間暫停 resize-to-content
-    ///（否則 guest 換模式前的舊尺寸 frame 會把視窗又改回去）。
-    pending_resize: Option<(u32, u32)>,
-    /// pending 的剩餘等待 tick（歸零 = 逾時放棄）。
-    pending_ticks: u32,
+    /// 使用者手動改過視窗尺寸 → 尺寸主導權移交使用者：**永久停用 resize-to-content**。
+    /// guest 若跟上請求（會跟模式的 compositor）幀尺寸=視窗 → 自然 1:1；不跟（cage 這種
+    /// 固定模式 kiosk，實機驗證）→ 以 StretchDIBits 縮放顯示（abs 座標按視窗比例映射，
+    /// 輸入仍正確），視窗不彈回。
+    user_sized: bool,
 }
 
 /// VM 端持有的視窗把手。
@@ -193,8 +190,7 @@ fn window_thread(
             snap_h: 0,
             in_sizemove: false,
             programmatic_resize: false,
-            pending_resize: None,
-            pending_ticks: 0,
+            user_sized: false,
         });
         let state_ptr = Box::into_raw(state);
 
@@ -263,23 +259,12 @@ unsafe extern "system" fn wnd_proc(
                 state.snap_w = w;
                 state.snap_h = h;
                 state.last_gen = generation;
-                // 動態解析度 pending：等 guest 換到請求尺寸期間，暫停 resize-to-content
-                //（此刻進來的仍是舊尺寸 frame，跟隨它會把視窗改回去 = 回饋迴圈）。
-                // guest 到位（frame 尺寸 = 請求）或逾時（guest 不理/夾住）→ 解除 pending。
-                if let Some((pw, ph)) = state.pending_resize {
-                    state.pending_ticks = state.pending_ticks.saturating_sub(1);
-                    if (w, h) == (pw, ph) || state.pending_ticks == 0 {
-                        state.pending_resize = None;
-                    }
-                }
                 // guest 選定的 scanout 解析度可能 ≠ 視窗大小（cage/wlroots 挑的模式）。
                 // 視窗 client 區跟著調整為 guest 實際解析度 → 1:1 blit、不放大失真；
                 // 同時讓 abs 座標映射（用 state.width/height）與可見畫面一致。
-                if state.pending_resize.is_none()
-                    && (w, h) != (state.width, state.height)
-                    && w > 0
-                    && h > 0
-                {
+                // **使用者手動改過尺寸（user_sized）後永久停用**——尺寸主導權在使用者，
+                // guest 沒跟上就以縮放顯示，絕不把視窗改回去。
+                if !state.user_sized && (w, h) != (state.width, state.height) && w > 0 && h > 0 {
                     state.width = w;
                     state.height = h;
                     state.programmatic_resize = true;
@@ -287,12 +272,6 @@ unsafe extern "system" fn wnd_proc(
                     state.programmatic_resize = false;
                 }
                 unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
-            } else if state.pending_resize.is_some() {
-                // 無新 frame 也要倒數（guest 可能完全沒送新畫面）。
-                state.pending_ticks = state.pending_ticks.saturating_sub(1);
-                if state.pending_ticks == 0 {
-                    state.pending_resize = None;
-                }
             }
             0
         }
@@ -425,12 +404,12 @@ unsafe fn user_resize_request(hwnd: HWND, state: &mut WindowState) {
     if (w, h) == (state.width, state.height) {
         return; // 沒變（含我們自己 resize-to-content 引出的 WM_SIZE）→ 不請求
     }
-    // 立刻讓 blit 目標與 abs 座標映射跟上新 client 尺寸（過渡期舊 frame 以拉伸顯示，
-    // 座標按「視窗內比例 = guest 螢幕比例」映射仍正確）。
+    // 尺寸主導權移交使用者：blit 目標與 abs 座標映射跟上新 client 尺寸（guest 沒跟上時
+    // 舊尺寸 frame 以拉伸顯示，座標按「視窗內比例 = guest 螢幕比例」映射仍正確），
+    // 並永久停用 resize-to-content（見 WindowState::user_sized）。
     state.width = w;
     state.height = h;
-    state.pending_resize = Some((w, h));
-    state.pending_ticks = PENDING_RESIZE_TICKS;
+    state.user_sized = true;
     state.resize.request(w, h);
 }
 
