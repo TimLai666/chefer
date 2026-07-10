@@ -26,6 +26,22 @@ use anyhow::{Context, Result, bail};
 use chefer_bundle::Manifest;
 use nix::mount::{MsFlags, mount};
 
+/// 記一行 GUI 診斷。同時走 stderr（原生 Linux / 有接 console 的後端可見）與 **`/dev/kmsg`**
+/// ——WHP 的序列 console 在 `quiet` 下不顯示 guest-agent 自己的 stderr，但高優先序 kmsg 會
+/// 出現在 console（同 appliance init 的 `report()`），故 WHP GUI 的啟動診斷才看得到。best-effort。
+fn note(msg: &str) {
+    eprintln!("[guest-agent] gui: {msg}");
+    if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
+        use std::io::Write as _;
+        // **一次 write() = 一筆 kmsg 記錄**：必須先組好整行再單次寫入。`writeln!`（write_fmt）
+        // 會拆成多次 write，只有第一筆帶 `<2>` 前綴、其餘（含訊息本體）落回預設 level 而被
+        // `quiet` 擋掉。`quiet` 把 console_loglevel 壓到 4（只印 level < 4），故用 <2>=KERN_CRIT
+        //（appliance init 的 report() 用 <0> 亦同理）。
+        let line = format!("<2>[guest-agent] gui: {msg}\n");
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 /// cage 建立 Wayland socket 的 runtime 目錄（guest 內，appliance tmpfs 上）。
 const GUI_RUNTIME_DIR: &str = "/run/chefer-gui";
 /// 等 compositor socket 出現的上限。llvmpipe 首次啟動慢，放寬一點。
@@ -82,11 +98,13 @@ pub fn maybe_start(bundle_dir: &Path, manifest: &Manifest) -> Result<Option<GuiS
         );
     }
 
-    eprintln!("[guest-agent] gui: mounting the GUI overlay (cage/Xwayland/Mesa squashfs) …");
+    note("mounting the GUI overlay (cage/Xwayland/Mesa squashfs) …");
     mount_overlay(&overlay).context("failed to mount the GUI overlay")?;
 
+    note("starting udev + seatd");
     let udevd = start_udev();
     let seatd = start_seatd();
+    note("starting cage");
     let cage = start_cage().context("failed to start the in-VM compositor (cage)")?;
     let mut session = GuiSession {
         cage,
@@ -115,7 +133,7 @@ pub fn maybe_start(bundle_dir: &Path, manifest: &Manifest) -> Result<Option<GuiS
             "[guest-agent] gui: Xwayland socket not present; X11-only apps will not find a DISPLAY (Wayland apps are unaffected)"
         );
     }
-    eprintln!("[guest-agent] gui: compositor ready (WAYLAND_DISPLAY=wayland-0)");
+    note("compositor ready (WAYLAND_DISPLAY=wayland-0)");
     // compositor 就緒後起剪貼簿同步（env 已設好，wl-clipboard 可接 cage）。無 cmdline
     // token（host 未啟用剪貼簿）或 wl-clipboard 缺失時回 None，不致命。
     session.clipboard = crate::clipboard::maybe_start();
@@ -328,9 +346,16 @@ fn start_cage() -> Result<Child> {
         .env("XDG_RUNTIME_DIR", GUI_RUNTIME_DIR)
         .env("WLR_RENDERER", "pixman") // VM 無 GPU：強制軟算繪，避免 GLES 探測失敗
         .env("LIBSEAT_BACKEND", "seatd") // Alpine libseat 無 builtin backend → 走 seatd
+        // 實機根因（WHP GUI 約 1/3 間歇失敗）：virtio-input 節點（/dev/input/event*）由 udev
+        // 非同步建立，cage 若早於 udev 啟動，wlroots 的 libinput backend 見「no input devices」
+        // 直接 abort → cage 秒退。wlroots 的錯誤訊息本身建議設此旗標容忍 0 輸入裝置啟動
+        //（裝置隨後由 udev 熱插拔補上），消除此競態。
+        .env("WLR_LIBINPUT_NO_DEVICES", "1")
         .stdin(Stdio::null())
-        // cage/wlroots 的啟動失敗原因（缺 DRM、keymap…）只會出現在 stderr——
-        // 沿用 guest-agent stderr（VM console/診斷通道），別吞掉。
+        // cage/wlroots 的啟動失敗原因（缺 DRM、keymap、seatd…）只會出現在 stderr——**捕獲**
+        // 起來，cage 若啟動失敗（wait_for_socket 偵測）就轉發到 /dev/kmsg（WHP console 可見；
+        // 否則在 `quiet` 下這段錯誤完全看不到，見 note()）。
+        .stderr(Stdio::piped())
         .spawn()?;
     Ok(child)
 }
@@ -343,11 +368,29 @@ fn wait_for_socket(sock: &Path, session: &mut GuiSession) -> Result<()> {
             return Ok(());
         }
         if let Some(status) = session.cage.try_wait()? {
+            // cage 啟動失敗——把它捕獲的 stderr 轉到 kmsg（WHP console 可見），這正是
+            // 「Found 0 GPUs」/ seatd / keymap 之類真正原因的所在，否則在 quiet 下看不到。
+            let mut cage_err = String::new();
+            if let Some(mut err) = session.cage.stderr.take() {
+                use std::io::Read as _;
+                let _ = err.read_to_string(&mut cage_err);
+            }
+            let cage_err = cage_err.trim();
+            if !cage_err.is_empty() {
+                for line in cage_err.lines() {
+                    note(&format!("cage: {line}"));
+                }
+            }
             bail!(
-                "the in-VM compositor (cage) exited during startup ({status}); \
-                 GUI cannot be shown. Check the guest log for wlroots errors \
-                 (missing /dev/dri usually means the appliance kernel lacks virtio-gpu, \
-                 or the VM host did not attach a virtio-gpu device)."
+                "the in-VM compositor (cage) exited during startup ({status}); GUI cannot be shown. \
+                 cage stderr: {}. \
+                 (missing /dev/dri usually means the appliance kernel lacks virtio-gpu, or the VM \
+                 host did not attach a virtio-gpu device.)",
+                if cage_err.is_empty() {
+                    "(none captured)"
+                } else {
+                    cage_err
+                }
             );
         }
         if start.elapsed() > SOCKET_WAIT {
