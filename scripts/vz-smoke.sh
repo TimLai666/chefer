@@ -55,14 +55,32 @@ helper="$work/chefer-vz-helper-$arch"
 note "2/5 編譯 chefer-cli + chefer-runtime（release）"
 cargo build --release -p chefer-cli -p chefer-runtime --manifest-path "$root/Cargo.toml"
 
+# guest-agent 走 bundle 內嵌，且 GUI 修復（WLR_LIBINPUT_NO_DEVICES 等）在 guest-agent 裡——
+# **從原始碼建當前 main 的 guest-agent**（cross，如 release.yml），別用可能過舊的 kit binary。
+# 沒有 cross（需 Docker）時退回 kit 的 guest-agent，並大聲警告可能缺當前修復。
+musl_target="${arch}-unknown-linux-musl"
+fresh_agent=""
+if command -v cross >/dev/null 2>&1; then
+  note "2b/5 cross build guest-agent（$musl_target，含當前 GUI 修復）"
+  ( cd "$root" && cross build --release --target "$musl_target" -p guest-agent )
+  fresh_agent="$root/target/$musl_target/release/guest-agent"
+else
+  echo "vz-smoke: warning: 找不到 cross（cargo install cross，需 Docker）——改用 kit 的 guest-agent-$arch，" >&2
+  echo "  它可能早於當前 main 的 GUI 修復（如 WLR_LIBINPUT_NO_DEVICES boot-race fix）。要驗證當前碼請裝 cross。" >&2
+fi
+
 note "3/5 組 smoke kit（runtime + helper + appliance$([[ $gui == 1 ]] && echo ' + gui overlay')）"
 smoke_kit="$work/kit"
 mkdir -p "$smoke_kit"
 cp "$root/target/release/chefer-runtime" "$smoke_kit/chefer-runtime-$arch-apple-darwin"
 cp "$helper" "$smoke_kit/chefer-vz-helper-$arch"
 cp "$kit_dir/chefer-vmlinuz-$arch" "$kit_dir/chefer-initramfs-$arch" "$smoke_kit/"
-cp "$kit_dir/guest-agent-$arch" "$smoke_kit/" 2>/dev/null \
-  || die "kit 缺 guest-agent-$arch（vz bundle 內嵌用；release kit 已附）"
+if [[ -n "$fresh_agent" && -f "$fresh_agent" ]]; then
+  cp "$fresh_agent" "$smoke_kit/guest-agent-$arch"
+else
+  cp "$kit_dir/guest-agent-$arch" "$smoke_kit/" 2>/dev/null \
+    || die "kit 缺 guest-agent-$arch（vz bundle 內嵌用；release kit 已附），且無 cross 可自建"
+fi
 [[ $gui == 1 ]] && cp "$kit_dir/chefer-gui-overlay-$arch.sqfs" "$smoke_kit/"
 [[ -f "$kit_dir/pasta-$arch" ]] && cp "$kit_dir/pasta-$arch" "$smoke_kit/" || true
 
