@@ -20,7 +20,7 @@ tempfile = "3.27.0"
 [target."cfg(windows)".dependencies]
 # 剪貼簿圖片：CF_DIB ↔ PNG 轉換（純 Rust，無 C 依賴，符合單檔精神）。與現代（PNG 格式）
 # 及傳統（CF_DIB：小畫家/剪取工具/PowerShell）Windows app 互通。
-png = "0.17"
+png = "0.18"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_LibraryLoader",
