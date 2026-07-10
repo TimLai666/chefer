@@ -142,10 +142,13 @@ fn encode_png(width: u32, height: u32, rgba: &[u8]) -> Option<Vec<u8>> {
 /// 解 PNG → (width, height, RGBA8 top-down)。展開調色盤/低位深、16-bit 降 8-bit，
 /// 各色型正規化成 RGBA。
 fn decode_png(png_bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
-    let mut dec = png::Decoder::new(png_bytes);
+    // png 0.18 起 Decoder 要求 Read + Seek（支援 APNG/streaming）；&[u8] 只有 Read，
+    // 以 Cursor 補上 Seek。
+    let mut dec = png::Decoder::new(std::io::Cursor::new(png_bytes));
     dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = dec.read_info().ok()?;
-    let mut buf = vec![0u8; reader.output_buffer_size()];
+    // png 0.18：output_buffer_size 回 Option（尺寸溢位時 None）。
+    let mut buf = vec![0u8; reader.output_buffer_size()?];
     let info = reader.next_frame(&mut buf).ok()?;
     let data = &buf[..info.buffer_size()];
     let w = info.width;
