@@ -8,12 +8,18 @@
 use std::ffi::c_void;
 use std::io::{BufRead, BufReader};
 use std::mem::size_of;
+use std::os::windows::io::AsRawHandle;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use chefer_bundle::PortProto;
 
-use windows_sys::Win32::Foundation::FreeLibrary;
+use windows_sys::Win32::Foundation::{CloseHandle, FreeLibrary, HANDLE};
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject,
+};
 use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExA,
 };
@@ -116,6 +122,7 @@ impl ExecBackend for WhpBackend {
 
         let mut child = Command::new(&invocation.helper)
             .args(invocation.args())
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .with_context(|| {
@@ -124,6 +131,28 @@ impl ExecBackend for WhpBackend {
                     invocation.helper.display()
                 )
             })?;
+
+        // 防孤兒（DESIGN §6 whp「Helper 生命週期」）：runtime 的 Ctrl+C 處理仰賴 helper
+        // 同 console 收到同一個 console 事件，但對 runtime 單殺（taskkill /PID，非 console
+        // Ctrl+C）時 helper 收不到任何訊號，micro-VM 會殘留。雙保險：
+        // ① Job Object（KILL_ON_JOB_CLOSE）：job handle 故意洩漏、隨本行程存亡——runtime
+        //    無論怎麼死（taskkill /F、當機、正常結束）OS 都會關閉 handle → job 關閉 →
+        //    helper 連同 VM 被系統終結。spawn 與掛入之間的微小空窗與掛入失敗由 ② 後援。
+        if let Err(e) = assign_to_kill_on_close_job(&child) {
+            eprintln!(
+                "[chefer] warning: failed to put the WHP helper in a kill-on-close job: {e}; \
+                 relying on the helper's stdin-EOF self-termination"
+            );
+        }
+
+        // ② stdin liveness（與 vz 同契約）：helper 讀到 stdin EOF 即自我了結。寫端由本
+        //    行程握住不寫——WHP 的 guest console 無輸入路徑（serial 僅 TX），無 vz 的
+        //    terminal stdin 泵送需求——mem::forget 讓 fd 隨行程存亡。
+        let helper_stdin = child
+            .stdin
+            .take()
+            .expect("child stdin was requested as piped");
+        std::mem::forget(helper_stdin);
 
         let stdout = child
             .stdout
@@ -151,6 +180,39 @@ impl ExecBackend for WhpBackend {
             );
         }
         Ok(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper 防孤兒（Job Object）
+// ---------------------------------------------------------------------------
+
+/// 把 child 掛進 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Job Object，回傳 job handle
+///（防孤兒 ①，DESIGN §6 whp「Helper 生命週期」）。呼叫端**故意洩漏** handle（不
+/// CloseHandle）——handle 隨本行程存亡，行程死亡（任何方式）時 OS 關閉它 → job 關閉
+/// → child 連同其中的 micro-VM 被系統終結。Windows 8+ 支援巢狀 job：本行程已在別的
+/// job（如 CI runner）也掛得進去。
+fn assign_to_kill_on_close_job(child: &std::process::Child) -> std::io::Result<HANDLE> {
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let configured = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&raw const info).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) != 0
+            && AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE) != 0;
+        if !configured {
+            let err = std::io::Error::last_os_error();
+            CloseHandle(job);
+            return Err(err);
+        }
+        Ok(job)
     }
 }
 
@@ -362,5 +424,47 @@ mod tests {
         let reason = availability_reason_for(WhpHostCapability::HypervisorPresent, Some(&status));
 
         assert!(reason.contains("missing agents/chefer-whp-helper-x86_64.exe"));
+    }
+
+    /// 鎖住防孤兒 ① 的核心語意（DESIGN §6 whp「Helper 生命週期」）：關掉唯一的
+    /// job handle → job 內的行程被系統終結（KILL_ON_JOB_CLOSE）。真 WHP VM 情境
+    ///（runtime 被 taskkill）只能實機驗證；此測試以長命 dummy child 在 CI 的
+    /// Windows runner 上鎖住機制本身。
+    #[test]
+    fn kill_on_close_job_terminates_child_when_handle_closes() {
+        use std::time::Duration;
+
+        // 長命 child（約 60 秒自我了結——測試失敗時不殘留）。
+        let mut child = Command::new("ping")
+            .args(["-n", "60", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn the dummy child (ping)");
+
+        let job = assign_to_kill_on_close_job(&child).expect("failed to create/assign the job");
+        assert!(
+            child.try_wait().expect("try_wait failed").is_none(),
+            "the child died right after being assigned to the job"
+        );
+
+        // 關掉唯一的 handle：模擬 runtime 行程死亡時 OS 的行為。
+        unsafe { CloseHandle(job) };
+
+        let mut exited = false;
+        for _ in 0..100 {
+            if child.try_wait().expect("try_wait failed").is_some() {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if !exited {
+            let _ = child.kill();
+        }
+        assert!(
+            exited,
+            "the child survived closing the job handle; KILL_ON_JOB_CLOSE did not take effect"
+        );
     }
 }

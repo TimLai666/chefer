@@ -163,6 +163,17 @@ pub fn parse_guest_ip(console: &str) -> Option<Ipv4Addr> {
     })
 }
 
+/// manifest 是否需要把 runtime 自己的 stdin 泵給 helper（helper 的 stdin = guest console
+/// hvc0 輸入 + liveness 通道，見 vz.rs）。只有 terminal/both 服務存在時才泵——
+/// 其他 app 不該讀使用者的終端 stdin（會把輸入吞進 guest console）；此時 runtime
+/// 只握住 helper stdin 寫端不寫，供 helper 以 EOF 偵測 runtime 行程死亡。
+pub fn needs_console_stdin_pump(manifest: &chefer_bundle::Manifest) -> bool {
+    manifest
+        .services
+        .iter()
+        .any(|s| s.interface_mode.wants_terminal())
+}
+
 /// 一條 host→guest 埠轉發（VM host 端把 `127.0.0.1:host` relay 到 `<guest_ip>:guest`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PortForward {
@@ -376,6 +387,30 @@ mod tests {
             fwd.iter()
                 .any(|f| f.proto == PortProto::Udp && f.host == 5353 && f.guest == 53)
         );
+    }
+
+    #[test]
+    fn stdin_pump_only_for_terminal_services() {
+        let manifest = |mode: &str| -> chefer_bundle::Manifest {
+            serde_json::from_str(&format!(
+                r#"{{
+                    "format_version": 1,
+                    "app": {{"name": "t", "spec_version": "0.1", "generated_at_utc": ""}},
+                    "services": [
+                        {{"name": "a", "platform": "linux/amd64", "layers": [], "image_config": {{}},
+                         "interface_mode": "{mode}"}},
+                        {{"name": "b", "platform": "linux/amd64", "layers": [], "image_config": {{}}}}
+                    ]
+                }}"#
+            ))
+            .unwrap()
+        };
+        // terminal / both → 需要泵 stdin（terminal 服務 stdin 直通，DESIGN §7 stdio 模型）
+        assert!(needs_console_stdin_pump(&manifest("terminal")));
+        assert!(needs_console_stdin_pump(&manifest("both")));
+        // gui / none → 不讀使用者終端 stdin，只握住寫端當 liveness
+        assert!(!needs_console_stdin_pump(&manifest("gui")));
+        assert!(!needs_console_stdin_pump(&manifest("none")));
     }
 
     #[test]
