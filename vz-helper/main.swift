@@ -540,6 +540,31 @@ if guiMode {
     window.makeKeyAndOrderFront(nil)
     app.activate(ignoringOtherApps: true)
 
+    // 測試鉤子（vz-smoke 自動驗證動態解析度用；僅動態解析度模式有意義）：
+    // CHEFER_VZ_GUI_TEST_RESIZE="<秒>:<W>x<H>" → N 秒後程式化改視窗 content 尺寸。
+    // view 尺寸變更後的下游與使用者拖拉完全相同（automaticallyReconfiguresDisplay →
+    // VZ 對 guest virtio-gpu 重組態 → guest-agent resize watcher 讓 cage re-modeset），
+    // 讓沒有 Accessibility 權限的自動化環境也能驗證整條鏈。W/H 為 point，Retina 下
+    // guest 實際拿到的是像素尺寸（×backingScaleFactor）。
+    if #available(macOS 14.0, *), dynamicResolution,
+        let spec = ProcessInfo.processInfo.environment["CHEFER_VZ_GUI_TEST_RESIZE"]
+    {
+        let parts = spec.split(separator: ":", maxSplits: 1)
+        let dims = parts.count == 2 ? parts[1].lowercased().split(separator: "x") : []
+        if parts.count == 2, let delay = Double(parts[0]),
+            dims.count == 2, let w = Int(dims[0]), let h = Int(dims[1])
+        {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                ewrite("chefer-vz-helper: test resize -> \(w)x\(h)\n")
+                window.setContentSize(NSSize(width: w, height: h))
+            }
+        } else {
+            ewrite(
+                "chefer-vz-helper: ignoring invalid CHEFER_VZ_GUI_TEST_RESIZE '\(spec)' (want <seconds>:<W>x<H>)\n"
+            )
+        }
+    }
+
     // console tee：pipe → stdout 直通 + 掃 CHEFER_GUEST_IP（首見即起剪貼簿同步）。
     var clipboardHost: ClipboardHost? = nil
     let teePipe = consolePipe! // guiMode 下必建

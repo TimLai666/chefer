@@ -26,6 +26,8 @@ pub mod health;
 #[cfg(target_os = "linux")]
 pub mod netns;
 #[cfg(target_os = "linux")]
+pub mod resize;
+#[cfg(target_os = "linux")]
 pub mod subid;
 #[cfg(target_os = "linux")]
 pub mod supervisor;

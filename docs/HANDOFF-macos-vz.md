@@ -1,6 +1,6 @@
 # Handoff：在 Mac 上驗證 macOS vz 後端
 
-> **✅ 狀態：驗證已完成（2026-07-11，Apple Silicon / macOS 26）。** 核心路徑（開機/exit code/TCP+UDP 埠轉發）、bridge 出網（pasta+DNS）、多服務/persist、GUI（顯示、剪貼簿文字雙向+PNG）全數通過；動態解析度實測為**兩段式**：開機時 guest 模式=視窗 Retina 像素尺寸（`CHEFER_VZ_GUI_SIZE` 生效），但拖拉時只縮放不 re-modeset（cage 啟動後不跟模式變更，與 WHP 同一 guest 端限制）。結果已回填 README 與 DESIGN §6。實機揪出並修掉四顆 bug：extract 不還原 exec bit、release 的 aarch64 initramfs 內嵌 x86-64 busybox、runtime 埠代理與 vz relay 搶埠、容器缺 `/etc/resolv.conf`（bridge 出網通但 DNS 全掛）。仍待人工的互動項：實際打字點擊（HID）、拖拉縮放、關窗語意；兩個已知問題（剪貼簿連線偶發靜默 `.waiting`、對 runtime 單發 signal 會殘留 helper）見 DESIGN §6。以下原文保留供重跑參考，**過時處以「實測更正」標註**。
+> **✅ 狀態：驗證已完成（2026-07-11，Apple Silicon / macOS 26）。** 核心路徑（開機/exit code/TCP+UDP 埠轉發）、bridge 出網（pasta+DNS）、多服務/persist、GUI（顯示、剪貼簿文字雙向+PNG）全數通過；動態解析度實測為**兩段式**：開機時 guest 模式=視窗 Retina 像素尺寸（`CHEFER_VZ_GUI_SIZE` 生效），拖拉時 cage 不自行跟模式變更——**後續已由 guest-agent 的 resize watcher 補上 guest 側 re-modeset（`CHEFER_VZ_DYNAMIC_RESOLUTION=1` 下全鏈實測通過，見「發現」第 2 點；預設仍 view 縮放＝HiDPI 取捨）**。結果已回填 README 與 DESIGN §6。實機揪出並修掉四顆 bug：extract 不還原 exec bit、release 的 aarch64 initramfs 內嵌 x86-64 busybox、runtime 埠代理與 vz relay 搶埠、容器缺 `/etc/resolv.conf`（bridge 出網通但 DNS 全掛）。仍待人工的互動項：實際打字點擊（HID）、拖拉縮放、關窗語意；兩個已知問題（剪貼簿連線偶發靜默 `.waiting`、對 runtime 單發 signal 會殘留 helper）見 DESIGN §6。以下原文保留供重跑參考，**過時處以「實測更正」標註**。
 
 這份是給「拿到一台實體 Mac、要把 chefer 的 macOS（Virtualization.framework / vz）路徑收尾」的接手文件。程式碼側都寫完了，剩下的**只差在真 Mac 上跑一次驗證**——GitHub 的 macOS runner 是巢狀虛擬化、開不了 VZ guest，所以 CI 只能編譯+簽章，端到端一定要實機。
 
@@ -45,7 +45,7 @@ roadmap 上其餘純硬體項（與 Mac 無關，不在本 handoff）：AMD/Inte
 腳本只需要 kit 裡這幾個檔（`<arch>` = Apple Silicon 為 `aarch64`、Intel Mac 為 `x86_64`）：
 
 - `chefer-vmlinuz-<arch>`、`chefer-initramfs-<arch>`（appliance）
-- `chefer-gui-overlay-<arch>.sqfs`（僅 `--gui` 需要）
+- `chefer-gui-overlay-<arch>.sqfs`（僅 `--gui` 需要；動態解析度要 **cage ≥0.2.0**＝新版 `build-gui-overlay.sh`（Alpine 3.22）建的）
 - `pasta-<arch>`（選用；`--gui` 的 bridge 出網要它，缺了會降級成 internal）
 
 ~~**這幾個本輪都沒改**，所以最快是抓 [latest release](https://github.com/TimLai666/chefer/releases/latest) 的 **apple-darwin kit**~~ **實測更正（2026-07）**：≤ v0.4.0 的 release kit **不能**直接用——(a) `chefer-initramfs-aarch64` 內嵌 x86-64 busybox（交叉建置 bug，guest 直接 ENOEXEC panic；已修 `scripts/appliance/build-inside-container.sh`）；(b) kernel 缺 `SQUASHFS`/`BLK_DEV_LOOP`（GUI overlay 掛不起來）；(c) overlay 是舊 `.tar.zst` 格式（現行 `.sqfs`）。請用 Docker（OrbStack 亦可）從當前原始碼重建 appliance + overlay（指令見下）；`pasta-<arch>` 可沿用 release kit。
@@ -91,7 +91,7 @@ bash scripts/vz-smoke.sh --kit-dir kit --gui
 
 1. **boot-race 已修，vz 應同樣受惠**：WHP 實機發現 GUI 約 1/3 間歇開機失敗，根因是 **cage/wlroots 的 libinput backend 在「還沒有輸入裝置」時 abort**（virtio-input 節點由 udev 非同步建立、cage 贏競態就見 0 裝置）。修法 `WLR_LIBINPUT_NO_DEVICES=1` 在 `guest-agent/src/gui.rs`，**vz GUI 走同一條 gui.rs**，所以理論上一起修好了——但**這點值得在 Mac 上確認**（vz 的輸入裝置由 VZ 提供，時序可能不同）。
 
-2. **動態解析度——vz 可能比 WHP 更好，值得實測**：WHP 實測發現 **cage 不會因線上模式變更 re-modeset**，所以 WHP 是「視窗縮放、guest 維持原生解析度」。但 **vz 走的是 `VZVirtualMachineView.automaticallyReconfiguresDisplay`（macOS 14+）**，由 VZ 直接對 guest 的 virtio-gpu 重設組態——這條路**可能真的會 re-modeset**（不像 WHP 只能縮放）。**請在 Mac 上拖拉視窗、看 guest 畫面是「換解析度」還是「拉伸」**，結論回填 DESIGN/README。
+2. **動態解析度——guest 側 re-modeset 已補上（實機 e2e 通過）**：實測證實 cage 不會自行跟隨線上模式變更（vz 的 `automaticallyReconfiguresDisplay` 只解決 host→guest 這半段）。現由 guest-agent 的 **resize watcher（`resize.rs`）**補上：drm uevent → `GETCONNECTOR` re-probe → `wlr-randr --custom-mode`（wlr-output-management）要 cage 換模式，vz 與 WHP 共用。**前提：GUI overlay 需建自新版 `build-gui-overlay.sh`（Alpine 3.22：cage 0.2.0 + wlr-randr）**，vz-smoke 有 Docker 會自動現建。**vz 預設仍是 view 等比縮放**（HiDPI 取捨，見 DESIGN §6 ④）；`CHEFER_VZ_DYNAMIC_RESOLUTION=1` 切真動態解析度，配 `CHEFER_VZ_GUI_TEST_RESIZE=20:1100x700` 可免拖拉自動驗證（console 應出現 `gui: resize: Virtual-1 -> 2200x1400`，guest 內 `xdpyinfo` dimensions 跟著變——已在 Apple Silicon 實測通過）。**WHP 實機回歸待跑**（WHP 無 opt-in 閘，拖拉即觸發）。
 
 3. **guest-agent 在 VM 內的 stderr 預設看不到**（console 在 `quiet` 下只顯示高優先序 kmsg）。要在 guest 內除錯：寫 `/dev/kmsg`、優先序 `< 4`、且**整行一次 `write_all`**（每個 write() 是一筆 kmsg 記錄，`writeln!` 會拆開、訊息本體那筆沒前綴會被 `quiet` 擋掉）。gui.rs 的 `note()` 已用這招，且會把 cage 啟動失敗的 stderr 轉到 kmsg——**若 GUI 開不起來，先看 console 的 `[guest-agent] gui: cage: ...` 行**，那就是 wlroots 的真正錯誤。
 
