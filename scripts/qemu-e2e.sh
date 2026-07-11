@@ -75,6 +75,7 @@ DOCKER
   cat >"$dir/server.py" <<'PY'
 import json
 import os
+import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -125,6 +126,22 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_text(200, persist_file.read_text(encoding="utf-8"))
             else:
                 self.send_text(404, "missing\n")
+            return
+        if parsed.path == "/dns":
+            # 容器內 DNS 鏈驗證（DESIGN「容器內 DNS」）：/etc/resolv.conf 應為 guest-agent
+            # 注入的內容——QEMU slirp 下 nameserver 必為 10.0.2.3（pnp→init symlink→注入；
+            # image 殘留不會是這個值）——且外部 hostname 真的解析得動（slirp DNS proxy）。
+            try:
+                rc = Path("/etc/resolv.conf").read_text(encoding="utf-8")
+                ns = next(
+                    line.split()[1]
+                    for line in rc.splitlines()
+                    if line.startswith("nameserver")
+                )
+                addr = socket.getaddrinfo("example.com", 80)[0][4][0]
+                self.send_text(200, f"{ns}|{addr}\n")
+            except Exception as exc:  # 失敗細節回給 host 端斷言訊息
+                self.send_text(500, f"dns check failed: {exc!r}\n")
             return
         if parsed.path == "/mount":
             # 讀回多個 bind mount 的內容，驗證 overlay rootfs 之上的 bind 確實生效。
@@ -578,6 +595,18 @@ main() {
   [[ "$mounts_out" == "bind-one|bind-two" ]] \
     || die "multi bind-mount atop the overlay rootfs failed: expected 'bind-one|bind-two', got '${mounts_out}'"
   note "multi bind-mount atop overlay verified: ${mounts_out}"
+  # 容器內 DNS（resolv.conf 注入鏈，DESIGN「容器內 DNS」）：nameserver 應為 slirp 的
+  # 10.0.2.3（證明內容來自 pnp→init symlink→guest-agent 注入，而非 image 殘留），且
+  # example.com 真的解析得出。外部 DNS 在 CI 偶有抖動，重試幾次再判死。
+  local dns_out=""
+  for _ in 1 2 3; do
+    dns_out="$(curl -fsS "http://127.0.0.1:${host_port}/dns" || true)"
+    [[ "$dns_out" == "10.0.2.3|"* ]] && break
+    sleep 2
+  done
+  [[ "$dns_out" == "10.0.2.3|"* ]] \
+    || die "container DNS chain failed: expected 'nameserver 10.0.2.3' + working resolution, got '${dns_out}'"
+  note "container DNS (resolv.conf injection) verified: ${dns_out}"
   curl -fsS "http://127.0.0.1:${host_port}/write?value=qemu-first-run" >/dev/null
   curl -fsS "http://127.0.0.1:${host_port}/shutdown" >/dev/null || true
   wait_qemu_exit_code 0 "$first_log" "first run"

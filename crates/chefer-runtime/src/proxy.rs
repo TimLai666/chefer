@@ -29,6 +29,14 @@ use chefer_bundle::{Manifest, PortProto};
 /// 任一 host 埠 bind 失敗（通常是埠已被占用）→ 啟動前整體報錯並列出埠號，
 /// 不會啟動任何服務。
 pub fn start_port_proxies(manifest: &Manifest) -> Result<()> {
+    // macOS（vz）：guest 埠不在 host localhost 上（VZ NAT 無 wslrelay 式自動轉送），
+    // host→guest 一律由 vz 後端取得 guest IP 後 relay `127.0.0.1:host → <vm_ip>:guest`
+    // （TCP+UDP、含 host==guest）。在此綁 127.0.0.1:host 只會與後端的 relay 搶同一顆埠
+    // （同 Windows UDP 的先例），故整個略過。見 DESIGN「埠代理」。
+    if cfg!(target_os = "macos") {
+        tracing::debug!("port proxies are handled by the vz backend on macOS; skipping");
+        return Ok(());
+    }
     let mut failures: Vec<String> = Vec::new();
     for svc in &manifest.services {
         for spec in &svc.ports {

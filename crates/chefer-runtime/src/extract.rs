@@ -281,6 +281,18 @@ fn unpack_tar<R: Read>(reader: R, dest: &Path) -> Result<()> {
                     .with_context(|| format!("failed to create file: {}", out.display()))?;
                 io::copy(&mut entry, &mut file)
                     .with_context(|| format!("failed to write file: {}", out.display()))?;
+                // 還原 tar header 的 mode：bundle/agents/ 下的 helper/guest-agent/pasta
+                // 是 0o755，macOS host 要直接 spawn（vz-helper）、guest 也經 virtiofs 執行，
+                // 不還原就 EACCES。Windows 無 POSIX mode，略過。
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode = entry.header().mode().unwrap_or(0o644) & 0o777;
+                    file.set_permissions(std::fs::Permissions::from_mode(mode))
+                        .with_context(|| {
+                            format!("failed to set permissions on: {}", out.display())
+                        })?;
+                }
             }
             other => {
                 bail!(
@@ -419,6 +431,64 @@ mod tests {
         let bundle_dir = extracted.bundle_dir.clone();
         drop(extracted);
         assert!(!bundle_dir.exists(), "未指定 --keep-tmp 時應自動刪除暫存");
+    }
+
+    /// Unix：解壓須還原 tar header 的 mode——bundle/agents/ 的 0o755 掉了會讓
+    /// macOS host spawn vz-helper／guest 執行 guest-agent 直接 EACCES。
+    #[cfg(unix)]
+    #[test]
+    fn extract_restores_exec_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut tar_buf = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_buf);
+            for dir in ["bundle/", "bundle/agents/"] {
+                let mut h = tar::Header::new_gnu();
+                h.set_entry_type(tar::EntryType::Directory);
+                h.set_mode(0o755);
+                h.set_size(0);
+                h.set_mtime(0);
+                b.append_data(&mut h, dir, io::empty()).unwrap();
+            }
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_mode(0o644);
+            h.set_size(2);
+            h.set_mtime(0);
+            b.append_data(&mut h, "bundle/manifest.json", &b"{}"[..])
+                .unwrap();
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(tar::EntryType::Regular);
+            h.set_mode(0o755);
+            h.set_size(5);
+            h.set_mtime(0);
+            b.append_data(&mut h, "bundle/agents/fake-agent", &b"#!bin"[..])
+                .unwrap();
+            b.finish().unwrap();
+        }
+        let payload = zstd::stream::encode_all(&tar_buf[..], 3).unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let exe = tmp.path().join("fake-app.exe");
+        let ft = write_fake_single(&exe, 16, &payload);
+        let parent = tmp.path().join("work");
+        let opts = ExtractOptions {
+            extract_parent: Some(&parent),
+            keep_tmp: false,
+        };
+        let extracted = extract_bundle(&exe, &ft, &opts).unwrap();
+
+        let agent_mode = fs::metadata(extracted.bundle_dir.join("agents/fake-agent"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(agent_mode & 0o777, 0o755, "agents/ 執行檔應還原 0o755");
+        let manifest_mode = fs::metadata(extracted.bundle_dir.join("manifest.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(manifest_mode & 0o777, 0o644, "資料檔應為 0o644");
     }
 
     #[test]

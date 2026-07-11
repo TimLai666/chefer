@@ -67,6 +67,43 @@
 4. **在沒有 WSL 或設 `CHEFER_BACKEND=whp` 的 Windows** 跑單檔，驗 redis + app 起來、埠可連、
    `CHEFER_GUEST_EXIT` 正確回傳、data 持久化。
 
+### M7-d — 容器內 DNS（10.0.2.3 pivot）✅ 實機驗證通過（2026-07-11）
+
+背景：M7-b/c 記錄的 `wget http://example.com` 成功**不代表**裸 image 開箱可解析——當時
+容器內沒有任何 resolv.conf 來源（裸 alpine 不自帶；musl 缺檔 fallback `127.0.0.1:53`，
+到不了 NAT），解析必是測試時另行給了 nameserver。正式來源已補（設計見 DESIGN
+§「容器內 DNS」）：
+
+- guest 側：kernel cmdline `ip=` 尾追 dns0=`10.0.2.3`（`whp_util::kernel_command_line`）→
+  `/proc/net/pnp` 出現 `nameserver 10.0.2.3` → appliance init symlink `/etc/resolv.conf` →
+  guest-agent `exec.rs` 注入每個容器（vz/QEMU 同一條既有鏈）。
+- host 側：helper `net_backend` 的 DNS pivot——iface 掛 `10.0.2.3/32` 應答 ARP，
+  `10.0.2.3:53` 的 UDP fanout 到 host 設定的 DNS（`GetNetworkParams`、60s 快取、
+  `CHEFER_WHP_DNS` 覆寫、無上游才 fallback 公共 DNS），回程 masquerade 回
+  `10.0.2.3:53`；TCP:53 SYN 走 TCP NAT 但改連第一個上游。
+  host 端邏輯已有跨平台單元測試（`net_backend::tests::dns_*`），Windows 專屬的
+  `GetNetworkParams` 僅過 cross-compile check。
+
+**實機驗證記錄（2026-07-11，Windows 11 Pro 26200 + WHP，host DNS = Wi-Fi `192.168.1.1`）**：
+
+- kit：本分支重建 `chefer-runtime`／`chefer-whp-helper`／musl `guest-agent`／appliance
+  initramfs（init 含 resolv.conf symlink 區塊；kernel 沿用 v6.6.32 既有 vmlinuz——config
+  未變不必重編）＋ `scripts/build-pasta.sh` 產靜態 pasta（passt tag 2026_06_11.a9c61ff）。
+- 測試 app：裸 `alpine:3.20`、**不含任何 resolv.conf 手段**、`interface_mode: none`，
+  `cmd: sh -c "nslookup example.com | grep -F 10.0.2.3 && wget -O- http://example.com >/dev/null"`
+  ——WHP console 看不到服務 stdout，故「nslookup Server = 10.0.2.3」以容器內 grep 斷言
+  進 exit code。
+- 結果（`CHEFER_BACKEND=whp CHEFER_WHP_NET_TRACE=1` 跑單檔）：
+  1. 預設 `bridge`：exit 0（`CHEFER_GUEST_EXIT=0`）；trace 見
+     `dns: upstreams = [192.168.1.1:53]`（與 host `ipconfig` 一致，GetNetworkParams 探測
+     正確）、`nat: new dns pivot flow 10.0.2.15:*` 兩條、`nat-tcp: new flow … :80`。
+  2. `network: shared`：exit 0，同樣 pivot flow（不經 pasta 的路徑）。
+  3. `CHEFER_WHP_DNS=1.1.1.1`：exit 0，trace upstreams 變 `[1.1.1.1:53]`（覆寫生效）。
+- **未涵蓋**：(c) VPN/公司內網 hostname 解析（驗證機當時無 VPN）——pivot 對內網 DNS 的
+  價值路徑（上游=VPN DNS）尚待有 VPN 環境時順手補驗。
+- 陷阱重演提醒：initramfs 重建時 init 必須去 CRLF（`build-inside-container.sh` 已處理；
+  自組重建管線漏掉會 PID 1 exit 127 kernel panic，本次實測踩過一次）。
+
 ### M8 — GUI（virtio-gpu + cage overlay；契約見 DESIGN §6「WHP GUI」與「GUI overlay 打包契約」）
 
 M1-M7（blk/persist/net/NAT 含預設 bridge）皆已實機完成後，WHP 僅剩這條大線。

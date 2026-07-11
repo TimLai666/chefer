@@ -1,18 +1,20 @@
 # Handoff：在 Mac 上驗證 macOS vz 後端
 
+> **✅ 狀態：驗證已完成（2026-07-11，Apple Silicon / macOS 26）。** 核心路徑（開機/exit code/TCP+UDP 埠轉發）、bridge 出網（pasta+DNS）、多服務/persist、GUI（顯示、剪貼簿文字雙向+PNG）全數通過；動態解析度實測為**兩段式**：開機時 guest 模式=視窗 Retina 像素尺寸（`CHEFER_VZ_GUI_SIZE` 生效），但拖拉時只縮放不 re-modeset（cage 啟動後不跟模式變更，與 WHP 同一 guest 端限制）。結果已回填 README 與 DESIGN §6。實機揪出並修掉四顆 bug：extract 不還原 exec bit、release 的 aarch64 initramfs 內嵌 x86-64 busybox、runtime 埠代理與 vz relay 搶埠、容器缺 `/etc/resolv.conf`（bridge 出網通但 DNS 全掛）。仍待人工的互動項：實際打字點擊（HID）、拖拉縮放、關窗語意；兩個已知問題（剪貼簿連線偶發靜默 `.waiting`、對 runtime 單發 signal 會殘留 helper）見 DESIGN §6。以下原文保留供重跑參考，**過時處以「實測更正」標註**。
+
 這份是給「拿到一台實體 Mac、要把 chefer 的 macOS（Virtualization.framework / vz）路徑收尾」的接手文件。程式碼側都寫完了，剩下的**只差在真 Mac 上跑一次驗證**——GitHub 的 macOS runner 是巢狀虛擬化、開不了 VZ guest，所以 CI 只能編譯+簽章，端到端一定要實機。
 
 ## TL;DR
 
 ```bash
-# 1. 前置：Xcode CLT、Rust、（建 guest-agent 用）cross + Docker；備一份含 appliance/overlay 的 kit
+# 1. 前置：Xcode CLT、Rust（含 <arch>-unknown-linux-musl target；免 cross/Docker）；備一份含 appliance/overlay 的 kit
 # 2. 一鍵驗證（非 GUI 的核心路徑：開機 / exit code 傳播 / 埠轉發）
 bash scripts/vz-smoke.sh --kit-dir <放 appliance 的資料夾>
 # 3. 加 --gui 再驗顯示 / HID / 剪貼簿 / 動態解析度 / 關窗語意（會列手動檢核清單）
 bash scripts/vz-smoke.sh --kit-dir <...> --gui
 ```
 
-腳本自己會**從當前原始碼**建 `chefer-vz-helper`（swiftc + virtualization entitlement 簽章）、`chefer-cli`、`chefer-runtime`、以及 `guest-agent`（cross，含本輪的 GUI 修復），只從 `--kit-dir` 拿兩個「需要 Docker 才建得出、且本輪沒改」的 Linux 產物：**appliance kernel/initramfs** 與 **GUI overlay squashfs**。
+腳本自己會**從當前原始碼**建 `chefer-vz-helper`（swiftc + virtualization entitlement 簽章）、`chefer-cli`、`chefer-runtime`、以及 `guest-agent`（原生 cargo musl build，有 cross 則優先 cross），只從 `--kit-dir` 拿兩個「需要 Docker 才建得出」的 Linux 產物：**appliance kernel/initramfs** 與 **GUI overlay squashfs**（注意：≤ v0.4.0 release kit 的這兩樣不可用，見下方「實測更正」）。
 
 ---
 
@@ -35,7 +37,7 @@ roadmap 上其餘純硬體項（與 Mac 無關，不在本 handoff）：AMD/Inte
 | macOS **13+**（GUI 動態解析度需 **14+**） | Virtualization.framework / virtiofs | Apple Silicon 或 Intel 皆可 |
 | Xcode Command Line Tools | `swiftc` + `codesign`（建/簽 vz-helper） | `xcode-select --install` |
 | Rust toolchain | 建 cli/runtime | https://rustup.rs |
-| **cross + Docker** | 從原始碼建 `guest-agent`（含 GUI 修復） | `cargo install cross`；沒有的話腳本退回 kit 的 guest-agent 並警告 |
+| musl target（`rustup target add <arch>-unknown-linux-musl`） | 從原始碼建 `guest-agent`（純 Rust + rust-lld，**免 cross/Docker**） | 腳本會自動 `rustup target add`；有 cross 則優先用 cross |
 | 一份 **kit**（appliance + overlay） | vz-smoke 從這裡拿 vmlinuz/initramfs/overlay | 見下節 |
 
 ### 取得 kit（appliance + gui-overlay）
@@ -46,9 +48,9 @@ roadmap 上其餘純硬體項（與 Mac 無關，不在本 handoff）：AMD/Inte
 - `chefer-gui-overlay-<arch>.sqfs`（僅 `--gui` 需要）
 - `pasta-<arch>`（選用；`--gui` 的 bridge 出網要它，缺了會降級成 internal）
 
-**這幾個本輪都沒改**，所以最快是抓 [latest release](https://github.com/TimLai666/chefer/releases/latest) 的 **apple-darwin kit**（`chefer_<ver>_<arch>-apple-darwin.tar.gz`，解開後有 `kit/`），指 `--kit-dir` 到那個 `kit/` 即可。
+~~**這幾個本輪都沒改**，所以最快是抓 [latest release](https://github.com/TimLai666/chefer/releases/latest) 的 **apple-darwin kit**~~ **實測更正（2026-07）**：≤ v0.4.0 的 release kit **不能**直接用——(a) `chefer-initramfs-aarch64` 內嵌 x86-64 busybox（交叉建置 bug，guest 直接 ENOEXEC panic；已修 `scripts/appliance/build-inside-container.sh`）；(b) kernel 缺 `SQUASHFS`/`BLK_DEV_LOOP`（GUI overlay 掛不起來）；(c) overlay 是舊 `.tar.zst` 格式（現行 `.sqfs`）。請用 Docker（OrbStack 亦可）從當前原始碼重建 appliance + overlay（指令見下）；`pasta-<arch>` 可沿用 release kit。
 
-> ⚠️ **重點**：release 的 kit 也含一份 `guest-agent-<arch>`，但那是**舊版、不含本輪的 GUI 修復**（尤其 boot-race 的 `WLR_LIBINPUT_NO_DEVICES=1`）。vz-smoke 已改成**優先用 cross 從當前原始碼自建 guest-agent**、忽略 kit 的舊版。所以請務必裝 `cross`（否則會退回舊 guest-agent，vz GUI 可能踩到已修好的競態）。
+> ⚠️ **重點**：release 的 kit 也含一份 `guest-agent-<arch>`，但那是**舊版、不含本輪的 GUI 修復**（尤其 boot-race 的 `WLR_LIBINPUT_NO_DEVICES=1`）。vz-smoke 會**優先從當前原始碼自建 guest-agent**、忽略 kit 的舊版。**實測更正（2026-07）：不需要 cross/Docker**——guest-agent 是純 Rust + rust-lld（`.cargo/config.toml` 已設 linker），`rustup target add <arch>-unknown-linux-musl` 後用原生 `cargo build --target <arch>-unknown-linux-musl --release -p guest-agent` 即可（vz-smoke 已支援此原生 fallback）。
 
 想完全自建 kit（不抓 release）：
 ```bash

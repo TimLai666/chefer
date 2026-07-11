@@ -52,9 +52,15 @@ pub fn helper_in_bundle(bundle_dir: &Path, host_arch: &str) -> PathBuf {
 /// 網路：用 kernel IP_PNP **靜態**設定 eth0（`10.0.2.15/24`、gateway `10.0.2.2`），
 /// 不走 DHCP——helper 的 smoltcp gateway 不提供 DHCP server。此 IP 與 gateway 必須與
 /// `whp-helper` 的 `NET_GUEST_IP`／`NET_GATEWAY_IP` 一致（host↔guest 網路契約）。
+///
+/// `ip=` 第 8 欄（dns0）帶約定 DNS `10.0.2.3`（slirp 慣例位址；helper 在
+/// `net_backend::NAT_DNS_IP` 提供轉發）：kernel ipconfig 對靜態設定**也會**建
+/// `/proc/net/pnp`（無 dns0 時內容只有 `#MANUAL`、無 nameserver 行），dns0 讓它多出
+/// `nameserver 10.0.2.3` → appliance init 的 resolv.conf symlink + guest-agent 的
+/// 容器注入整條沿用 vz/QEMU 的既有鏈（見 docs/DESIGN.md「容器內 DNS」）。
 pub fn kernel_command_line(keep_rootfs: bool) -> String {
     let mut s = String::from(
-        "console=ttyS0 quiet ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off \
+        "console=ttyS0 quiet ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off:10.0.2.3 \
          panic=-1 nolapic lpj=1000000 notsc clocksource=jiffies",
     );
     s.push_str(&format!(
@@ -237,8 +243,9 @@ mod tests {
         let cmdline = kernel_command_line(true);
 
         assert!(cmdline.contains("console=ttyS0"));
-        // WHP 用 kernel 靜態 IP（無 DHCP server），IP/gw 對齊 helper 的 net 契約。
-        assert!(cmdline.contains("ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off"));
+        // WHP 用 kernel 靜態 IP（無 DHCP server），IP/gw 對齊 helper 的 net 契約；
+        // dns0=10.0.2.3（約定 DNS，helper 的 DNS pivot）讓 /proc/net/pnp 有 nameserver 行。
+        assert!(cmdline.contains("ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off:10.0.2.3"));
         assert!(!cmdline.contains("ip=dhcp"));
         assert!(cmdline.contains("nolapic"));
         assert!(cmdline.contains("lpj=1000000"));
