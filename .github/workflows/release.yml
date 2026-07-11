@@ -173,6 +173,23 @@ jobs:
         shell: bash
         run: bash scripts/build-appliance.sh --arch "${{ matrix.arch }}" --linux-ref "${{ needs.preflight.outputs.linux_ref }}" --out stage
 
+      # 開機 smoke：擋「initramfs 是錯誤架構」這類 boot 級 regression 於 upload 之前
+      # （v0.4.0 的 chefer-initramfs-aarch64 內嵌 x86-64 busybox → guest ENOEXEC panic，
+      # 出貨後才在實體 Mac 上被抓到）。aarch64 在 x86_64 runner 以 TCG 模擬開機即可；
+      # qemu-system-arm 套件提供 qemu-system-aarch64。
+      - name: Install QEMU for boot smoke
+        shell: bash
+        run: |
+          sudo apt-get update
+          case "${{ matrix.arch }}" in
+            x86_64) sudo apt-get install -y qemu-system-x86 ;;
+            aarch64) sudo apt-get install -y qemu-system-arm ;;
+          esac
+
+      - name: Boot smoke (${{ matrix.arch }})
+        shell: bash
+        run: bash scripts/appliance-boot-smoke.sh --arch "${{ matrix.arch }}" --dir stage
+
       - uses: actions/upload-artifact@v7
         with:
           name: appliance-${{ matrix.arch }}

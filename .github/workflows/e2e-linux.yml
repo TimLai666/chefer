@@ -206,3 +206,45 @@ jobs:
       - name: Run QEMU appliance E2E
         shell: bash
         run: bash scripts/qemu-e2e.sh
+
+  # release 的 aarch64 appliance 是在 x86_64 host 上「交叉」建置的（release.yml 的 appliance
+  # job 跑 ubuntu-latest）；上面 qemu-appliance-e2e 的 arm64 job 用 arm64 runner 原生建置，
+  # 蓋不到交叉路徑。v0.4.0 的 chefer-initramfs-aarch64 因此內嵌了 x86-64 busybox
+  # （build-inside-container.sh 抄容器自身 /bin/busybox），guest exec /init 即 ENOEXEC panic，
+  # 一路活到 release 才在實體 Mac 上被抓到。此 job 重現 release 的交叉建置，並以
+  # qemu-system-aarch64（TCG 模擬）裸開機驗證 console 出現 [chefer-init] / CHEFER_GUEST_EXIT
+  # 標記，在 PR 階段就擋住「initramfs 是錯架構」這類 boot 級 regression。
+  cross-appliance-boot-smoke:
+    name: cross-built aarch64 appliance boots (x86_64 host)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      # qemu-system-arm 套件提供 qemu-system-aarch64。
+      - name: Install qemu-system-aarch64
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-arm
+
+      - name: Resolve appliance cache dir
+        shell: bash
+        run: echo "APPLIANCE_DIR=$HOME/.cache/chefer-appliance-cross" >> "$GITHUB_ENV"
+
+      # 與 qemu-appliance-e2e 相同的快取策略：appliance 建置輸入（scripts）或 kernel ref
+      # 一變就重建 —— busybox 之類的 regression 正是在重建時被抓到；沒變則快取命中，
+      # 整個 job 只剩開機 smoke（約 1–2 分鐘）。
+      - name: Cache cross-built appliance (kernel + initramfs)
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/chefer-appliance-cross
+          key: appliance-cross-aarch64-${{ env.CHEFER_LINUX_REF }}-${{ hashFiles('scripts/build-appliance.sh', 'scripts/appliance/**') }}
+
+      - name: Cross-build aarch64 appliance (same path as release)
+        shell: bash
+        run: |
+          if [[ ! -f "$APPLIANCE_DIR/chefer-vmlinuz-aarch64" || ! -f "$APPLIANCE_DIR/chefer-initramfs-aarch64" ]]; then
+            bash scripts/build-appliance.sh --arch aarch64 --linux-ref "$CHEFER_LINUX_REF" --out "$APPLIANCE_DIR"
+          fi
+
+      - name: Boot smoke (qemu-system-aarch64, TCG)
+        shell: bash
+        run: bash scripts/appliance-boot-smoke.sh --arch aarch64 --dir "$APPLIANCE_DIR"
