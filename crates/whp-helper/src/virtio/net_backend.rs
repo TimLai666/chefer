@@ -29,6 +29,17 @@ use smoltcp::wire::{
 /// 出網 host TCP connect 的逾時（背景執行緒，不阻塞 VM run loop）。
 const NAT_TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// 「約定 DNS」位址（slirp 慣例 `10.0.2.3`；QEMU 路徑由 slirp 原生在同位址提供 DNS，
+/// WHP 與之對齊）。guest 的 resolv.conf（kernel cmdline `ip=` 的 dns0 欄，見
+/// `vmm-backend::whp_util::kernel_command_line`）指向這裡；接線層（main.rs drain_tx）把
+/// 送到此位址 UDP/TCP:53 的查詢分流給 [`NetBackend::nat_outbound_dns`] /
+/// [`NetBackend::nat_tcp_dns_syn`] 轉發到 host 設定的 DNS 上游。
+pub const NAT_DNS_IP: [u8; 4] = [10, 0, 2, 3];
+
+/// DNS 上游（host 設定的 DNS server）快取壽命：網路切換（VPN 連上/斷開）會改 host DNS，
+/// 長駐 app 不能只在啟動時探一次；也不宜每個查詢都呼叫 Windows API。
+const DNS_UPSTREAM_TTL: Duration = Duration::from_secs(60);
+
 /// 乙太網 MTU（virtio-net 預設）。
 pub const MTU: usize = 1500;
 
@@ -139,6 +150,9 @@ pub struct NetBackend {
     /// 出網 TCP NAT：per 4-tuple flow（smoltcp socket ↔ host TcpStream）。
     tcp_nat: Vec<TcpNatFlow>,
     next_local_port: u16,
+    /// `10.0.2.3:53` DNS pivot 的上游（host 設定的 DNS server）；lazy 探測 + TTL 快取。
+    dns_upstreams: Vec<SocketAddr>,
+    dns_upstreams_at: Option<std::time::Instant>,
 }
 
 struct Conn {
@@ -155,13 +169,20 @@ struct UdpSession {
     forward_idx: usize,
 }
 
-/// 出網 UDP NAT 的一條 flow：以 guest 的 `(ip, port)` 為鍵，持有一個 host UDP socket
-/// 對外送/收。回程以 socket `recv_from` 得到的外部位址當合成 frame 的 src。
+/// 出網 UDP NAT 的一條 flow：以 guest 的 `(ip, port, dns)` 為鍵，持有一個 host UDP socket
+/// 對外送/收。一般 flow 回程以 socket `recv_from` 得到的外部位址當合成 frame 的 src；
+/// DNS pivot flow（guest → `10.0.2.3:53`）回程只收 `upstreams` 內的來源，且 src 一律
+/// masquerade 成 `NAT_DNS_IP:53`——guest 端 resolver 多用 connected UDP socket，回程
+/// src 不是它查的位址會被 kernel 丟掉。
 struct NatFlow {
     guest_ip: [u8; 4],
     guest_port: u16,
     guest_mac: [u8; 6],
     sock: UdpSocket,
+    /// DNS pivot flow；與一般 flow 分鍵（同一 guest src port 可能同時查外部 DNS 與 10.0.2.3）。
+    dns: bool,
+    /// DNS pivot 的 fanout 上游（一般 flow 為空）。
+    upstreams: Vec<SocketAddr>,
 }
 
 /// 出網 TCP NAT 的 host 端連線狀態。
@@ -195,6 +216,11 @@ impl NetBackend {
         let mut iface = Interface::new(config, phy, Instant::from_millis(0));
         iface.update_ip_addrs(|addrs| {
             let _ = addrs.push(IpCidr::new(gateway_ip.into(), 24));
+            // 約定 DNS 位址（同網段、on-link）：guest／pasta 送查詢前會對它 ARP，而 smoltcp
+            // 只回答自己持有的位址——掛上 /32 讓 ARP 有回應。實際的 :53 流量不進 smoltcp
+            // socket，由接線層 drain_tx 分流到 nat_outbound_dns / nat_tcp_dns_syn。
+            let dns = Ipv4Address::new(NAT_DNS_IP[0], NAT_DNS_IP[1], NAT_DNS_IP[2], NAT_DNS_IP[3]);
+            let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(dns), 32));
         });
         Self {
             iface,
@@ -208,6 +234,8 @@ impl NetBackend {
             nat_flows: Vec::new(),
             tcp_nat: Vec::new(),
             next_local_port: 49152,
+            dns_upstreams: Vec::new(),
+            dns_upstreams_at: None,
         }
     }
 
@@ -261,6 +289,23 @@ impl NetBackend {
     /// 預註冊——dst IP 動態加進 iface、建 smoltcp listen socket(dst,port)、背景 connect host。
     /// 重傳 SYN（同 4-tuple 已有 flow）則略過。
     pub fn nat_tcp_syn(&mut self, t: super::nat::OutboundTcp) {
+        self.nat_tcp_syn_to(t, SocketAddr::from((t.dst_ip, t.dst_port)));
+    }
+
+    /// DNS pivot 的 TCP fallback（guest → `10.0.2.3:53` 的 SYN）：resolver 收到截斷（TC）
+    /// 回應時會改走 TCP:53（glibc/node/go 都會；musl 不會）。guest 側照常對 10.0.2.3:53
+    /// 完成 smoltcp 握手，host 側改連第一個 DNS 上游。
+    pub fn nat_tcp_dns_syn(&mut self, t: super::nat::OutboundTcp) {
+        let Some(up) = self.dns_upstreams().first().copied() else {
+            return;
+        };
+        self.nat_tcp_syn_to(t, up);
+    }
+
+    /// [`Self::nat_tcp_syn`] 的實體：guest 可見的連線對象是 `t.dst`（smoltcp 在該位址
+    /// listen），host 端實際連 `connect_to`（一般出網兩者相同；DNS pivot 時 dst=10.0.2.3
+    /// 而 connect_to=真正的 DNS 上游）。
+    fn nat_tcp_syn_to(&mut self, t: super::nat::OutboundTcp, connect_to: SocketAddr) {
         if self.tcp_nat.iter().any(|f| {
             f.guest_ip == t.src_ip
                 && f.guest_port == t.src_port
@@ -290,9 +335,11 @@ impl NetBackend {
         }
         let handle = self.sockets.add(sock);
         let (tx, rx) = mpsc::channel();
-        let dst = SocketAddr::from((t.dst_ip, t.dst_port));
         std::thread::spawn(move || {
-            let _ = tx.send(TcpStream::connect_timeout(&dst, NAT_TCP_CONNECT_TIMEOUT));
+            let _ = tx.send(TcpStream::connect_timeout(
+                &connect_to,
+                NAT_TCP_CONNECT_TIMEOUT,
+            ));
         });
         if net_trace_enabled() {
             let d = t.dst_ip;
@@ -325,11 +372,14 @@ impl NetBackend {
         if ok {
             return true;
         }
-        // 滿了：找一個目前無 flow 使用的 /32 dst 驅逐。
+        // 滿了：找一個目前無 flow 使用的 /32 dst 驅逐（約定 DNS 位址是常駐的，永不驅逐）。
         let evict = self.iface.ip_addrs().iter().copied().find(|c| {
             c.prefix_len() == 32
                 && match c.address() {
-                    IpAddress::Ipv4(a) => !self.tcp_nat.iter().any(|f| f.dst_ip == a.octets()),
+                    IpAddress::Ipv4(a) => {
+                        a.octets() != NAT_DNS_IP
+                            && !self.tcp_nat.iter().any(|f| f.dst_ip == a.octets())
+                    }
                     #[allow(unreachable_patterns)]
                     _ => false,
                 }
@@ -345,8 +395,9 @@ impl NetBackend {
     }
 
     /// flow 關閉後釋放其 dst IP（若無其他 flow 再用該 dst）。須在 flow 已自 tcp_nat 移除後呼叫。
+    /// 約定 DNS 位址常駐（ARP 應答依賴它），即使是 DNS TCP fallback 的 flow 關閉也不釋放。
     fn release_dst_addr(&mut self, dst_ip: [u8; 4]) {
-        if self.tcp_nat.iter().any(|f| f.dst_ip == dst_ip) {
+        if dst_ip == NAT_DNS_IP || self.tcp_nat.iter().any(|f| f.dst_ip == dst_ip) {
             return;
         }
         let x = Ipv4Address::new(dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]);
@@ -413,52 +464,120 @@ impl NetBackend {
         let idx = match self
             .nat_flows
             .iter()
-            .position(|f| f.guest_ip == udp.src_ip && f.guest_port == udp.src_port)
+            .position(|f| !f.dns && f.guest_ip == udp.src_ip && f.guest_port == udp.src_port)
         {
             Some(i) => i,
             None => {
-                let sock = match UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        if net_trace_enabled() {
-                            eprintln!("[whp-net-trace] nat: host udp bind failed: {e}");
-                        }
-                        return;
-                    }
+                let Some(i) = self.new_nat_flow(&udp, false) else {
+                    return;
                 };
-                let _ = sock.set_nonblocking(true);
-                if net_trace_enabled() {
-                    let s = udp.src_ip;
-                    eprintln!(
-                        "[whp-net-trace] nat: new outbound flow {}.{}.{}.{}:{}",
-                        s[0], s[1], s[2], s[3], udp.src_port
-                    );
-                }
-                self.nat_flows.push(NatFlow {
-                    guest_ip: udp.src_ip,
-                    guest_port: udp.src_port,
-                    guest_mac: udp.src_mac,
-                    sock,
-                });
-                self.nat_flows.len() - 1
+                i
             }
         };
         let dst = SocketAddr::from((udp.dst_ip, udp.dst_port));
         let _ = self.nat_flows[idx].sock.send_to(&udp.payload, dst);
     }
 
+    /// 處理 guest 送往「約定 DNS」`10.0.2.3:53` 的查詢（接線層 drain_tx 分流後呼叫）：
+    /// 把 payload 原樣 fanout 到 host 設定的所有 DNS 上游（首個回應者勝出——resolver 只取
+    /// 第一個答案，多餘回應無害）。回程由 [`Self::nat_poll`] masquerade 成 `10.0.2.3:53`。
+    pub fn nat_outbound_dns(&mut self, udp: super::nat::OutboundUdp) {
+        let upstreams = self.dns_upstreams();
+        let idx = match self
+            .nat_flows
+            .iter()
+            .position(|f| f.dns && f.guest_ip == udp.src_ip && f.guest_port == udp.src_port)
+        {
+            Some(i) => i,
+            None => {
+                let Some(i) = self.new_nat_flow(&udp, true) else {
+                    return;
+                };
+                i
+            }
+        };
+        for up in &upstreams {
+            let _ = self.nat_flows[idx].sock.send_to(&udp.payload, up);
+        }
+        // 上游快取可能已刷新（VPN 切換）；flow 的回程過濾清單跟著更新。
+        self.nat_flows[idx].upstreams = upstreams;
+    }
+
+    /// 建一條出網 UDP NAT flow（bind host socket）；bind 失敗回 None（該封包丟棄）。
+    fn new_nat_flow(&mut self, udp: &super::nat::OutboundUdp, dns: bool) -> Option<usize> {
+        let sock = match UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)) {
+            Ok(s) => s,
+            Err(e) => {
+                if net_trace_enabled() {
+                    eprintln!("[whp-net-trace] nat: host udp bind failed: {e}");
+                }
+                return None;
+            }
+        };
+        let _ = sock.set_nonblocking(true);
+        if net_trace_enabled() {
+            let s = udp.src_ip;
+            let kind = if dns { "dns pivot" } else { "outbound" };
+            eprintln!(
+                "[whp-net-trace] nat: new {kind} flow {}.{}.{}.{}:{}",
+                s[0], s[1], s[2], s[3], udp.src_port
+            );
+        }
+        self.nat_flows.push(NatFlow {
+            guest_ip: udp.src_ip,
+            guest_port: udp.src_port,
+            guest_mac: udp.src_mac,
+            sock,
+            dns,
+            upstreams: Vec::new(),
+        });
+        Some(self.nat_flows.len() - 1)
+    }
+
+    /// DNS 上游（lazy 探測 + TTL 快取；見 [`discover_dns_upstreams`]）。
+    fn dns_upstreams(&mut self) -> Vec<SocketAddr> {
+        let stale = self
+            .dns_upstreams_at
+            .is_none_or(|t| t.elapsed() >= DNS_UPSTREAM_TTL);
+        if stale {
+            self.dns_upstreams = discover_dns_upstreams();
+            self.dns_upstreams_at = Some(std::time::Instant::now());
+            if net_trace_enabled() {
+                eprintln!("[whp-net-trace] dns: upstreams = {:?}", self.dns_upstreams);
+            }
+        }
+        self.dns_upstreams.clone()
+    }
+
+    /// 測試用：直接設定 DNS 上游（並標記為新鮮，跳過探測）。
+    #[cfg(test)]
+    fn set_dns_upstreams_for_test(&mut self, ups: Vec<SocketAddr>) {
+        self.dns_upstreams = ups;
+        self.dns_upstreams_at = Some(std::time::Instant::now());
+    }
+
     /// 把各 NAT flow 的 host socket 收到的外部回應合成 外部→guest 的 frame 注入 guest rx。
+    /// DNS pivot flow：只收 fanout 過的上游來源（其餘丟棄），src masquerade 成
+    /// `NAT_DNS_IP:53`（guest resolver 的 connected socket 才收得下）。
     fn nat_poll(&mut self, phy: &mut VirtioNetPhy) {
         let mut buf = [0u8; 65535];
         for f in &self.nat_flows {
             loop {
                 match f.sock.recv_from(&mut buf) {
                     Ok((n, SocketAddr::V4(from))) => {
+                        let (ext_ip, ext_port) = if f.dns {
+                            if !f.upstreams.contains(&SocketAddr::V4(from)) {
+                                continue; // 非我們查詢的上游，丟棄
+                            }
+                            (NAT_DNS_IP, 53)
+                        } else {
+                            (from.ip().octets(), from.port())
+                        };
                         let frame = super::nat::build_udp_reply(
                             self.gateway_mac,
                             f.guest_mac,
-                            from.ip().octets(),
-                            from.port(),
+                            ext_ip,
+                            ext_port,
                             f.guest_ip,
                             f.guest_port,
                             &buf[..n],
@@ -634,6 +753,88 @@ impl NetBackend {
     }
 }
 
+/// 探測 DNS 上游，依序：`CHEFER_WHP_DNS`（逗號分隔 IPv4；測試/受限網路的明確覆寫）→
+/// Windows host 目前設定的 DNS（`GetNetworkParams`；跟著 VPN/公司網路走，等價 Docker
+/// 讀 host resolv.conf）→ 都沒有才 fallback 公共 DNS（1.1.1.1/8.8.8.8，Docker 同款
+/// 行為）。fallback 不與 host DNS 並用：host DNS 存在時查詢不外流到第三方。
+fn discover_dns_upstreams() -> Vec<SocketAddr> {
+    if let Ok(v) = std::env::var("CHEFER_WHP_DNS") {
+        let list = parse_dns_override(&v);
+        if !list.is_empty() {
+            return list;
+        }
+        // 設了但解析不出任何位址 → 視同未設定，繼續探測。
+    }
+    let mut list = host_dns_servers();
+    // 保序去重 + 上限（GetNetworkParams 可能列多網卡重複項；fanout 不宜太寬）。
+    let mut seen = Vec::new();
+    list.retain(|a| {
+        let dup = seen.contains(a);
+        seen.push(*a);
+        !dup
+    });
+    list.truncate(3);
+    if list.is_empty() {
+        list = vec![
+            SocketAddr::from(([1, 1, 1, 1], 53)),
+            SocketAddr::from(([8, 8, 8, 8], 53)),
+        ];
+    }
+    list
+}
+
+/// 解析 `CHEFER_WHP_DNS`：逗號分隔的 IPv4（一律用 :53；無效項忽略）。
+fn parse_dns_override(v: &str) -> Vec<SocketAddr> {
+    v.split(',')
+        .filter_map(|s| s.trim().parse::<std::net::Ipv4Addr>().ok())
+        .filter(|ip| !ip.is_unspecified())
+        .map(|ip| SocketAddr::from((ip, 53)))
+        .collect()
+}
+
+/// Windows host 目前設定的 DNS server（IPv4）：IP Helper `GetNetworkParams` 的
+/// `DnsServerList`（系統層級、跨網卡的解析順序，正是「host 自己解名字會問誰」）。
+/// loopback 上游（本機跑 AdGuard 之類）也保留——helper 的 socket 在 host 端，連得到。
+#[cfg(windows)]
+fn host_dns_servers() -> Vec<SocketAddr> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{FIXED_INFO_W2KSP1, GetNetworkParams};
+    unsafe {
+        let mut len: u32 = 0;
+        // 第一次呼叫拿所需 buffer 大小（預期回 ERROR_BUFFER_OVERFLOW）。
+        let _ = GetNetworkParams(std::ptr::null_mut(), &mut len);
+        if len == 0 {
+            return Vec::new();
+        }
+        let mut buf = vec![0u8; len as usize];
+        if GetNetworkParams(buf.as_mut_ptr().cast::<FIXED_INFO_W2KSP1>(), &mut len) != 0 {
+            return Vec::new();
+        }
+        let info = &*buf.as_ptr().cast::<FIXED_INFO_W2KSP1>();
+        let mut out = Vec::new();
+        let mut node = std::ptr::addr_of!(info.DnsServerList);
+        while !node.is_null() {
+            // IP_ADDRESS_STRING 是以 NUL 結尾的點分十進位 ANSI 字串。
+            let raw =
+                std::slice::from_raw_parts((*node).IpAddress.String.as_ptr().cast::<u8>(), 16);
+            let end = raw.iter().position(|&c| c == 0).unwrap_or(raw.len());
+            if let Ok(txt) = std::str::from_utf8(&raw[..end])
+                && let Ok(ip) = txt.parse::<std::net::Ipv4Addr>()
+                && !ip.is_unspecified()
+            {
+                out.push(SocketAddr::from((ip, 53)));
+            }
+            node = (*node).Next;
+        }
+        out
+    }
+}
+
+/// 非 Windows（本 crate 的跨平台單元測試環境）：無 host DNS 探測，交給上層 fallback。
+#[cfg(not(windows))]
+fn host_dns_servers() -> Vec<SocketAddr> {
+    Vec::new()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -766,5 +967,200 @@ mod tests {
             }
         }
         assert!(found, "NetBackend 應對 guest 發 ARP（UDP 埠轉發發起）");
+    }
+
+    const GW_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x00, 0x02];
+    const GUEST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+    const GUEST_IP: [u8; 4] = [10, 0, 2, 15];
+
+    fn test_backend(phy: &mut VirtioNetPhy) -> NetBackend {
+        NetBackend::new(
+            GW_MAC,
+            Ipv4Address::new(10, 0, 2, 2),
+            Ipv4Address::new(10, 0, 2, 15),
+            phy,
+        )
+    }
+
+    /// 組一個 guest → 10.0.2.3:53 的查詢並解析成 OutboundUdp（重用 nat 的合成器）。
+    fn dns_query_from_guest(src_port: u16, payload: &[u8]) -> super::super::nat::OutboundUdp {
+        let frame = super::super::nat::build_udp_reply(
+            GUEST_MAC, GW_MAC, GUEST_IP, src_port, NAT_DNS_IP, 53, payload,
+        );
+        super::super::nat::parse_udp(&frame).unwrap()
+    }
+
+    #[test]
+    fn smoltcp_answers_arp_for_nat_dns_ip() {
+        // guest（或 pasta）送查詢前會對 on-link 的 10.0.2.3 ARP；backend 的 iface 掛了
+        // /32，應回 ARP reply——否則查詢連 L2 都出不去。
+        let mut phy = VirtioNetPhy::new();
+        let mut backend = test_backend(&mut phy);
+
+        let mut arp = Vec::new();
+        arp.extend_from_slice(&[0xff; 6]); // broadcast
+        arp.extend_from_slice(&GUEST_MAC);
+        arp.extend_from_slice(&[0x08, 0x06]);
+        arp.extend_from_slice(&[0x00, 0x01, 0x08, 0x00, 0x06, 0x04, 0x00, 0x01]);
+        arp.extend_from_slice(&GUEST_MAC);
+        arp.extend_from_slice(&GUEST_IP);
+        arp.extend_from_slice(&[0u8; 6]);
+        arp.extend_from_slice(&NAT_DNS_IP); // who-has 10.0.2.3
+        phy.push_from_guest(arp);
+
+        backend.poll(&mut phy, Instant::from_millis(0));
+        let reply = phy
+            .pop_to_guest()
+            .expect("應回 ARP reply（10.0.2.3 由 iface 持有）");
+        assert_eq!(&reply[12..14], &[0x08, 0x06]);
+        assert_eq!(&reply[20..22], &[0x00, 0x02], "opcode 應為 reply");
+        assert_eq!(&reply[28..32], &NAT_DNS_IP, "sender IP 應為 10.0.2.3");
+    }
+
+    #[test]
+    fn dns_pivot_forwards_to_upstream_and_masquerades_reply() {
+        // 完整 UDP pivot 鏈（host 端）：guest 查 10.0.2.3:53 → 上游收到原 payload →
+        // 上游回應 → 合成回 guest 的 frame src 必須是 10.0.2.3:53（masquerade）。
+        let mut phy = VirtioNetPhy::new();
+        let mut backend = test_backend(&mut phy);
+
+        let upstream = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        upstream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        backend.set_dns_upstreams_for_test(vec![upstream.local_addr().unwrap()]);
+
+        backend.nat_outbound_dns(dns_query_from_guest(40000, b"query-bytes"));
+
+        let mut buf = [0u8; 512];
+        let (n, flow_addr) = upstream.recv_from(&mut buf).expect("上游應收到查詢");
+        assert_eq!(&buf[..n], b"query-bytes");
+        upstream.send_to(b"answer-bytes", flow_addr).unwrap();
+
+        // 回程是真 OS socket，非同步；輪詢至 frame 出現。
+        let mut reply = None;
+        for ms in 0..200 {
+            backend.poll(&mut phy, Instant::from_millis(ms));
+            if let Some(f) = phy.pop_to_guest() {
+                reply = Some(f);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let p = super::super::nat::parse_udp(&reply.expect("應合成回 guest 的 DNS 回應"))
+            .expect("回程應為 IPv4/UDP");
+        assert_eq!(p.src_ip, NAT_DNS_IP, "src 應 masquerade 成 10.0.2.3");
+        assert_eq!(p.src_port, 53);
+        assert_eq!(p.dst_ip, GUEST_IP);
+        assert_eq!(p.dst_port, 40000);
+        assert_eq!(p.payload, b"answer-bytes");
+    }
+
+    #[test]
+    fn dns_pivot_drops_reply_from_non_upstream() {
+        // 只有 fanout 過的上游能回；其他來源（spoof）一律丟棄。
+        let mut phy = VirtioNetPhy::new();
+        let mut backend = test_backend(&mut phy);
+
+        let upstream = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        upstream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        backend.set_dns_upstreams_for_test(vec![upstream.local_addr().unwrap()]);
+
+        backend.nat_outbound_dns(dns_query_from_guest(40001, b"q"));
+        let mut buf = [0u8; 512];
+        let (_, flow_addr) = upstream.recv_from(&mut buf).expect("上游應收到查詢");
+
+        // 惡意來源先送，正牌上游後送——只有正牌 payload 能到 guest。
+        let spoofer = UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        spoofer.send_to(b"spoofed", flow_addr).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        upstream.send_to(b"legit", flow_addr).unwrap();
+
+        let mut frames = Vec::new();
+        for ms in 0..200 {
+            backend.poll(&mut phy, Instant::from_millis(ms));
+            while let Some(f) = phy.pop_to_guest() {
+                frames.push(f);
+            }
+            if !frames.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(frames.len(), 1, "spoof 應被丟棄、只留正牌回應");
+        let p = super::super::nat::parse_udp(&frames[0]).unwrap();
+        assert_eq!(p.payload, b"legit");
+        assert_eq!(p.src_ip, NAT_DNS_IP);
+    }
+
+    #[test]
+    fn dns_flow_keyed_separately_from_normal_flow() {
+        // 同一 guest src port 同時查外部 DNS（一般 NAT）與 10.0.2.3（pivot）：
+        // 兩者不能共用 flow，否則 masquerade 會錯掛到一般回程上。
+        let mut phy = VirtioNetPhy::new();
+        let mut backend = test_backend(&mut phy);
+        backend.set_dns_upstreams_for_test(vec![SocketAddr::from(([127, 0, 0, 1], 9))]);
+
+        // 一般出網（dst 用 loopback discard 埠，不真的期待回應）。
+        let ext_frame = super::super::nat::build_udp_reply(
+            GUEST_MAC,
+            GW_MAC,
+            GUEST_IP,
+            40002,
+            [127, 0, 0, 1],
+            9,
+            b"x",
+        );
+        backend.nat_outbound(super::super::nat::parse_udp(&ext_frame).unwrap());
+        backend.nat_outbound_dns(dns_query_from_guest(40002, b"y"));
+
+        assert_eq!(backend.nat_flows.len(), 2, "一般與 DNS pivot 應各一條 flow");
+        assert!(backend.nat_flows.iter().any(|f| !f.dns));
+        assert!(backend.nat_flows.iter().any(|f| f.dns));
+    }
+
+    #[test]
+    fn nat_dns_addr_is_never_evicted_or_released() {
+        // TCP NAT 動態 dst 塞滿 iface 位址表時，常駐的 10.0.2.3 不可被驅逐；
+        // release_dst_addr(10.0.2.3) 也必須是 no-op（ARP 應答依賴它）。
+        let mut phy = VirtioNetPhy::new();
+        let mut backend = test_backend(&mut phy);
+        let dns_cidr = IpCidr::new(IpAddress::Ipv4(Ipv4Address::new(10, 0, 2, 3)), 32);
+        assert!(backend.iface.ip_addrs().contains(&dns_cidr));
+
+        // 塞爆位址表（SMOLTCP_IFACE_MAX_ADDR_COUNT=64），迫使驅逐路徑運轉。
+        for i in 0..100u32 {
+            let b = i.to_be_bytes();
+            let _ = backend.ensure_dst_addr([1, b[1], b[2], b[3].max(1)]);
+        }
+        assert!(
+            backend.iface.ip_addrs().contains(&dns_cidr),
+            "10.0.2.3 不可被驅逐"
+        );
+
+        backend.release_dst_addr(NAT_DNS_IP);
+        assert!(
+            backend.iface.ip_addrs().contains(&dns_cidr),
+            "release 對 10.0.2.3 應為 no-op"
+        );
+    }
+
+    #[test]
+    fn dns_override_parsing() {
+        assert_eq!(
+            parse_dns_override("1.1.1.1, 8.8.8.8"),
+            vec![
+                SocketAddr::from(([1, 1, 1, 1], 53)),
+                SocketAddr::from(([8, 8, 8, 8], 53)),
+            ]
+        );
+        // 無效項忽略；0.0.0.0 排除；全空 → 空清單（呼叫端視同未設定）。
+        assert_eq!(
+            parse_dns_override("junk, 0.0.0.0, 9.9.9.9"),
+            vec![SocketAddr::from(([9, 9, 9, 9], 53))]
+        );
+        assert!(parse_dns_override("").is_empty());
     }
 }

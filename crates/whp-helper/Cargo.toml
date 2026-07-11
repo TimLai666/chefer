@@ -25,6 +25,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
+    # 容器內 DNS（10.0.2.3 pivot）：GetNetworkParams 取 host 設定的 DNS server 當轉發上游。
+    "Win32_NetworkManagement_IpHelper",
     # GUI 顯示視窗（M8-c）：視窗類別/訊息迴圈、GDI blit（StretchDIBits）。
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",

@@ -67,6 +67,41 @@
 4. **在沒有 WSL 或設 `CHEFER_BACKEND=whp` 的 Windows** 跑單檔，驗 redis + app 起來、埠可連、
    `CHEFER_GUEST_EXIT` 正確回傳、data 持久化。
 
+### M7-d — 容器內 DNS（10.0.2.3 pivot）🚧 待實機驗證
+
+背景：M7-b/c 記錄的 `wget http://example.com` 成功**不代表**裸 image 開箱可解析——當時
+容器內沒有任何 resolv.conf 來源（裸 alpine 不自帶；musl 缺檔 fallback `127.0.0.1:53`，
+到不了 NAT），解析必是測試時另行給了 nameserver。正式來源已補（設計見 DESIGN
+§「容器內 DNS」）：
+
+- guest 側：kernel cmdline `ip=` 尾追 dns0=`10.0.2.3`（`whp_util::kernel_command_line`）→
+  `/proc/net/pnp` 出現 `nameserver 10.0.2.3` → appliance init symlink `/etc/resolv.conf` →
+  guest-agent `exec.rs` 注入每個容器（vz/QEMU 同一條既有鏈）。
+- host 側：helper `net_backend` 的 DNS pivot——iface 掛 `10.0.2.3/32` 應答 ARP，
+  `10.0.2.3:53` 的 UDP fanout 到 host 設定的 DNS（`GetNetworkParams`、60s 快取、
+  `CHEFER_WHP_DNS` 覆寫、無上游才 fallback 公共 DNS），回程 masquerade 回
+  `10.0.2.3:53`；TCP:53 SYN 走 TCP NAT 但改連第一個上游。
+  host 端邏輯已有跨平台單元測試（`net_backend::tests::dns_*`），Windows 專屬的
+  `GetNetworkParams` 僅過 cross-compile check。
+
+**實機驗證步驟（Windows + WHP）**：
+
+1. 依 M6 流程產 kit（appliance 需含 init 的 resolv.conf symlink 區塊——用本分支重建）、
+   本分支重建 `chefer-whp-helper` 與 `chefer-runtime`。
+2. 測試 appcipe：**裸 alpine**（不要在 command 裡寫 resolv.conf——那正是當年掩蓋問題的
+   做法），`network` 用預設 bridge：
+   `command: sh -c "nslookup example.com && wget -O- http://example.com >NUL"`,
+   `interface_mode: none`。build 後 `CHEFER_BACKEND=whp` 跑單檔。
+3. 斷言：exit 0；`CHEFER_WHP_NET_TRACE=1` 可見 `dns: upstreams = [...]`（應列出本機
+   `ipconfig /all` 的 DNS）與 `nat: new dns pivot flow`；`nslookup` 輸出的 Server 應為
+   `10.0.2.3`。
+4. 變因驗證：(a) `network: shared` 同樣通（不經 pasta 的路徑）；(b)
+   `CHEFER_WHP_DNS=1.1.1.1` 覆寫後仍通（trace 的 upstreams 跟著換）；(c) 若在
+   VPN/公司網路，額外驗內網 hostname 可解析（這正是 pivot 相對「寫死公共 DNS」的
+   價值）。
+5. 通過後把 DESIGN §6 M7-d 與本節的 🚧 改 ✅（記下實測環境），失敗則帶
+   `CHEFER_WHP_NET_TRACE=1` 的輸出回報。
+
 ### M8 — GUI（virtio-gpu + cage overlay；契約見 DESIGN §6「WHP GUI」與「GUI overlay 打包契約」）
 
 M1-M7（blk/persist/net/NAT 含預設 bridge）皆已實機完成後，WHP 僅剩這條大線。

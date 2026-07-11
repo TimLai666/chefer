@@ -236,7 +236,9 @@ mod whp_api {
     // vdb（data）image 容量上限（host RAM 內的 backing；env CHEFER_WHP_DATA_MIB 覆寫，預設 256MiB）。
     // 必須 ≥ guest 關機 re-tar data_dir 後的 tar 大小，否則回寫 IOERR。
     const VIRTIO_DATA_DEFAULT_MIB: u64 = 256;
-    // user-mode 網路：smoltcp gateway 10.0.2.2、guest 靜態 10.0.2.15/24（與 appliance init 約定）。
+    // user-mode 網路：smoltcp gateway 10.0.2.2、guest 靜態 10.0.2.15/24（與 appliance init 約定）；
+    // 約定 DNS 10.0.2.3:53（net_backend::NAT_DNS_IP，kernel cmdline dns0 指向它，
+    // drain_tx 分流到 DNS pivot 轉發 host 設定的 DNS）。
     const NET_GATEWAY_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x00, 0x00, 0x02];
     const NET_GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
     const NET_GUEST_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
@@ -1074,17 +1076,28 @@ mod whp_api {
                             );
                         }
                         // 出網分流：
+                        // - 約定 DNS `10.0.2.3:53`：UDP → DNS pivot（轉發 host 設定的 DNS
+                        //   上游、回程 masquerade）；TCP SYN → 同 pivot 的 TCP fallback
+                        //   （截斷回應時 resolver 改走 TCP:53）。須在 is_external_dst 之前
+                        //   分流——10.0.2.3 在 guest 網段內、不算外部。
                         // - 外部 dst 的 TCP：仍交給 smoltcp（出網 TCP 由 smoltcp 動態 dst 處理）；
                         //   但 SYN 先 nat_tcp_syn 預註冊 dst+listen socket+背景 connect host。
                         // - 外部 dst 的 UDP：手工 NAT（不交 smoltcp，smoltcp 不轉發）。
                         // - 其餘（ARP、guest↔gateway、同網段、multicast/bcast）照舊餵 smoltcp。
+                        use super::virtio::net_backend::NAT_DNS_IP;
                         if let Some(t) = super::virtio::nat::parse_tcp(&frame) {
-                            if is_external_dst(t.dst_ip) && t.syn && !t.ack {
-                                self.backend.nat_tcp_syn(t);
+                            if t.syn && !t.ack {
+                                if t.dst_ip == NAT_DNS_IP && t.dst_port == 53 {
+                                    self.backend.nat_tcp_dns_syn(t);
+                                } else if is_external_dst(t.dst_ip) {
+                                    self.backend.nat_tcp_syn(t);
+                                }
                             }
                             self.phy.push_from_guest(frame);
                         } else if let Some(udp) = super::virtio::nat::parse_udp(&frame) {
-                            if is_external_dst(udp.dst_ip) {
+                            if udp.dst_ip == NAT_DNS_IP && udp.dst_port == 53 {
+                                self.backend.nat_outbound_dns(udp);
+                            } else if is_external_dst(udp.dst_ip) {
                                 self.backend.nat_outbound(udp);
                             } else {
                                 self.phy.push_from_guest(frame);
