@@ -6,6 +6,10 @@
 #   --arch 省略時取 host 架構（uname -m）。swiftc 可在 Apple Silicon 上交叉編到 x86_64，
 #   故 release 可在單一 arm64 runner 上分別產兩種架構的 helper。
 # 產出：<out_dir>/chefer-vz-helper-<aarch64|x86_64>（已以 virtualization entitlement ad-hoc 簽章）
+#
+# 簽章身分：預設 ad-hoc（`-`），每次 build 身分都不同 → macOS TCC（如「區域網路」隱私權，
+# 剪貼簿同步連 guest 會踩到）記不住授權、每個新 binary 都可能重新被閘。有 Apple Development
+# / Developer ID 憑證時可設 CHEFER_CODESIGN_IDENTITY=<identity> 取得穩定簽章身分。
 set -Eeuo pipefail
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -39,10 +43,11 @@ echo "==> swiftc → $bin (target=$swift_target)"
 swiftc -O -target "$swift_target" -framework Virtualization \
   -o "$bin" "$root/vz-helper/main.swift"
 
-echo "==> codesign（ad-hoc）+ virtualization entitlement"
+identity="${CHEFER_CODESIGN_IDENTITY:--}"
+echo "==> codesign（identity: ${identity}）+ virtualization entitlement"
 codesign --force --options runtime \
   --entitlements "$root/vz-helper/vz-helper.entitlements" \
-  --sign - "$bin"
+  --sign "$identity" "$bin"
 
 echo "==> 完成：$bin"
 codesign -d --entitlements - "$bin" 2>/dev/null || true

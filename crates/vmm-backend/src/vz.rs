@@ -128,11 +128,37 @@ impl ExecBackend for VzBackend {
         );
         let mut child = Command::new(&helper)
             .args(&args)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .with_context(|| {
                 format!("failed to spawn the macOS VM helper: {}", helper.display())
             })?;
+
+        // helper 的 stdin 同時是 guest console（hvc0）輸入與 **liveness 通道**：helper 讀到
+        // stdin EOF 即自我了結（見 vz-helper/main.swift）。寫端由本行程握住——runtime 無論
+        // 怎麼死（單發 SIGINT/SIGTERM、SIGKILL、panic），OS 都會關掉這個 fd，helper/VM 就
+        // 不會殘留。終端 Ctrl+C 靠同 process group 收訊號沒這問題；實機發現單發訊號給
+        // runtime 時 helper 收不到，VM 會孤兒化繼續吃 CPU。
+        let helper_stdin = child
+            .stdin
+            .take()
+            .expect("child stdin was requested as piped");
+        if vz_util::needs_console_stdin_pump(ctx.manifest) {
+            // 有 terminal/both 服務：把 runtime 自己的 stdin 泵給 helper（terminal 服務
+            // stdin 直通）。runtime stdin 先到 EOF（如 < /dev/null）不能關掉 helper 端
+            // ——那等於殺掉整個 app——改為 mem::forget 讓寫端 fd 隨行程存亡。
+            std::thread::spawn(move || {
+                let mut src = std::io::stdin();
+                let mut dst = helper_stdin;
+                let _ = std::io::copy(&mut src, &mut dst);
+                std::mem::forget(dst);
+            });
+        } else {
+            // 無 terminal 服務：不讀使用者終端的 stdin（避免把輸入吞進 guest console），
+            // 只讓寫端 fd 隨行程存亡。
+            std::mem::forget(helper_stdin);
+        }
 
         let stdout = child
             .stdout
