@@ -67,7 +67,7 @@
 4. **在沒有 WSL 或設 `CHEFER_BACKEND=whp` 的 Windows** 跑單檔，驗 redis + app 起來、埠可連、
    `CHEFER_GUEST_EXIT` 正確回傳、data 持久化。
 
-### M7-d — 容器內 DNS（10.0.2.3 pivot）🚧 待實機驗證
+### M7-d — 容器內 DNS（10.0.2.3 pivot）✅ 實機驗證通過（2026-07-11）
 
 背景：M7-b/c 記錄的 `wget http://example.com` 成功**不代表**裸 image 開箱可解析——當時
 容器內沒有任何 resolv.conf 來源（裸 alpine 不自帶；musl 缺檔 fallback `127.0.0.1:53`，
@@ -84,23 +84,25 @@
   host 端邏輯已有跨平台單元測試（`net_backend::tests::dns_*`），Windows 專屬的
   `GetNetworkParams` 僅過 cross-compile check。
 
-**實機驗證步驟（Windows + WHP）**：
+**實機驗證記錄（2026-07-11，Windows 11 Pro 26200 + WHP，host DNS = Wi-Fi `192.168.1.1`）**：
 
-1. 依 M6 流程產 kit（appliance 需含 init 的 resolv.conf symlink 區塊——用本分支重建）、
-   本分支重建 `chefer-whp-helper` 與 `chefer-runtime`。
-2. 測試 appcipe：**裸 alpine**（不要在 command 裡寫 resolv.conf——那正是當年掩蓋問題的
-   做法），`network` 用預設 bridge：
-   `command: sh -c "nslookup example.com && wget -O- http://example.com >NUL"`,
-   `interface_mode: none`。build 後 `CHEFER_BACKEND=whp` 跑單檔。
-3. 斷言：exit 0；`CHEFER_WHP_NET_TRACE=1` 可見 `dns: upstreams = [...]`（應列出本機
-   `ipconfig /all` 的 DNS）與 `nat: new dns pivot flow`；`nslookup` 輸出的 Server 應為
-   `10.0.2.3`。
-4. 變因驗證：(a) `network: shared` 同樣通（不經 pasta 的路徑）；(b)
-   `CHEFER_WHP_DNS=1.1.1.1` 覆寫後仍通（trace 的 upstreams 跟著換）；(c) 若在
-   VPN/公司網路，額外驗內網 hostname 可解析（這正是 pivot 相對「寫死公共 DNS」的
-   價值）。
-5. 通過後把 DESIGN §6 M7-d 與本節的 🚧 改 ✅（記下實測環境），失敗則帶
-   `CHEFER_WHP_NET_TRACE=1` 的輸出回報。
+- kit：本分支重建 `chefer-runtime`／`chefer-whp-helper`／musl `guest-agent`／appliance
+  initramfs（init 含 resolv.conf symlink 區塊；kernel 沿用 v6.6.32 既有 vmlinuz——config
+  未變不必重編）＋ `scripts/build-pasta.sh` 產靜態 pasta（passt tag 2026_06_11.a9c61ff）。
+- 測試 app：裸 `alpine:3.20`、**不含任何 resolv.conf 手段**、`interface_mode: none`，
+  `cmd: sh -c "nslookup example.com | grep -F 10.0.2.3 && wget -O- http://example.com >/dev/null"`
+  ——WHP console 看不到服務 stdout，故「nslookup Server = 10.0.2.3」以容器內 grep 斷言
+  進 exit code。
+- 結果（`CHEFER_BACKEND=whp CHEFER_WHP_NET_TRACE=1` 跑單檔）：
+  1. 預設 `bridge`：exit 0（`CHEFER_GUEST_EXIT=0`）；trace 見
+     `dns: upstreams = [192.168.1.1:53]`（與 host `ipconfig` 一致，GetNetworkParams 探測
+     正確）、`nat: new dns pivot flow 10.0.2.15:*` 兩條、`nat-tcp: new flow … :80`。
+  2. `network: shared`：exit 0，同樣 pivot flow（不經 pasta 的路徑）。
+  3. `CHEFER_WHP_DNS=1.1.1.1`：exit 0，trace upstreams 變 `[1.1.1.1:53]`（覆寫生效）。
+- **未涵蓋**：(c) VPN/公司內網 hostname 解析（驗證機當時無 VPN）——pivot 對內網 DNS 的
+  價值路徑（上游=VPN DNS）尚待有 VPN 環境時順手補驗。
+- 陷阱重演提醒：initramfs 重建時 init 必須去 CRLF（`build-inside-container.sh` 已處理；
+  自組重建管線漏掉會 PID 1 exit 127 kernel panic，本次實測踩過一次）。
 
 ### M8 — GUI（virtio-gpu + cage overlay；契約見 DESIGN §6「WHP GUI」與「GUI overlay 打包契約」）
 
