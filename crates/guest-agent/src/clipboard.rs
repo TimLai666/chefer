@@ -332,9 +332,15 @@ fn wl_copy_kind(kind: u8, data: &[u8]) {
     }
 }
 
-/// 在 PATH 找執行檔（overlay 解壓後的 /usr/bin 等）。
-fn which(bin: &str) -> Option<std::path::PathBuf> {
-    let path = std::env::var_os("PATH")?;
+/// 在 PATH 找執行檔（overlay 解壓後的 /usr/bin 等）。resize.rs 亦共用。
+///
+/// PATH 未設時退回標準路徑：appliance init 舊版沒 export PATH（kernel 給 PID 1 的環境
+/// 本來就沒有），guest-agent 會拿不到——別因此把剪貼簿/動態解析度整組靜默停用。
+/// 執行時 `Command::new(裸名)` 的 execvp 在無 PATH 下也用類似的預設路徑，行為一致。
+pub(crate) fn which(bin: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "/usr/local/bin:/bin:/usr/bin:/sbin:/usr/sbin".into());
     for dir in std::env::split_paths(&path) {
         let cand = dir.join(bin);
         if cand.is_file() {

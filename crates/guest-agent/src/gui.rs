@@ -14,6 +14,8 @@
 //!    `$XDG_RUNTIME_DIR/wayland-0`（與 Xwayland 的 `/tmp/.X11-unix/X0`）出現。
 //! 4. 設定 `XDG_RUNTIME_DIR`/`WAYLAND_DISPLAY`/`DISPLAY` 供 exec.rs 既有的
 //!    GUI socket bind 邏輯把 socket 掛進服務容器。
+//! 5. 啟動 host↔guest 剪貼簿同步（clipboard.rs）與動態解析度跟隨（resize.rs——
+//!    host 調整視窗 → guest re-modeset，cage 本身不跟隨線上模式變更）。
 //!
 //! 觸發條件（`maybe_start`）：appliance init 設 `CHEFER_VM_GUI=1` **且** manifest
 //! 有 gui/both 服務。overlay 缺失 → 硬錯誤（依契約不得無聲黑屏）。
@@ -29,7 +31,7 @@ use nix::mount::{MsFlags, mount};
 /// 記一行 GUI 診斷。同時走 stderr（原生 Linux / 有接 console 的後端可見）與 **`/dev/kmsg`**
 /// ——WHP 的序列 console 在 `quiet` 下不顯示 guest-agent 自己的 stderr，但高優先序 kmsg 會
 /// 出現在 console（同 appliance init 的 `report()`），故 WHP GUI 的啟動診斷才看得到。best-effort。
-fn note(msg: &str) {
+pub(crate) fn note(msg: &str) {
     eprintln!("[guest-agent] gui: {msg}");
     if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open("/dev/kmsg") {
         use std::io::Write as _;
@@ -47,18 +49,21 @@ const GUI_RUNTIME_DIR: &str = "/run/chefer-gui";
 /// 等 compositor socket 出現的上限。llvmpipe 首次啟動慢，放寬一點。
 const SOCKET_WAIT: Duration = Duration::from_secs(20);
 
-/// 存活中的 GUI 環境；Drop 時收掉 clipboard / cage / seatd / udevd。
+/// 存活中的 GUI 環境；Drop 時收掉 resize/clipboard / cage / seatd / udevd。
 pub struct GuiSession {
     cage: Child,
     seatd: Option<Child>,
     udevd: Option<Child>,
     /// host↔guest 剪貼簿同步（有 cmdline token 且 wl-clipboard 可用時；見 clipboard.rs）。
     clipboard: Option<crate::clipboard::ClipboardSync>,
+    /// 動態解析度跟隨（wlr-randr 可用時；見 resize.rs）。
+    resize: Option<crate::resize::ResizeWatcher>,
 }
 
 impl Drop for GuiSession {
     fn drop(&mut self) {
-        // 先收剪貼簿同步（背景執行緒），再收 compositor。
+        // 先收背景執行緒（解析度跟隨、剪貼簿同步），再收 compositor。
+        self.resize.take();
         self.clipboard.take();
         let _ = self.cage.kill();
         let _ = self.cage.wait();
@@ -111,6 +116,7 @@ pub fn maybe_start(bundle_dir: &Path, manifest: &Manifest) -> Result<Option<GuiS
         seatd,
         udevd,
         clipboard: None,
+        resize: None,
     };
 
     let wayland = PathBuf::from(GUI_RUNTIME_DIR).join("wayland-0");
@@ -137,6 +143,9 @@ pub fn maybe_start(bundle_dir: &Path, manifest: &Manifest) -> Result<Option<GuiS
     // compositor 就緒後起剪貼簿同步（env 已設好，wl-clipboard 可接 cage）。無 cmdline
     // token（host 未啟用剪貼簿）或 wl-clipboard 缺失時回 None，不致命。
     session.clipboard = crate::clipboard::maybe_start();
+    // 動態解析度跟隨（host 調整視窗 → guest re-modeset；見 resize.rs）。wlr-randr 缺失
+    //（舊 overlay）時回 None，不致命——退回「host 端拉伸顯示」的舊行為。
+    session.resize = crate::resize::maybe_start();
     Ok(Some(session))
 }
 

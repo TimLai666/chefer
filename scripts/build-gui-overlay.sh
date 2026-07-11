@@ -37,12 +37,14 @@ usage() {
 '用法：scripts/build-gui-overlay.sh --arch <x86_64|aarch64> [--out <dir>]' \
 '' \
 '環境變數：' \
-'  CHEFER_GUI_CONTAINER  建置容器映像（預設：alpine:3.20；決定 overlay 內套件版本）' >&2
+'  CHEFER_GUI_CONTAINER  建置容器映像（預設：alpine:3.22；決定 overlay 內套件版本）' >&2
 }
 
 main() {
   local arch="" out_dir=""
-  local container="${CHEFER_GUI_CONTAINER:-alpine:3.20}"
+  # 至少 3.21（cage ≥ 0.2.0）：動態解析度靠 cage 的 wlr-output-management 協定
+  # （guest-agent resize.rs 以 wlr-randr 對它下 custom mode），3.20 的 cage 0.1.5 沒有。
+  local container="${CHEFER_GUI_CONTAINER:-alpine:3.22}"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -68,13 +70,14 @@ main() {
   # 在容器內：apk --root 安裝到乾淨 staging（自動帶入依賴閉包，含 musl/busybox 基底）
   # → 精簡（文件/快取）→ tar.zst 輸出。
   # 套件選擇（缺一 cage 就起不來，實測依據見 docs/whp-virtio-roadmap.md M8）：
-  #   cage              kiosk Wayland compositor（wlroots）
+  #   cage              kiosk Wayland compositor（wlroots）；≥0.2.0 才有 wlr-output-management
   #   xwayland          讓 X11 app 也能顯示（cage 內建整合）
   #   mesa-dri-gallium  llvmpipe 軟算繪（VM 無 GPU）
   #   eudev             wlroots 的 DRM/libinput 裝置探索需要 udev
   #   xkeyboard-config  libxkbcommon 載入鍵盤配置（缺了 cage 啟動即失敗）
   #   wl-clipboard      M8-e 剪貼簿同步的 guest 端工具
   #   seatd             seat 管理 daemon（Alpine 的 libseat 沒編 builtin backend，實測必要）
+  #   wlr-randr         動態解析度：guest-agent（resize.rs）對 cage 下 custom mode
   docker run --rm --platform "$platform" \
     -e OUT_ARCH="$arch" \
     -v "$out_dir:/out" \
@@ -86,7 +89,8 @@ main() {
       apk add --root "$root" --initdb --no-cache \
         --keys-dir /etc/apk/keys \
         --repositories-file /etc/apk/repositories \
-        cage xwayland mesa-dri-gallium eudev xkeyboard-config wl-clipboard seatd >/dev/null
+        cage xwayland mesa-dri-gallium eudev xkeyboard-config wl-clipboard seatd \
+        wlr-randr >/dev/null
       # Xwayland 的 access control 連「同 uid 的本機連線」都要求 cookie（實測 xhost 也被拒，
       # 而 wlroots 啟動 Xwayland 不帶 -auth、也無法傳額外參數）→ 以 shim 讓 cage 啟動的
       # Xwayland 一律帶 -ac 關閉 access control。安全邊界是 micro-VM 本身：VM 內只有

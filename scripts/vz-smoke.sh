@@ -41,8 +41,9 @@ done
 kit_dir="${kit_dir:-${CHEFER_KIT_DIR:-$root/kit}}"
 [[ -f "$kit_dir/chefer-vmlinuz-$arch" && -f "$kit_dir/chefer-initramfs-$arch" ]] \
   || die "kit 缺 macOS appliance（$kit_dir/chefer-vmlinuz-$arch / chefer-initramfs-$arch）；用 release 的 kit/ 或先跑 scripts/build-appliance.sh"
-if [[ "$gui" == 1 && ! -f "$kit_dir/chefer-gui-overlay-$arch.sqfs" ]]; then
-  die "--gui 需要 kit 內有 chefer-gui-overlay-$arch.sqfs（release kit 已附）"
+if [[ "$gui" == 1 && ! -f "$kit_dir/chefer-gui-overlay-$arch.sqfs" ]] \
+  && ! command -v docker >/dev/null 2>&1; then
+  die "--gui 需要 kit 內有 chefer-gui-overlay-$arch.sqfs（release kit 已附），或裝 Docker 讓腳本現建"
 fi
 
 work="$root/dist/vz-smoke"
@@ -87,7 +88,19 @@ else
   cp "$kit_dir/guest-agent-$arch" "$smoke_kit/" 2>/dev/null \
     || die "kit 缺 guest-agent-$arch（vz bundle 內嵌用；release kit 已附），且無 cross 可自建"
 fi
-[[ $gui == 1 ]] && cp "$kit_dir/chefer-gui-overlay-$arch.sqfs" "$smoke_kit/"
+if [[ $gui == 1 ]]; then
+  # 動態解析度需要新 overlay（cage ≥0.2.0 + wlr-randr，Alpine 3.22）——舊 release kit 的
+  # overlay（cage 0.1.5）沒有 wlr-output-management。有 Docker 就照當前腳本現建，
+  # 否則沿用 kit 的並提醒該檢核項可能失敗。
+  if command -v docker >/dev/null 2>&1; then
+    note "3b/5 現建 GUI overlay（當前 build-gui-overlay.sh：cage 0.2.0 + wlr-randr）"
+    bash "$root/scripts/build-gui-overlay.sh" --arch "$arch" --out "$smoke_kit"
+  else
+    cp "$kit_dir/chefer-gui-overlay-$arch.sqfs" "$smoke_kit/"
+    echo "vz-smoke: warning: 無 docker，沿用 kit 的 GUI overlay——若它建自舊版腳本（cage 0.1.x），" >&2
+    echo "  「動態解析度」檢核會失敗（console 出現 resize: giving up 或 wlr-randr not found）。" >&2
+  fi
+fi
 [[ -f "$kit_dir/pasta-$arch" ]] && cp "$kit_dir/pasta-$arch" "$smoke_kit/" || true
 
 platform="linux/$([[ "$arch" == aarch64 ]] && echo arm64 || echo amd64)"
@@ -188,9 +201,14 @@ YML
     [ ] 滑鼠移動/點擊、鍵盤輸入進得了 guest（HID）
     [ ] host 複製文字 → guest 內可貼上；guest 複製 → host 可貼上（剪貼簿，含 PNG 圖）
     [ ] 關窗 → app 乾淨結束、行程退出（關窗 = app 結束語意）
-    （動態解析度已實測收斂，不必再驗：開機時 guest 模式=視窗 Retina 像素尺寸、
-      CHEFER_VZ_GUI_SIZE 生效；拖拉時只縮放不 re-modeset——cage 啟動後不跟模式變更，
-      與 WHP 同一 guest 端限制，見 DESIGN §6。）
+    [ ] 動態解析度（opt-in，macOS 14+；guest 側 re-modeset 由 guest-agent resize watcher
+        提供，需上面 3b/5 的新 overlay）——本清單跑完後另跑：
+          CHEFER_VZ_EXPERIMENTAL=1 CHEFER_VZ_DYNAMIC_RESOLUTION=1 \
+            CHEFER_VZ_GUI_TEST_RESIZE=20:1100x700 <同一個單檔>
+        20 秒後視窗自動縮放（與手動拖拉同路徑），console 應出現
+        「gui: resize: Virtual-1 -> 2200x1400」（Retina 2x）且畫面重排非拉伸。
+    （預設模式的拖拉=view 等比縮放、不 re-modeset——預設取捨見 DESIGN §6 ④：
+      Retina 像素模式下 Linux guest 無 HiDPI output scale，UI 會縮半。）
 CHECK
   CHEFER_VZ_EXPERIMENTAL=1 "$work/dist/vz-gui-smoke/vz-gui-smoke_${arch}-apple-darwin" --extract-dir "$work/extract-gui"
   note "GUI app 已結束（exit $?）——請依上方清單回填結果"
