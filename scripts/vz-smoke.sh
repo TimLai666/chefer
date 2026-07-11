@@ -56,17 +56,23 @@ note "2/5 編譯 chefer-cli + chefer-runtime（release）"
 cargo build --release -p chefer-cli -p chefer-runtime --manifest-path "$root/Cargo.toml"
 
 # guest-agent 走 bundle 內嵌，且 GUI 修復（WLR_LIBINPUT_NO_DEVICES 等）在 guest-agent 裡——
-# **從原始碼建當前 main 的 guest-agent**（cross，如 release.yml），別用可能過舊的 kit binary。
-# 沒有 cross（需 Docker）時退回 kit 的 guest-agent，並大聲警告可能缺當前修復。
+# **從原始碼建當前 main 的 guest-agent**，別用可能過舊的 kit binary。
+# guest-agent 是純 Rust + rust-lld（.cargo/config.toml 已設 linker），macOS host 原生
+# `cargo build --target <arch>-unknown-linux-musl` 即可（實體 Mac 驗證時實測），免 cross/Docker；
+# 有 cross 就照 release.yml 用 cross。兩者皆不可行才退回 kit 的 guest-agent 並大聲警告。
 musl_target="${arch}-unknown-linux-musl"
 fresh_agent=""
 if command -v cross >/dev/null 2>&1; then
   note "2b/5 cross build guest-agent（$musl_target，含當前 GUI 修復）"
   ( cd "$root" && cross build --release --target "$musl_target" -p guest-agent )
   fresh_agent="$root/target/$musl_target/release/guest-agent"
+elif command -v rustup >/dev/null 2>&1 && rustup target add "$musl_target" >/dev/null 2>&1; then
+  note "2b/5 原生 cargo build guest-agent（$musl_target，rust-lld，免 cross/Docker）"
+  ( cd "$root" && cargo build --release --target "$musl_target" -p guest-agent )
+  fresh_agent="$root/target/$musl_target/release/guest-agent"
 else
-  echo "vz-smoke: warning: 找不到 cross（cargo install cross，需 Docker）——改用 kit 的 guest-agent-$arch，" >&2
-  echo "  它可能早於當前 main 的 GUI 修復（如 WLR_LIBINPUT_NO_DEVICES boot-race fix）。要驗證當前碼請裝 cross。" >&2
+  echo "vz-smoke: warning: 無 cross 也無法以 rustup 加 $musl_target target——改用 kit 的 guest-agent-$arch，" >&2
+  echo "  它可能早於當前 main 的 GUI 修復（如 WLR_LIBINPUT_NO_DEVICES boot-race fix）。" >&2
 fi
 
 note "3/5 組 smoke kit（runtime + helper + appliance$([[ $gui == 1 ]] && echo ' + gui overlay')）"
@@ -125,7 +131,8 @@ services:
       platform: $platform
     interface_mode: none
     ports: ["18080:8080"]
-    cmd: ["sh", "-c", "echo VZ_SMOKE_SERVICE_UP; httpd -f -p 8080"]
+    # alpine 基底沒有 httpd（在 busybox-extras），用 busybox nc 湊一個最小 HTTP 服務。
+    cmd: ["sh", "-c", "echo VZ_SMOKE_SERVICE_UP; while true; do printf 'HTTP/1.0 200 OK\\r\\n\\r\\nok\\n' | nc -l -p 8080; done"]
 YML
 "$root/target/release/chefer-cli" build "$work/smoke.yml" --out "$work/dist"
 exe="$work/dist/vz-smoke/vz-smoke_${arch}-apple-darwin"
@@ -152,6 +159,9 @@ done
 kill -INT "$app_pid" 2>/dev/null || true
 wait "$app_pid" 2>/dev/null || true
 trap - EXIT
+# 對 runtime 單發 SIGINT（非終端機 Ctrl+C 的整個 process group）不會帶走 helper/VM，
+# 實測會殘留吃 CPU——收尾把本次 work dir 下的 helper 一併清掉。
+pkill -f "$work/.*chefer-vz-helper" 2>/dev/null || true
 grep -q "CHEFER_GUEST_IP=" "$log" || die "console 沒出現 CHEFER_GUEST_IP 標記（埠轉發不會啟動）；log: $log"
 [[ $ok_port == 1 ]] || die "TCP 埠轉發失敗（curl 127.0.0.1:18080 不通）；log: $log"
 note "驗證二通過：服務常駐 ✓ CHEFER_GUEST_IP 標記 ✓ TCP 轉發 ✓"
@@ -177,8 +187,10 @@ YML
     [ ] 出現以 app 名為標題的視窗，xclock 指針在動（VZVirtualMachineView 顯示）
     [ ] 滑鼠移動/點擊、鍵盤輸入進得了 guest（HID）
     [ ] host 複製文字 → guest 內可貼上；guest 複製 → host 可貼上（剪貼簿，含 PNG 圖）
-    [ ] macOS 14+：拖拉視窗角改變大小 → guest 畫面跟著換解析度（動態解析度）
     [ ] 關窗 → app 乾淨結束、行程退出（關窗 = app 結束語意）
+    （動態解析度已實測收斂，不必再驗：開機時 guest 模式=視窗 Retina 像素尺寸、
+      CHEFER_VZ_GUI_SIZE 生效；拖拉時只縮放不 re-modeset——cage 啟動後不跟模式變更，
+      與 WHP 同一 guest 端限制，見 DESIGN §6。）
 CHECK
   CHEFER_VZ_EXPERIMENTAL=1 "$work/dist/vz-gui-smoke/vz-gui-smoke_${arch}-apple-darwin" --extract-dir "$work/extract-gui"
   note "GUI app 已結束（exit $?）——請依上方清單回填結果"

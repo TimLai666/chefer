@@ -148,7 +148,19 @@ config.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfigurati
 
 // GUI：virtio-gpu 一個 scanout + USB 鍵盤 + 絕對座標指標（VZVirtualMachineView 自動把
 // HID 事件轉進這些裝置；絕對座標同 WHP 的 tablet 選擇，避免滑鼠捕捉問題）。
+//
+// 動態解析度開關（實體 Mac 實測後的取捨）：guest 的 cage kiosk compositor 啟動後
+// **不跟隨**模式變更（見 DESIGN §6 ④）——此時開 automaticallyReconfiguresDisplay 反而
+// 讓 view 停止縮放、等一個永遠不會來的 guest re-modeset，拖拉視窗時畫面尺寸不同步。
+// 且它推給 guest 的是 Retina **實體像素**尺寸（點 ×2），Linux guest 無 HiDPI 概念、
+// cage 也設不了 output scale → 游標與 UI 內容都只剩一半大（實測使用者直接抱怨）。
+// 故預設：scanout = 視窗「點」數（guest 看到 WxH 的螢幕、內容尺寸與一般視窗一致），
+// automaticallyReconfiguresDisplay 關、由 view 縮放（Retina 上 2× 放大，略軟但尺寸正確；
+// 拖拉視窗即時跟手）。等 guest compositor 支援 re-modeset ＋ HiDPI output scale 後，
+// 以 CHEFER_VZ_DYNAMIC_RESOLUTION=1 切回真動態解析度（macOS 14+）。
 let (guiW, guiH) = guiSize()
+let dynamicResolution =
+    ProcessInfo.processInfo.environment["CHEFER_VZ_DYNAMIC_RESOLUTION"] == "1"
 if guiMode {
     let gpu = VZVirtioGraphicsDeviceConfiguration()
     gpu.scanouts = [
@@ -431,19 +443,24 @@ if guiMode {
     view.virtualMachine = vm
     view.autoresizingMask = [.width, .height]
 
-    // 視窗預設 1:1 scanout 尺寸。動態解析度（DESIGN ④「縮放」）：macOS 14+ 的
-    // VZVirtualMachineView 支援 automaticallyReconfiguresDisplay——使用者調整視窗
-    // 尺寸時由 VZ 對 guest 的 virtio-gpu 發顯示重組態，guest DRM hotplug 換模式、
-    // cage/wlroots 跟隨新 output 尺寸 → 開放 .resizable。macOS 13 無此 API，
-    // 維持固定尺寸（resize 只會縮放失真，故不開）。
+    // 視窗以「點」開 guiW×guiH、scanout 同為 guiW×guiH → guest 內容尺寸與一般視窗
+    // 一致（Retina 上由 view 2× 放大，略軟但游標/UI 大小正確）。預設
+    // automaticallyReconfiguresDisplay **關**：view 縮放跟隨視窗（拖拉即時跟手）——
+    // guest 的 cage 不跟模式變更，開了反而畫面尺寸不同步、且內容縮成一半（實測）。
+    // CHEFER_VZ_DYNAMIC_RESOLUTION=1 + macOS 14+ 才走真動態解析度。
     let window = NSWindow(
         contentRect: NSRect(x: 0, y: 0, width: CGFloat(guiW), height: CGFloat(guiH)),
-        styleMask: [.titled, .closable, .miniaturizable],
+        styleMask: [.titled, .closable, .miniaturizable, .resizable],
         backing: .buffered,
         defer: false)
-    if #available(macOS 14.0, *) {
+    if #available(macOS 14.0, *), dynamicResolution {
         view.automaticallyReconfiguresDisplay = true
-        window.styleMask.insert(.resizable)
+    } else {
+        // guest 不 re-modeset（cage 固定模式）→ view 等比縮放；視窗內容區若偏離 guest
+        // 的長寬比會 letterbox 出黑邊（實測：拖到近全螢幕時標題列/選單列吃掉高度、比例
+        // 跑掉）。鎖定內容區長寬比＝guest 比例，拖拉永遠無縫。真動態解析度模式下不鎖
+        // （guest 會跟著換模式，自由比例才有意義）。
+        window.contentAspectRatio = NSSize(width: CGFloat(guiW), height: CGFloat(guiH))
     }
     window.title = guiTitle
     window.contentView = view

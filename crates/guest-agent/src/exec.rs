@@ -246,6 +246,37 @@ fn build_plan(spec: &SpawnSpec) -> Result<ChildPlan> {
         });
     }
 
+    // DNS：容器 rootfs 沒有 Docker daemon 幫忙注入 /etc/resolv.conf（alpine 等基底 image
+    // 也不自帶），服務內任何 hostname 解析都會倒在預設的 127.0.0.1:53 → 直接失敗。
+    // 比照 Docker：把執行環境（VM root / 原生 host）的 /etc/resolv.conf 注入容器。
+    // 兩個坑決定了做法「fork 前實體化內容到 temp 檔，再 bind 那個檔」：
+    // - 不能 fork 前直接寫進 spec.rootfs——rootfs 的 overlay 是孫行程在自己的 mount ns
+    //   內才蓋上去的，先寫會被 overlay 遮住；bind 在 overlay 之後套用才可見。
+    // - 不能直接 bind /etc/resolv.conf——VM 後端（vz/QEMU/WHP）的 appliance init 把它
+    //   symlink 到 /proc/net/pnp，而孫行程 bind 時已 setns 進 app netns，/proc/net 是
+    //   該 netns 的視圖、pnp 不存在 → ENOENT。故在此（root netns）先讀出內容寫成一般檔案。
+    // image 自帶的 resolv.conf 一律被蓋掉（通常是 build 環境殘留，如 Docker 內嵌的
+    // 127.0.0.11）；執行環境沒有該檔或內容為空時不注入、維持原狀。
+    if let Ok(dns) = fs::read_to_string("/etc/resolv.conf")
+        && !dns.trim().is_empty()
+    {
+        let staged =
+            std::env::temp_dir().join(format!("chefer-resolv-{}-{}", std::process::id(), svc.name));
+        match fs::write(&staged, &dns) {
+            Ok(()) => binds.push(BindEntry {
+                host: staged,
+                target: join_guest(spec.rootfs, "/etc/resolv.conf")?,
+                read_only: false,
+                is_dir: false,
+            }),
+            Err(e) => eprintln!(
+                "[guest-agent] service `{}`: could not stage /etc/resolv.conf for the container ({e}); \
+                 name resolution inside the service may fail",
+                svc.name
+            ),
+        }
+    }
+
     // GPU passthrough（opt-in per-service `gpu: true`；見 docs/DESIGN.md「GPU passthrough」）。
     // 只在能實際觸及 host GPU 的後端可行（原生 Linux / WSL2）；WHP/vz VM 明確報錯，
     // 不靜默綁到 virtio-gpu 的 2D `/dev/dri`。探測到的節點/libs 以既有 bind 流程套用

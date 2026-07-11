@@ -122,6 +122,17 @@ if [ ! -e /dev/net/tun ]; then
 fi
 chmod 0666 /dev/net/tun 2>/dev/null || true
 
+# DNS：kernel ipconfig 把 nameserver 放在 /proc/net/pnp、不會自己寫 /etc/resolv.conf——
+# 比照慣例接上 symlink。guest-agent 會把這份 resolv.conf 的內容注入各服務的容器 rootfs
+# （等價於 Docker 對容器注入 resolv.conf；見 exec.rs）。三條 VM 路徑同一機制：
+# vz/QEMU 用 `ip=dhcp`（nameserver 來自 DHCP：VZ NAT gateway / slirp 10.0.2.3）；
+# WHP 的靜態 `ip=` 也會建 /proc/net/pnp，nameserver 來自 cmdline 的 dns0 欄
+# （=10.0.2.3，helper 的 DNS pivot；見 vmm-backend whp_util::kernel_command_line）。
+if [ ! -s /etc/resolv.conf ] && [ -f /proc/net/pnp ]; then
+  mkdir -p /etc
+  ln -sf /proc/net/pnp /etc/resolv.conf 2>/dev/null || true
+fi
+
 machine="$(uname -m)"
 case "$machine" in
   x86_64) arch="x86_64" ;;
