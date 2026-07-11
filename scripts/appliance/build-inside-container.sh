@@ -88,9 +88,10 @@ enable_kernel_options() {
 
 build_initramfs() {
   local root="$1"
+  local busybox="$2"
   rm -rf "$root"
   mkdir -p "$root"/{bin,dev,proc,sys,run,tmp,mnt,dev/pts,dev/shm}
-  cp /bin/busybox "$root/bin/busybox"
+  cp "$busybox" "$root/bin/busybox"
   # Windows checkout 可能把 /init 轉成 CRLF；kernel 解析 shebang 時會把 \r
   # 當成 interpreter 路徑的一部分，導致 PID 1 以 127 直接結束。
   sed 's/\r$//' /src/scripts/appliance/init >"$root/init"
@@ -123,6 +124,29 @@ main() {
   fi
 
   mkdir -p /work "$CHEFER_APPLIANCE_OUT"
+
+  # initramfs 內的 busybox 必須是「目標」架構——kernel 有 CROSS_COMPILE，busybox 也要跟著換。
+  # 直接抄容器自己的 /bin/busybox 在交叉建置（如 x86_64 容器建 aarch64 appliance）會產出
+  # exec /init 即 ENOEXEC 的開不了機 initramfs（實體 Mac 驗證時踩到）。Debian 主 archive
+  # 本身就是 multiarch：加目標架構後用 apt-get download 取 busybox-static，不安裝（避免與
+  # 容器架構的 busybox-static 衝突），dpkg-deb -x 解出靜態 binary 即可。
+  local deb_arch busybox_path
+  case "$CHEFER_APPLIANCE_ARCH" in
+    x86_64) deb_arch="amd64" ;;
+    aarch64) deb_arch="arm64" ;;
+  esac
+  if [[ "$deb_arch" == "$(dpkg --print-architecture)" ]]; then
+    busybox_path="/bin/busybox"
+  else
+    note "交叉建置：下載 ${deb_arch} 的 busybox-static（initramfs 用）"
+    dpkg --add-architecture "$deb_arch"
+    apt-get update
+    (cd /work && apt-get download "busybox-static:${deb_arch}")
+    dpkg-deb -x /work/busybox-static_*_"${deb_arch}".deb "/work/busybox-${deb_arch}"
+    busybox_path="/work/busybox-${deb_arch}/bin/busybox"
+    [[ -f "$busybox_path" ]] || die "無法取得 ${deb_arch} 的 busybox-static"
+  fi
+
   note "clone Linux ${CHEFER_LINUX_REF}（來源：${CHEFER_LINUX_REPO}）"
   git clone --depth 1 --branch "$CHEFER_LINUX_REF" "$CHEFER_LINUX_REPO" /work/linux
   cd /work/linux
@@ -155,10 +179,12 @@ main() {
 
   local kernel_out="$CHEFER_APPLIANCE_OUT/chefer-vmlinuz-${CHEFER_APPLIANCE_ARCH}"
   local initramfs_out="$CHEFER_APPLIANCE_OUT/chefer-initramfs-${CHEFER_APPLIANCE_ARCH}"
-  cp "$image_path" "$kernel_out"
+  # --sparse=never：/out 可能是 virtiofs（OrbStack/Lima 的 Docker 掛 host 目錄），
+  # 不支援 FALLOC_FL_PUNCH_HOLE，GNU cp 的 sparse 偵測會以 EINVAL 失敗。
+  cp --sparse=never "$image_path" "$kernel_out"
 
   note "產生 initramfs"
-  build_initramfs /work/initramfs-root >"$initramfs_out"
+  build_initramfs /work/initramfs-root "$busybox_path" >"$initramfs_out"
 
   local linux_commit
   linux_commit="$(git rev-parse HEAD)"
