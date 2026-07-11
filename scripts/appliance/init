@@ -1,7 +1,11 @@
 #!/bin/busybox sh
 set -eu
 
-PATH=/bin:/sbin:/usr/bin:/usr/sbin
+# 必須 export：kernel 給 PID 1 的環境沒有 PATH，不 export 的話 guest-agent 及其子行程
+# 拿不到 PATH——它以 PATH 尋找 GUI overlay 的工具（wl-copy/wlr-randr），沒 PATH 會全部
+# 「not found」而靜默停用剪貼簿與動態解析度（實機 vz 抓到；guest-agent 的 which() 另有
+# 預設路徑退路，讓舊 initramfs 也能運作）。
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 /bin/busybox --install -s /bin >/dev/null 2>&1 || true
 
 mountpoint() {
