@@ -44,7 +44,7 @@ swiftc -O -target "$swift_target" -framework Virtualization \
   -o "$bin" "$root/vz-helper/main.swift"
 
 identity="${CHEFER_CODESIGN_IDENTITY:--}"
-echo "==> codesign（identity: $identity）+ virtualization entitlement"
+echo "==> codesign（identity: ${identity}）+ virtualization entitlement"
 codesign --force --options runtime \
   --entitlements "$root/vz-helper/vz-helper.entitlements" \
   --sign "$identity" "$bin"
