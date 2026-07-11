@@ -5,6 +5,11 @@
 // （hvc0）接到本程序 stdout。guest 內 appliance init 會在 console 印出 CHEFER_GUEST_IP / CHEFER_GUEST_EXIT
 // 標記，由 chefer-runtime 解析（見 docs/DESIGN.md macOS（vz）節）。
 //
+// stdin 契約（liveness）：stdin 同時是 guest console（hvc0）輸入與存活通道——vz.rs 以
+// piped stdin spawn 並握住寫端，本程式讀到 **stdin EOF 即自我了結**（VM 在行程內，exit
+// 即拆 VM）。這讓 runtime 被單發 SIGINT/SIGTERM/SIGKILL（非終端 Ctrl+C 的整組訊號）時
+// helper/VM 不會殘留。手動測試時請保持 stdin 開啟（`< /dev/null` 會立即結束）。
+//
 // GUI 模式（`--gui`，DESIGN §6「macOS GUI」分期 ③④）：VM 組態加 virtio-gpu scanout +
 // USB 鍵盤/絕對座標指標，開一個 AppKit 視窗承載 `VZVirtualMachineView`（VZ 自動把顯示與
 // 鍵鼠 HID 接進 guest；guest 側 cage overlay 與 WHP 完全共用）。**關窗 = app 結束**（與 WHP
@@ -117,13 +122,33 @@ config.cpuCount = cpus
 config.memorySize = memMib * 1024 * 1024
 
 // guest 序列 console（kernel 視為 hvc0）：
-//  - 無頭：寫出 → 本程序 stdout（zero-copy 直通）；讀入 ← stdin。
+//  - 無頭：寫出 → 本程序 stdout（zero-copy 直通）；讀入 ← stdin（經下方 relay）。
 //  - GUI：寫出 → 內部 pipe（tee 執行緒轉發到 stdout **同時**掃 CHEFER_GUEST_IP 標記，
 //    取得 guest IP 後才能起剪貼簿同步——runtime 端讀我們的 stdout 解析標記，直通不變）。
+//
+// stdin 不能直接交給 VZ 讀：本程式需要「讀到 stdin EOF」作為 chefer-runtime 行程死亡的
+// 訊號（見檔頭 stdin 契約；runtime 被單發 SIGINT/SIGTERM/SIGKILL 時 helper 收不到訊號，
+// 實機曾因此殘留 VM 吃 CPU）。讀 stdin 的只能有一個，故由專屬執行緒代讀、轉進內部
+// pipe 餵 VZ serial（console 輸入路徑不變，多一跳 copy 對鍵盤輸入無感），EOF 即收攤。
+let stdinRelayPipe = Pipe()
+let stdinWatchThread = Thread {
+    let src = FileHandle.standardInput
+    let dst = stdinRelayPipe.fileHandleForWriting
+    while true {
+        let chunk = src.availableData
+        if chunk.isEmpty { break } // EOF：runtime 行程已死（或明確關閉 stdin）
+        do { try dst.write(contentsOf: chunk) } catch { break } // 讀端沒了 → 一樣收攤
+    }
+    ewrite("chefer-vz-helper: stdin closed (chefer-runtime is gone); shutting down\n")
+    exit(0) // VM 在行程內，exit 即拆 VM；此時 runtime 已死，exit code 無人讀取
+}
+stdinWatchThread.name = "chefer-stdin-watch"
+stdinWatchThread.start()
+
 let consolePipe: Pipe? = guiMode ? Pipe() : nil
 let serial = VZVirtioConsoleDeviceSerialPortConfiguration()
 serial.attachment = VZFileHandleSerialPortAttachment(
-    fileHandleForReading: FileHandle.standardInput,
+    fileHandleForReading: stdinRelayPipe.fileHandleForReading,
     fileHandleForWriting: consolePipe?.fileHandleForWriting ?? FileHandle.standardOutput)
 config.serialPorts = [serial]
 
@@ -184,6 +209,11 @@ final class ClipboardHost {
     private var suppressChangeCount = -1
     private var lastSeenChangeCount: Int
     private var timer: DispatchSourceTimer?
+    /// connect() 每次遞增；讓 .waiting 的逾時回呼辨識「還是不是同一條連線」。
+    private var generation = 0
+    /// 同一條連線只排一次 .waiting 逾時（.waiting 可能因錯誤變化多次觸發）。
+    private var waitingRetryArmed = false
+    private static var warnedLocalNetwork = false
 
     init(guestIP: String, token: String) {
         self.host = NWEndpoint.Host(guestIP)
@@ -201,6 +231,9 @@ final class ClipboardHost {
     }
 
     private func connect() {
+        generation += 1
+        waitingRetryArmed = false
+        let gen = generation
         let c = NWConnection(host: host, port: port, using: .tcp)
         conn = c
         ready = false
@@ -221,6 +254,22 @@ final class ClipboardHost {
                     self.receiveHeader()
                     self.startWatcher()
                 })
+            case .waiting(let err):
+                // 實機發現：對 guest:55381 的連線偶發卡在 .waiting 數十秒或永不成功
+                // （同一時間 shell 的 nc 可秒連）——疑為 macOS「區域網路」隱私權對
+                // ad-hoc 簽章 helper 的閘門。此狀態以前落在 default 分支完全靜默，
+                // 剪貼簿「就是不動」無從排查。現在：印一次性 stderr 提示引導放行，
+                // 並在 3 秒仍未 ready 時棄掉這條連線重連（新連線常可立即成功）。
+                self.tracef("connection waiting: \(err)")
+                ClipboardHost.warnLocalNetworkOnce(err)
+                if !self.waitingRetryArmed {
+                    self.waitingRetryArmed = true
+                    self.queue.asyncAfter(deadline: .now() + 3) { [weak self] in
+                        guard let self, self.generation == gen, !self.ready else { return }
+                        self.tracef("still waiting after 3s; dropping the connection and retrying")
+                        self.reconnect()
+                    }
+                }
             case .failed(let err):
                 self.tracef("connection failed: \(err); retrying in 1s")
                 self.reconnect()
@@ -234,10 +283,28 @@ final class ClipboardHost {
     }
 
     private func reconnect() {
+        // 多個失敗路徑（send/receive 錯誤、.failed、.waiting 逾時）可能對同一條連線
+        // 各觸發一次——conn 已被清掉代表重連在途，去重以免疊出多條並行連線。
+        guard let c = conn else { return }
         ready = false
-        conn?.cancel()
+        c.cancel()
         conn = nil
         queue.asyncAfter(deadline: .now() + 1) { [weak self] in self?.connect() }
+    }
+
+    /// 區域網路隱私權提示：一個行程只印一次（不 gated on CHEFER_CLIP_TRACE——這是
+    /// 使用者可行動的排查線索，靜默時幾乎無從發現）。
+    private static func warnLocalNetworkOnce(_ err: NWError) {
+        guard !warnedLocalNetwork else { return }
+        warnedLocalNetwork = true
+        ewrite(
+            "chefer-vz-helper: clipboard sync to the guest is stuck in 'waiting' (\(err)). "
+                + "This is usually macOS Local Network privacy blocking the connection - open "
+                + "System Settings > Privacy & Security > Local Network and enable the app that "
+                + "launched this program (e.g. your terminal). A helper signed with a stable "
+                + "identity (CHEFER_CODESIGN_IDENTITY in scripts/build-vz-helper.sh) lets macOS "
+                + "remember the grant. Clipboard sync keeps retrying; the app itself is unaffected.\n"
+        )
     }
 
     /// 讀 5-byte 標頭（1 kind + 4 BE len），再讀 payload；EOF/錯誤 → 重連。
