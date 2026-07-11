@@ -12,7 +12,13 @@ tar = "0.4.46"
 
 [target."cfg(windows)".dependencies]
 tempfile = "3.27.0"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    # WHP helper 防孤兒：KILL_ON_JOB_CLOSE Job Object（whp.rs，DESIGN §6「Helper 生命週期」）。
+    "Win32_System_JobObjects",
+] }
 
 [dev-dependencies]
 serde_json = "1.0.145"

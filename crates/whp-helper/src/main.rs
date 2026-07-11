@@ -64,7 +64,38 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<(), String> {
     }
 
     let request = HelperRequest::parse(args)?;
+
+    // stdin liveness（防孤兒 ②，與 vz-helper 同契約；DESIGN §6 whp「Helper 生命週期」）：
+    // chefer-runtime 以 piped stdin spawn 本程式並讓寫端 fd 隨其行程存亡——runtime 無論
+    // 怎麼死（taskkill、當機、正常結束）OS 都會關 fd，這裡讀到 EOF 即自我了結（VM 在
+    // 本行程內，exit 即拆）。WHP 的 guest console（ttyS0）無輸入路徑（serial.rs 僅 TX），
+    // 讀到的資料直接丟棄；未來若接 console 輸入，這條執行緒就是轉發點。僅 boot 模式
+    // 安裝——--preflight/--gui-selftest 由 `.output()` 驅動（stdin 立即 EOF），裝了會
+    // 誤殺；手動在終端跑 helper 時 stdin 是 console、不會 EOF，行為不變。cfg(not(test))：
+    // 單元測試走進 run() 時不得讀走測試行程的 stdin（cargo test 下常已關閉→立即 EOF
+    // →誤殺整個測試行程）。
+    #[cfg(not(test))]
+    std::thread::spawn(|| {
+        drain_until_eof(std::io::stdin().lock());
+        eprintln!("chefer-whp-helper: stdin closed (chefer-runtime is gone); shutting down");
+        std::process::exit(0);
+    });
+
     run_boot(request)
+}
+
+/// 讀 `reader` 直到 EOF，資料一律丟棄；`Interrupted` 重試，其他讀取錯誤視同 EOF
+///（stdin 壞掉時同樣不能再當存活訊號）。回傳＝寫端已全數消失。
+fn drain_until_eof(mut reader: impl std::io::Read) {
+    let mut buf = [0u8; 1024];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => return,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return,
+        }
+    }
 }
 
 fn print_help() {
@@ -3282,5 +3313,52 @@ mod tests {
         let args = vec!["--preflight".to_string(), "--cpus".to_string()];
         let err = run_preflight(args).unwrap_err();
         assert!(err.contains("--cpus requires a value"));
+    }
+
+    // --- stdin liveness（drain_until_eof，DESIGN §6 whp「Helper 生命週期」）---
+
+    /// 先 Interrupted、再給資料、最後 EOF 的 reader——鎖住「Interrupted 重試、
+    /// 資料丟棄、EOF 才返回」的契約。
+    struct FlakyReader {
+        interrupts_left: u32,
+        data_left: usize,
+    }
+
+    impl std::io::Read for FlakyReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.interrupts_left > 0 {
+                self.interrupts_left -= 1;
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
+            if self.data_left == 0 {
+                return Ok(0); // EOF
+            }
+            let n = self.data_left.min(buf.len());
+            self.data_left -= n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn drain_until_eof_retries_interrupted_and_returns_on_eof() {
+        // 返回本身就是斷言：Interrupted 沒把它打斷、資料沒被當 EOF 提早返回、
+        // EOF 後不再讀（卡住則測試逾時失敗）。
+        drain_until_eof(FlakyReader {
+            interrupts_left: 3,
+            data_left: 8192,
+        });
+        drain_until_eof(std::io::empty()); // 空輸入：立即 EOF
+    }
+
+    #[test]
+    fn drain_until_eof_treats_read_errors_as_eof() {
+        struct BrokenReader;
+        impl std::io::Read for BrokenReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+        }
+        // 讀取錯誤視同 EOF：返回而非無窮重試。
+        drain_until_eof(BrokenReader);
     }
 }
