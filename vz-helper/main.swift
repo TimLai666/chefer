@@ -111,6 +111,22 @@ if let token = clipToken {
     cmdline += " chefer.clip_token=\(token) chefer.clip_port=\(CLIP_PORT)"
 }
 
+// 動態解析度 opt-in（macOS 14+ 才生效；預設取捨見下方 GUI 組態註解與 DESIGN §6 ④）。
+let dynamicResolution =
+    ProcessInfo.processInfo.environment["CHEFER_VZ_DYNAMIC_RESOLUTION"] == "1"
+
+// HiDPI（動態解析度模式限定）：automaticallyReconfiguresDisplay 推給 guest 的是
+// Retina「實體像素」尺寸，Linux guest 無 HiDPI 概念 → UI/游標縮半。把開機當下螢幕的
+// backingScaleFactor 附進 cmdline（同 clip_token 作法），guest-agent 的 resize watcher
+// 據此對 cage 設 wlr-output-management 的 output scale——邏輯尺寸回到「點」數。
+// 視窗跨螢幕拖移造成的 scale 變化暫不追蹤（恆用開機值）。
+if #available(macOS 14.0, *), guiMode, dynamicResolution {
+    let scale = (NSScreen.main ?? NSScreen.screens.first)?.backingScaleFactor ?? 1.0
+    if scale > 1.0 {
+        cmdline += " chefer.gui_scale=\(String(format: "%g", scale))"
+    }
+}
+
 // --- 組態 ---
 let bootLoader = VZLinuxBootLoader(kernelURL: URL(fileURLWithPath: kernelPath))
 bootLoader.initialRamdiskURL = URL(fileURLWithPath: initramfsPath)
@@ -176,16 +192,16 @@ config.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfigurati
 //
 // 動態解析度開關（實體 Mac 實測後的取捨）：guest 的 cage kiosk compositor 啟動後
 // **不跟隨**模式變更（見 DESIGN §6 ④）——此時開 automaticallyReconfiguresDisplay 反而
-// 讓 view 停止縮放、等一個永遠不會來的 guest re-modeset，拖拉視窗時畫面尺寸不同步。
-// 且它推給 guest 的是 Retina **實體像素**尺寸（點 ×2），Linux guest 無 HiDPI 概念、
-// cage 也設不了 output scale → 游標與 UI 內容都只剩一半大（實測使用者直接抱怨）。
+// 讓 view 停止縮放、等一個不會自己來的 guest re-modeset，拖拉視窗時畫面尺寸不同步。
+// 且它推給 guest 的是 Retina **實體像素**尺寸（點 ×2），Linux guest 無 HiDPI 概念
+// → 游標與 UI 內容都只剩一半大（實測使用者直接抱怨）。
 // 故預設：scanout = 視窗「點」數（guest 看到 WxH 的螢幕、內容尺寸與一般視窗一致），
 // automaticallyReconfiguresDisplay 關、由 view 縮放（Retina 上 2× 放大，略軟但尺寸正確；
-// 拖拉視窗即時跟手）。等 guest compositor 支援 re-modeset ＋ HiDPI output scale 後，
-// 以 CHEFER_VZ_DYNAMIC_RESOLUTION=1 切回真動態解析度（macOS 14+）。
+// 拖拉視窗即時跟手）。CHEFER_VZ_DYNAMIC_RESOLUTION=1（macOS 14+）切真動態解析度：
+// guest 側 re-modeset 由 guest-agent resize watcher 補上、UI 縮半由上面的
+// chefer.gui_scale → output scale 補上——Xwayland 品質/輸入座標/xdpyinfo 實機驗證
+// 通過後再評估翻預設（DESIGN §6 ④）。
 let (guiW, guiH) = guiSize()
-let dynamicResolution =
-    ProcessInfo.processInfo.environment["CHEFER_VZ_DYNAMIC_RESOLUTION"] == "1"
 if guiMode {
     let gpu = VZVirtioGraphicsDeviceConfiguration()
     gpu.scanouts = [
@@ -545,7 +561,8 @@ if guiMode {
     // view 尺寸變更後的下游與使用者拖拉完全相同（automaticallyReconfiguresDisplay →
     // VZ 對 guest virtio-gpu 重組態 → guest-agent resize watcher 讓 cage re-modeset），
     // 讓沒有 Accessibility 權限的自動化環境也能驗證整條鏈。W/H 為 point，Retina 下
-    // guest 實際拿到的是像素尺寸（×backingScaleFactor）。
+    // guest 實際拿到的是像素尺寸（×backingScaleFactor）；guest 端 output scale
+    // （chefer.gui_scale）會把邏輯尺寸縮回點數（xdpyinfo 應回報 WxH 而非像素尺寸）。
     if #available(macOS 14.0, *), dynamicResolution,
         let spec = ProcessInfo.processInfo.environment["CHEFER_VZ_GUI_TEST_RESIZE"]
     {

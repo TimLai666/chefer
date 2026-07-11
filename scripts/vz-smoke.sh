@@ -201,14 +201,19 @@ YML
     [ ] 滑鼠移動/點擊、鍵盤輸入進得了 guest（HID）
     [ ] host 複製文字 → guest 內可貼上；guest 複製 → host 可貼上（剪貼簿，含 PNG 圖）
     [ ] 關窗 → app 乾淨結束、行程退出（關窗 = app 結束語意）
-    [ ] 動態解析度（opt-in，macOS 14+；guest 側 re-modeset 由 guest-agent resize watcher
-        提供，需上面 3b/5 的新 overlay）——本清單跑完後另跑：
+    [ ] 動態解析度 + HiDPI scale（opt-in，macOS 14+；guest 側 re-modeset 與 output scale
+        由 guest-agent resize watcher 提供，需上面 3b/5 的新 overlay）——本清單跑完後另跑：
           CHEFER_VZ_EXPERIMENTAL=1 CHEFER_VZ_DYNAMIC_RESOLUTION=1 \
             CHEFER_VZ_GUI_TEST_RESIZE=20:1100x700 <同一個單檔>
-        20 秒後視窗自動縮放（與手動拖拉同路徑），console 應出現
-        「gui: resize: Virtual-1 -> 2200x1400」（Retina 2x）且畫面重排非拉伸。
-    （預設模式的拖拉=view 等比縮放、不 re-modeset——預設取捨見 DESIGN §6 ④：
-      Retina 像素模式下 Linux guest 無 HiDPI output scale，UI 會縮半。）
+        開機後 console 應出現「gui: resize: Virtual-1 output scale -> 2」（Retina 2x；
+        helper 經 kernel cmdline chefer.gui_scale 傳入），20 秒後視窗自動縮放（與手動
+        拖拉同路徑），console 應出現「gui: resize: Virtual-1 -> 2200x1400 (scale 2)」
+        且畫面重排非拉伸。逐項檢核（DESIGN §6 ④「待實機驗證」三變因）：
+        [ ] 游標與 UI 尺寸正常、非縮半（output scale 生效的直接證據）
+        [ ] guest 內 xdpyinfo 回報「邏輯」尺寸（縮放後應為 1100x700，非 2200x1400）
+        [ ] X11 app 畫質可接受（scale-1 X11 surface 由 compositor 放大）＋點擊落點準確
+    （預設模式的拖拉=view 等比縮放、不 re-modeset——預設取捨見 DESIGN §6 ④；
+      上列 HiDPI 檢核全數通過後，依 DESIGN 評估把動態解析度翻成預設。）
 CHECK
   CHEFER_VZ_EXPERIMENTAL=1 "$work/dist/vz-gui-smoke/vz-gui-smoke_${arch}-apple-darwin" --extract-dir "$work/extract-gui"
   note "GUI app 已結束（exit $?）——請依上方清單回填結果"
