@@ -111,9 +111,17 @@ if let token = clipToken {
     cmdline += " chefer.clip_token=\(token) chefer.clip_port=\(CLIP_PORT)"
 }
 
-// 動態解析度 opt-in（macOS 14+ 才生效；預設取捨見下方 GUI 組態註解與 DESIGN §6 ④）。
-let dynamicResolution =
-    ProcessInfo.processInfo.environment["CHEFER_VZ_DYNAMIC_RESOLUTION"] == "1"
+// 動態解析度：macOS 14+ **預設開**（實機驗證通過後翻預設，DESIGN §6 ④——guest 側
+// re-modeset 與 HiDPI output scale 均由 guest-agent resize watcher 提供）。
+// CHEFER_VZ_DYNAMIC_RESOLUTION=0 退回 view 等比縮放——保底用（例如手動搭配舊 overlay
+// （cage <0.2.0，無 wlr-output-management）的 kit；正常 kit 的 overlay 與 helper 同版
+// 出貨不會有此組合）。macOS 13 無 automaticallyReconfiguresDisplay，恆走 view 縮放。
+let dynamicResolution: Bool = {
+    if #available(macOS 14.0, *) {
+        return ProcessInfo.processInfo.environment["CHEFER_VZ_DYNAMIC_RESOLUTION"] != "0"
+    }
+    return false
+}()
 
 // HiDPI（動態解析度模式限定）：automaticallyReconfiguresDisplay 推給 guest 的是
 // Retina「實體像素」尺寸，Linux guest 無 HiDPI 概念 → UI/游標縮半。把開機當下螢幕的
@@ -190,17 +198,15 @@ config.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfigurati
 // GUI：virtio-gpu 一個 scanout + USB 鍵盤 + 絕對座標指標（VZVirtualMachineView 自動把
 // HID 事件轉進這些裝置；絕對座標同 WHP 的 tablet 選擇，避免滑鼠捕捉問題）。
 //
-// 動態解析度開關（實體 Mac 實測後的取捨）：guest 的 cage kiosk compositor 啟動後
-// **不跟隨**模式變更（見 DESIGN §6 ④）——此時開 automaticallyReconfiguresDisplay 反而
-// 讓 view 停止縮放、等一個不會自己來的 guest re-modeset，拖拉視窗時畫面尺寸不同步。
-// 且它推給 guest 的是 Retina **實體像素**尺寸（點 ×2），Linux guest 無 HiDPI 概念
-// → 游標與 UI 內容都只剩一半大（實測使用者直接抱怨）。
-// 故預設：scanout = 視窗「點」數（guest 看到 WxH 的螢幕、內容尺寸與一般視窗一致），
-// automaticallyReconfiguresDisplay 關、由 view 縮放（Retina 上 2× 放大，略軟但尺寸正確；
-// 拖拉視窗即時跟手）。CHEFER_VZ_DYNAMIC_RESOLUTION=1（macOS 14+）切真動態解析度：
-// guest 側 re-modeset 由 guest-agent resize watcher 補上、UI 縮半由上面的
-// chefer.gui_scale → output scale 補上——Xwayland 品質/輸入座標/xdpyinfo 實機驗證
-// 通過後再評估翻預設（DESIGN §6 ④）。
+// 動態解析度為 macOS 14+ 預設（實機驗證後定案，DESIGN §6 ④）：
+// automaticallyReconfiguresDisplay 把視窗 backing 像素尺寸推進 guest，guest-agent 的
+// resize watcher 讓 cage re-modeset 跟隨、並依上面的 chefer.gui_scale 設 output scale
+// （Retina 實體像素模式下邏輯尺寸回到「點」數，游標/UI 尺寸正常）——比例自由、無
+// letterbox（拖拉中的細黑邊為 debounce 前的暫態）。實機檢核（游標/UI 尺寸、座標映射、
+// Xwayland 畫質、xdpyinfo 邏輯尺寸）2026-07 全數通過。
+// CHEFER_VZ_DYNAMIC_RESOLUTION=0（或 macOS 13）退回舊取捨：scanout=視窗「點」數、
+// automaticallyReconfiguresDisplay 關、view 等比縮放＋鎖長寬比（Retina 上 2× 放大略軟
+// 但尺寸正確）——guest 不 re-modeset（如舊 overlay 的 cage <0.2.0）時的保底。
 let (guiW, guiH) = guiSize()
 if guiMode {
     let gpu = VZVirtioGraphicsDeviceConfiguration()
@@ -526,11 +532,10 @@ if guiMode {
     view.virtualMachine = vm
     view.autoresizingMask = [.width, .height]
 
-    // 視窗以「點」開 guiW×guiH、scanout 同為 guiW×guiH → guest 內容尺寸與一般視窗
-    // 一致（Retina 上由 view 2× 放大，略軟但游標/UI 大小正確）。預設
-    // automaticallyReconfiguresDisplay **關**：view 縮放跟隨視窗（拖拉即時跟手）——
-    // guest 的 cage 不跟模式變更，開了反而畫面尺寸不同步、且內容縮成一半（實測）。
-    // CHEFER_VZ_DYNAMIC_RESOLUTION=1 + macOS 14+ 才走真動態解析度。
+    // 視窗以「點」開 guiW×guiH（scanout 初值同尺寸）。動態解析度（macOS 14+ 預設）：
+    // automaticallyReconfiguresDisplay 開機即把 backing 像素尺寸推進 guest、拖拉時
+    // re-modeset 跟隨（guest 側 watcher + chefer.gui_scale，見上）。opt-out（=0 或
+    // macOS 13）：automaticallyReconfiguresDisplay 關、view 等比縮放＋鎖長寬比。
     let window = NSWindow(
         contentRect: NSRect(x: 0, y: 0, width: CGFloat(guiW), height: CGFloat(guiH)),
         styleMask: [.titled, .closable, .miniaturizable, .resizable],
