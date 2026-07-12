@@ -208,9 +208,9 @@ YML
         開機後 console 應出現「gui: resize: Virtual-1 output scale -> 2」（Retina 2x；
         helper 經 kernel cmdline chefer.gui_scale 傳入），20 秒後視窗自動縮放（與手動
         拖拉同路徑），console 應出現「gui: resize: Virtual-1 -> 2200x1400 (scale 2)」
-        且畫面重排非拉伸。逐項檢核（DESIGN §6 ④「待實機驗證」三變因）：
+        且畫面重排非拉伸。逐項檢核（DESIGN §6 ④；xdpyinfo 邏輯尺寸鏈已於
+        2026-07-12 實機自動驗證通過（開機 1280x800、縮放後 1100x700），此處驗目測項）：
         [ ] 游標與 UI 尺寸正常、非縮半（output scale 生效的直接證據）
-        [ ] guest 內 xdpyinfo 回報「邏輯」尺寸（縮放後應為 1100x700，非 2200x1400）
         [ ] X11 app 畫質可接受（scale-1 X11 surface 由 compositor 放大）＋點擊落點準確
     （預設模式的拖拉=view 等比縮放、不 re-modeset——預設取捨見 DESIGN §6 ④；
       上列 HiDPI 檢核全數通過後，依 DESIGN 評估把動態解析度翻成預設。）
