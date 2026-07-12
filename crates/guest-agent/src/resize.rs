@@ -19,6 +19,14 @@
 //!    模式清單**（wlroots 不會為已連線 connector 更新 wlr_output 的 mode list）。
 //!    cage commit 新模式 → wlr_output_layout 變更 → view 重排滿版，Xwayland root 同步。
 //!
+//! **HiDPI（`chefer.gui_scale=`）**：vz 動態解析度模式推進 guest 的是 Retina **實體像素**
+//! 尺寸，Linux guest 無 HiDPI 概念 → UI/游標縮半。host（vz-helper）把開機當下螢幕的
+//! backingScaleFactor 附進 kernel cmdline，本 watcher 據此對輸出設 wlr-output-management
+//! 的 **output scale**：啟動時先補設一次（開機初始模式就已是像素尺寸、之後未必再有 drm
+//! 事件），此後每次換模式一併重設。邏輯尺寸回到「點」數；X11 surface 由 compositor 放大
+//! （預期視覺等同預設 view-scaling，但比例自由、無 letterbox、游標尺寸正常——待實機驗證）。
+//! 未附此參數（WHP、vz 預設模式）→ 完全不帶 `--scale`，行為與既往相同。
+//!
 //! **為何不是 replug**：曾試「connector 回報 disabled→enabled」模擬拔插，cage 會拆輸出
 //! → 介面 app 退出 → fail_fast 收掉整個 app（見 roadmap M8-d），故必須走「connector
 //! 保持連線、只換模式」的本路線。等 wlroots 0.20 + 對應 cage 進 Alpine 後，cage 會自己
@@ -73,13 +81,21 @@ pub fn maybe_start() -> Option<ResizeWatcher> {
             return None;
         }
     };
+    let scale = read_cmdline_gui_scale();
     let stop = Arc::new(AtomicBool::new(false));
     let stop_c = stop.clone();
     let handle = std::thread::Builder::new()
         .name("chefer-resize".into())
-        .spawn(move || run(sock, stop_c))
+        .spawn(move || run(sock, stop_c, scale))
         .ok()?;
-    crate::gui::note("resize: following host window size (drm uevent -> wlr-output-management)");
+    match scale {
+        Some(s) => crate::gui::note(&format!(
+            "resize: following host window size (drm uevent -> wlr-output-management); HiDPI output scale {s}"
+        )),
+        None => crate::gui::note(
+            "resize: following host window size (drm uevent -> wlr-output-management)",
+        ),
+    }
     Some(ResizeWatcher {
         stop,
         handle: Some(handle),
@@ -87,7 +103,15 @@ pub fn maybe_start() -> Option<ResizeWatcher> {
 }
 
 /// 主迴圈：等 drm change → debounce → probe 新 preferred mode → wlr-randr 套用。
-fn run(sock: OwnedFd, stop: Arc<AtomicBool>) {
+fn run(sock: OwnedFd, stop: Arc<AtomicBool>, scale: Option<f64>) {
+    // HiDPI：開機初始模式就已是 Retina 像素尺寸（vz 於開機即推入、cage 啟動即選中），
+    // 之後未必再有 drm 事件——啟動時就對現行輸出補設 output scale 一次。
+    if let Some(s) = scale {
+        match apply_scale(s) {
+            Ok(output) => crate::gui::note(&format!("resize: {output} output scale -> {s}")),
+            Err(e) => crate::gui::note(&format!("resize: failed to set output scale {s}: {e}")),
+        }
+    }
     // 最近一次成功套用的尺寸：同尺寸不重設（避免無謂 re-modeset 閃爍）。
     let mut last: Option<(u16, u16)> = None;
     let mut failures = 0u32;
@@ -115,11 +139,16 @@ fn run(sock: OwnedFd, stop: Arc<AtomicBool>) {
         if last == Some((w, h)) {
             continue;
         }
-        match apply_mode(w, h) {
+        match apply_mode(w, h, scale) {
             Ok(output) => {
                 last = Some((w, h));
                 failures = 0;
-                crate::gui::note(&format!("resize: {output} -> {w}x{h}"));
+                match scale {
+                    Some(s) => {
+                        crate::gui::note(&format!("resize: {output} -> {w}x{h} (scale {s})"));
+                    }
+                    None => crate::gui::note(&format!("resize: {output} -> {w}x{h}")),
+                }
             }
             Err(e) => {
                 failures += 1;
@@ -134,6 +163,25 @@ fn run(sock: OwnedFd, stop: Arc<AtomicBool>) {
             }
         }
     }
+}
+
+// ---- HiDPI output scale（kernel cmdline）----
+
+/// 從 `/proc/cmdline` 取 host 附上的 `chefer.gui_scale=`（vz 動態解析度模式限定，
+/// 見 vz-helper/main.swift；同 clipboard.rs 讀 clip_token 的模式）。無或無效 → None。
+fn read_cmdline_gui_scale() -> Option<f64> {
+    parse_gui_scale(&std::fs::read_to_string("/proc/cmdline").ok()?)
+}
+
+/// 解析 `chefer.gui_scale=` 值。僅接受 (1.0, 4.0] 的有限值：1 = 不需縮放（省略
+/// `--scale`，與未附參數完全同路徑）；範圍外視為 host 端錯誤——寧可不縮放，也不把
+/// 0/負值/NaN 這類會直接毀掉版面的值餵給 compositor。
+fn parse_gui_scale(cmdline: &str) -> Option<f64> {
+    let v = cmdline
+        .split_whitespace()
+        .find_map(|tok| tok.strip_prefix("chefer.gui_scale="))?;
+    let s: f64 = v.parse().ok()?;
+    (s.is_finite() && s > 1.0 && s <= 4.0).then_some(s)
 }
 
 // ---- kernel uevent（netlink）----
@@ -417,22 +465,53 @@ fn pick_mode(modes: &[DrmModeModeinfo]) -> Option<(u16, u16)> {
 
 // ---- 套用（wlr-randr → wlr-output-management → cage）----
 
-/// 以 custom mode 要求 cage 換到 `w`×`h`（refresh 交給 compositor 預設）。
-/// 回傳套用到的 output 名。
-fn apply_mode(w: u16, h: u16) -> Result<String, String> {
-    // output 名以 compositor 回報為準（kiosk 單輸出；virtio-gpu 下慣例是 Virtual-1，
-    // 但不硬編——從 wlr-randr 列表拿第一個）。
+/// 從 compositor 取輸出名。output 名以 compositor 回報為準（kiosk 單輸出；
+/// virtio-gpu 下慣例是 Virtual-1，但不硬編——從 wlr-randr 列表拿第一個）。
+fn current_output_name() -> Result<String, String> {
     let (stdout, stderr, ok) = run_wlr_randr(&[])?;
     if !ok {
         return Err(format!("wlr-randr list failed: {}", stderr.trim()));
     }
-    let name = first_output_name(&stdout).ok_or("wlr-randr reported no outputs")?;
-    let (_, stderr, ok) =
-        run_wlr_randr(&["--output", &name, "--custom-mode", &format!("{w}x{h}")])?;
+    first_output_name(&stdout).ok_or_else(|| "wlr-randr reported no outputs".to_string())
+}
+
+/// 以 custom mode 要求 cage 換到 `w`×`h`（refresh 交給 compositor 預設）；有 HiDPI
+/// scale 時同一次 apply 一併重設。回傳套用到的 output 名。
+fn apply_mode(w: u16, h: u16, scale: Option<f64>) -> Result<String, String> {
+    let name = current_output_name()?;
+    let args = mode_args(&name, w, h, scale);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (_, stderr, ok) = run_wlr_randr(&args)?;
     if !ok {
         return Err(format!("wlr-randr --custom-mode failed: {}", stderr.trim()));
     }
     Ok(name)
+}
+
+/// 只設 output scale、模式不動（watcher 啟動時對開機初始模式補設用）。回傳 output 名。
+fn apply_scale(scale: f64) -> Result<String, String> {
+    let name = current_output_name()?;
+    let (_, stderr, ok) = run_wlr_randr(&["--output", &name, "--scale", &format!("{scale}")])?;
+    if !ok {
+        return Err(format!("wlr-randr --scale failed: {}", stderr.trim()));
+    }
+    Ok(name)
+}
+
+/// 組「換模式（有 scale 一併設）」的 wlr-randr 引數。`scale=None` → 不帶 `--scale`，
+/// 與既往完全相同（未附 `chefer.gui_scale` 的路徑：WHP、vz 預設模式）。
+fn mode_args(output: &str, w: u16, h: u16, scale: Option<f64>) -> Vec<String> {
+    let mut args = vec![
+        "--output".to_string(),
+        output.to_string(),
+        "--custom-mode".to_string(),
+        format!("{w}x{h}"),
+    ];
+    if let Some(s) = scale {
+        args.push("--scale".to_string());
+        args.push(format!("{s}"));
+    }
+    args
 }
 
 /// 跑 wlr-randr 並回收 (stdout, stderr, 成功與否)。
@@ -538,6 +617,54 @@ mod tests {
             Some((1280, 800))
         );
         assert_eq!(pick_mode(&[m(0, 0, 0)]), None);
+    }
+
+    #[test]
+    fn gui_scale_parse() {
+        // 標準 Retina（2×）與非整數 scale。
+        assert_eq!(parse_gui_scale("quiet chefer.gui_scale=2 ro"), Some(2.0));
+        assert_eq!(parse_gui_scale("chefer.gui_scale=1.5"), Some(1.5));
+        // 1 = 不需縮放 → None（走與未附參數完全相同的路徑）。
+        assert_eq!(parse_gui_scale("chefer.gui_scale=1"), None);
+        assert_eq!(parse_gui_scale("chefer.gui_scale=1.0"), None);
+        // 無參數 / 空值 / 垃圾 → None。
+        assert_eq!(parse_gui_scale("quiet ro"), None);
+        assert_eq!(parse_gui_scale("chefer.gui_scale="), None);
+        assert_eq!(parse_gui_scale("chefer.gui_scale=abc"), None);
+        // 會毀版面的值一律不採：0、負、NaN、inf、超過 4。
+        assert_eq!(parse_gui_scale("chefer.gui_scale=0"), None);
+        assert_eq!(parse_gui_scale("chefer.gui_scale=-2"), None);
+        assert_eq!(parse_gui_scale("chefer.gui_scale=nan"), None);
+        assert_eq!(parse_gui_scale("chefer.gui_scale=inf"), None);
+        assert_eq!(parse_gui_scale("chefer.gui_scale=8"), None);
+        // 與其他 chefer.* cmdline 參數共存。
+        assert_eq!(
+            parse_gui_scale("chefer.clip_token=abc chefer.gui_scale=2 chefer.clip_port=40000"),
+            Some(2.0)
+        );
+    }
+
+    #[test]
+    fn mode_args_scale_flag() {
+        // 無 scale：與既往完全相同的四個引數（WHP / vz 預設模式不受影響）。
+        assert_eq!(
+            mode_args("Virtual-1", 2200, 1400, None),
+            ["--output", "Virtual-1", "--custom-mode", "2200x1400"]
+        );
+        // 有 scale：同一次 apply 一併帶 --scale（模式與 scale 同 commit）。
+        assert_eq!(
+            mode_args("Virtual-1", 2200, 1400, Some(2.0)),
+            [
+                "--output",
+                "Virtual-1",
+                "--custom-mode",
+                "2200x1400",
+                "--scale",
+                "2"
+            ]
+        );
+        // 非整數 scale 維持小數表示（wlr-randr 以 C locale 解析，小數點必為 '.'）。
+        assert_eq!(mode_args("X", 100, 50, Some(1.5))[5], "1.5");
     }
 
     #[test]
