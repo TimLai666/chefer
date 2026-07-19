@@ -7,10 +7,13 @@
 //! 開機由內附的 **Swift helper**（`agents/chefer-vz-helper-<arch>`）驅動：本後端只負責
 //! spawn helper、把它的 stdout（接著 guest 序列 console）串接解析 `CHEFER_GUEST_IP` /
 //! `CHEFER_GUEST_EXIT` 標記，並依 guest IP 起 host→guest 埠轉發。實際的
-//! Virtualization.framework 呼叫全在 helper（Swift）內，僅能在實體 Mac 驗證 VM 真的開得起來。
+//! Virtualization.framework 呼叫全在 helper（Swift）內。
 //!
-//! **誠實回報**：在實機驗證通過前 `availability()` 預設 `Unavailable`，需
-//! `CHEFER_VZ_EXPERIMENTAL=1` 才啟用。
+//! macOS 上 vz 是**唯一**的執行後端，且已於實體 Apple Silicon（macOS 26）完整驗證通過
+//! （2026-07），故不再上實驗性 env 鎖——`availability()` 依真實前提（host arch、bundle
+//! 內嵌 appliance、bundle 內嵌 helper、macOS 13+）決定可用性，缺任一即誠實回報
+//! `Unavailable`。Intel（x86_64）走完全相同的程式路徑（appliance 換 arch），但實機 VZ 開機
+//! 目前僅在 Apple Silicon 驗過（GHA runner 開不了 VZ guest，Intel 亦然）。
 
 use std::io::{BufRead, BufReader};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
@@ -32,17 +35,9 @@ impl ExecBackend for VzBackend {
     }
 
     fn availability(&self, ctx: &AppRunContext) -> Availability {
-        // 實機驗證前預設不可用；需 CHEFER_VZ_EXPERIMENTAL=1 才啟用（誠實不偽稱可執行）。
-        if std::env::var("CHEFER_VZ_EXPERIMENTAL").ok().as_deref() != Some("1") {
-            return Availability::Unavailable(
-                "The macOS (vz) backend is experimental and not yet validated on real hardware. \
-                 To try it on a Mac, set CHEFER_VZ_EXPERIMENTAL=1 (the app must embed a \
-                 chefer-vz-helper signed with the com.apple.security.virtualization entitlement, \
-                 or you can point CHEFER_VZ_HELPER at a locally built one)."
-                    .to_string(),
-            );
-        }
-
+        // 依真實前提決定可用性（host arch、內嵌 appliance、內嵌 helper、macOS 版本）——
+        // 已於 Apple Silicon 實機驗證，不再上實驗性 env 鎖（macOS 上 vz 是唯一後端，
+        // 鎖著等於預設不能跑）。缺任一前提即誠實回報 Unavailable。
         let host_arch = std::env::consts::ARCH;
         let Some(arch) = vz_util::host_guest_arch(host_arch) else {
             return Availability::Unavailable(format!(
