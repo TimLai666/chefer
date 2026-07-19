@@ -22,7 +22,7 @@ bash scripts/vz-smoke.sh --kit-dir <...> --gui
 
 已實作、CI（swiftc 編譯+entitlement 檢查）把關、**但端到端待實機**：
 
-- **vz 開機路徑**（`crates/vmm-backend/src/vz.rs` + `vz-helper/main.swift`）：以 bundle 內嵌 Linux appliance 開一台 micro-VM，virtiofs 共享 bundle/data，guest-agent 在裡面跑；解析 console 的 `CHEFER_GUEST_IP` / `CHEFER_GUEST_EXIT` 標記做埠轉發與 exit code 傳播。實機驗證前 `availability()` 預設不可用，需 `CHEFER_VZ_EXPERIMENTAL=1`。
+- **vz 開機路徑**（`crates/vmm-backend/src/vz.rs` + `vz-helper/main.swift`）：以 bundle 內嵌 Linux appliance 開一台 micro-VM，virtiofs 共享 bundle/data，guest-agent 在裡面跑；解析 console 的 `CHEFER_GUEST_IP` / `CHEFER_GUEST_EXIT` 標記做埠轉發與 exit code 傳播。**已於 2026-07 實機驗證通過，`availability()` 依真實前提決定可用性、無 `CHEFER_VZ_EXPERIMENTAL` env 鎖**（本文件下方仍出現的 `CHEFER_VZ_EXPERIMENTAL=1` 為當時歷史紀錄，現已不需要）。
 - **macOS GUI host 側**（`vz-helper --gui`）：virtio-gpu scanout（1280×800 預設，`CHEFER_VZ_GUI_SIZE=WxH` 覆寫）+ USB 鍵盤/絕對座標指標 + AppKit 視窗承載 `VZVirtualMachineView`；**關窗＝app 結束**（同 WHP 語意）。macOS 14+ 開 `.resizable` + `automaticallyReconfiguresDisplay`。
 - **剪貼簿**（host↔guest，文字 + PNG）：與 WHP 同一線協定 + cmdline token；host 端經 VZ NAT 直連 guest IP:55381，NSPasteboard 讀寫 `.png`/`.tiff`。
 
@@ -106,7 +106,7 @@ bash scripts/vz-smoke.sh --kit-dir kit --gui
 - `README.md` 平台表（第 ~29–39 行）macOS 欄的 🔧 → ✅、以及 GUI 欄「real-Mac VZ pending」字樣。
 - `README.md` roadmap（第 ~266–267 行）「macOS VZ boot validated」「GUI apps on macOS」兩項 `[ ]`/`[~]` → `[x]`。
 - `docs/DESIGN.md` §6 macOS 分期 ③④ 的「待實體 Mac 驗證」字樣、以及動態解析度那段（依實測是 re-modeset 還是縮放修正）。
-- 若一切成立，可考慮把 `vz.rs` 的 `CHEFER_VZ_EXPERIMENTAL` 閘門放寬（例如驗證過的 macOS 版本才預設可用）——這屬**改變預設對外行為**，動之前先確認。
+- ~~若一切成立，可考慮把 `vz.rs` 的 `CHEFER_VZ_EXPERIMENTAL` 閘門放寬~~ **已完成（2026-07）**：驗證通過後 env 鎖已整個移除，`availability()` 改依真實前提（arch／appliance／helper／macOS 13+）判定，macOS 上 vz 預設啟用。
 
 ---
 

@@ -123,7 +123,7 @@ export CHEFER_KIT_DIR="$smoke_kit"
 "$root/target/release/chefer-cli" build "$work/exitcode.yml" --out "$work/dist"
 exit_exe="$work/dist/vz-exit/vz-exit_${arch}-apple-darwin"
 set +e
-CHEFER_VZ_EXPERIMENTAL=1 "$exit_exe" --extract-dir "$work/extract-exit" >"$work/exit.log" 2>&1
+"$exit_exe" --extract-dir "$work/extract-exit" >"$work/exit.log" 2>&1
 rc=$?
 set -e
 grep -q "CHEFER_GUEST_EXIT=" "$work/exit.log" \
@@ -152,7 +152,6 @@ exe="$work/dist/vz-smoke/vz-smoke_${arch}-apple-darwin"
 [[ -x "$exe" ]] || die "build 沒產出 $exe"
 
 log="$work/run.log"
-export CHEFER_VZ_EXPERIMENTAL=1
 "$exe" --extract-dir "$work/extract" >"$log" 2>&1 &
 app_pid=$!
 trap 'kill "$app_pid" 2>/dev/null || true' EXIT
@@ -204,7 +203,7 @@ YML
     [ ] 動態解析度 + HiDPI scale（macOS 14+ **預設開**；guest 側 re-modeset 與 output
         scale 由 guest-agent resize watcher 提供，需上面 3b/5 的新 overlay）——本清單
         跑完後另跑：
-          CHEFER_VZ_EXPERIMENTAL=1 CHEFER_VZ_GUI_TEST_RESIZE=20:1100x700 <同一個單檔>
+          CHEFER_VZ_GUI_TEST_RESIZE=20:1100x700 <同一個單檔>
         開機後 console 應出現「gui: resize: Virtual-1 output scale -> 2」（Retina 2x；
         helper 經 kernel cmdline chefer.gui_scale 傳入），20 秒後視窗自動縮放（與手動
         拖拉同路徑），console 應出現「gui: resize: Virtual-1 -> 2200x1400 (scale 2)」
@@ -216,7 +215,7 @@ YML
     （CHEFER_VZ_DYNAMIC_RESOLUTION=0 或 macOS 13 退回 view 等比縮放＋鎖長寬比——
       保底路徑；搭舊 overlay（cage <0.2.0、guest 不 re-modeset）時亦建議如此。）
 CHECK
-  CHEFER_VZ_EXPERIMENTAL=1 "$work/dist/vz-gui-smoke/vz-gui-smoke_${arch}-apple-darwin" --extract-dir "$work/extract-gui"
+  "$work/dist/vz-gui-smoke/vz-gui-smoke_${arch}-apple-darwin" --extract-dir "$work/extract-gui"
   note "GUI app 已結束（exit $?）——請依上方清單回填結果"
 else
   note "5/5 略過 GUI（加 --gui 執行 GUI 驗證）"
