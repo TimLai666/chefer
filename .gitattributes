@@ -1,0 +1,6 @@
+# Windows checkout 的 core.autocrlf=true 會把 working tree 轉成 CRLF，但這些檔案一定要在
+# Linux/macOS 側以 bash/sh 執行——CRLF 會讓 `set -Eeuo pipefail` 之類直接語法錯誤，
+# scripts/appliance/init 更會被烤進 initramfs（`#!/bin/busybox sh\r` → guest 開不起來）。
+# 明確釘成 LF，與 CI（Linux runner）和 release 產物一致。
+*.sh text eol=lf
+scripts/appliance/init text eol=lf
