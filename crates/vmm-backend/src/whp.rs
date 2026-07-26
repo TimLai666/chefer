@@ -147,12 +147,13 @@ impl ExecBackend for WhpBackend {
 
         // ② stdin liveness（與 vz 同契約）：helper 讀到 stdin EOF 即自我了結。寫端由本
         //    行程握住不寫——WHP 的 guest console 無輸入路徑（serial 僅 TX），無 vz 的
-        //    terminal stdin 泵送需求——mem::forget 讓 fd 隨行程存亡。
+        //    terminal stdin 泵送需求——交由 crate 保管，寫端 handle 隨行程存亡，並讓
+        //    中斷訊號路徑能提前關閉它（見 crate::close_liveness_handles）。
         let helper_stdin = child
             .stdin
             .take()
             .expect("child stdin was requested as piped");
-        std::mem::forget(helper_stdin);
+        crate::hold_liveness_handle(helper_stdin);
 
         let stdout = child
             .stdout

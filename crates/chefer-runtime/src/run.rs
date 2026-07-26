@@ -47,11 +47,16 @@ pub fn run(bundle_dir: &Path, keep_tmp: bool) -> Result<i32> {
 
     // Ctrl-C：印訊息後等 run_app 自然返回（後端子行程共享 console，會收到
     // 同號訊號自行結束）；若 5 秒內未返回則以 130 強制退出。
+    //
+    // 對 runtime **單發**訊號（`kill -INT <pid>`、非終端機整個 process group）時 VM helper
+    // 收不到訊號，只能靠 stdin EOF 自我了結——那要等本行程真的死掉，等於白等 5 秒。故先
+    // 主動關掉 helper 的 liveness 寫端，讓它立刻收攤、run_app 立刻返回。
     let finished = Arc::new(AtomicBool::new(false));
     {
         let finished = Arc::clone(&finished);
         ctrlc::set_handler(move || {
             tracing::info!("Received interrupt (Ctrl-C); waiting for services to stop…");
+            vmm_backend::close_liveness_handles();
             for _ in 0..50 {
                 if finished.load(Ordering::SeqCst) {
                     return;

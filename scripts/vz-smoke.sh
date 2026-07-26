@@ -171,12 +171,20 @@ done
 kill -INT "$app_pid" 2>/dev/null || true
 wait "$app_pid" 2>/dev/null || true
 trap - EXIT
-# 對 runtime 單發 SIGINT（非終端機 Ctrl+C 的整個 process group）不會帶走 helper/VM，
-# 實測會殘留吃 CPU——收尾把本次 work dir 下的 helper 一併清掉。
-pkill -f "$work/.*chefer-vz-helper" 2>/dev/null || true
+# 對 runtime 單發 SIGINT（非終端機 Ctrl+C 的整個 process group）時，helper 靠 stdin EOF
+# 自我了結（寫端見 crates/vmm-backend/src/vz.rs、讀端見 vz-helper/main.swift）——runtime
+# 一結束 EOF 就到。直接斷言「helper 不會變孤兒」，不再用 pkill 打掃殘留。
+for _ in $(seq 1 10); do
+  pgrep -f "$work/.*chefer-vz-helper" >/dev/null 2>&1 || break
+  sleep 1
+done
+if pgrep -f "$work/.*chefer-vz-helper" >/dev/null 2>&1; then
+  pkill -f "$work/.*chefer-vz-helper" 2>/dev/null || true
+  die "helper 變孤兒：runtime 已結束，chefer-vz-helper 10 秒後仍在（stdin-EOF 自我了結失效）"
+fi
 grep -q "CHEFER_GUEST_IP=" "$log" || die "console 沒出現 CHEFER_GUEST_IP 標記（埠轉發不會啟動）；log: $log"
 [[ $ok_port == 1 ]] || die "TCP 埠轉發失敗（curl 127.0.0.1:18080 不通）；log: $log"
-note "驗證二通過：服務常駐 ✓ CHEFER_GUEST_IP 標記 ✓ TCP 轉發 ✓"
+note "驗證二通過：服務常駐 ✓ CHEFER_GUEST_IP 標記 ✓ TCP 轉發 ✓ helper 無殘留 ✓"
 
 if [[ $gui == 1 ]]; then
   note "5/5 驗證三（GUI，手動檢核）：即將開 xclock 視窗（bridge 出網裝 xclock，順帶驗 pasta NAT）"

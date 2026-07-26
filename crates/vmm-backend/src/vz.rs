@@ -151,8 +151,9 @@ impl ExecBackend for VzBackend {
             });
         } else {
             // 無 terminal 服務：不讀使用者終端的 stdin（避免把輸入吞進 guest console），
-            // 只讓寫端 fd 隨行程存亡。
-            std::mem::forget(helper_stdin);
+            // 只讓寫端 fd 隨行程存亡；另交由 crate 保管，讓中斷訊號路徑能提前關閉它
+            // （見 crate::close_liveness_handles），不必等 runtime 行程真的死掉。
+            crate::hold_liveness_handle(helper_stdin);
         }
 
         let stdout = child

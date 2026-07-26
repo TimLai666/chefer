@@ -35,6 +35,9 @@ mod vz_util;
 #[allow(dead_code)]
 mod whp_util;
 
+use std::process::ChildStdin;
+use std::sync::Mutex;
+
 use anyhow::Result;
 
 /// 後端可用性檢查結果。
@@ -112,6 +115,32 @@ pub fn whp_availability() -> Availability {
             std::env::consts::OS
         ))
     }
+}
+
+/// helper 的 stdin liveness 寫端（見 DESIGN §6 vz/whp 的「Helper 生命週期」）。
+///
+/// helper 讀到 stdin EOF 即自我了結，所以寫端只要活著 helper 就活著。這裡收下寫端相當於
+/// 舊的 `mem::forget`（fd 隨 runtime 行程存亡，OS 保底），另外多一條「訊號路徑主動關閉」的
+/// 快捷路徑——見 [`close_liveness_handles`]。
+static LIVENESS_HANDLES: Mutex<Vec<ChildStdin>> = Mutex::new(Vec::new());
+
+/// 交出 helper stdin 寫端由本模組保管，直到行程結束或 [`close_liveness_handles`] 被呼叫。
+pub(crate) fn hold_liveness_handle(handle: ChildStdin) {
+    lock_liveness().push(handle);
+}
+
+/// 中斷訊號路徑呼叫：立刻關掉所有 helper liveness 寫端，讓 helper 讀到 EOF 自我了結。
+///
+/// 沒有這條路徑時，helper 要等到 runtime 行程真的死亡（Ctrl-C handler 的 5 秒寬限跑完、
+/// `exit(130)`）才會收到 EOF——對 runtime **單發** SIGINT 時實測約 6 秒才收攤。呼叫本函式
+/// 讓 helper 立刻結束，`run_app` 也就立刻返回、走正常結束路徑。
+pub fn close_liveness_handles() {
+    lock_liveness().clear();
+}
+
+/// 取鎖；中毒時照樣取用內部值——這是訊號路徑，不能因為別處 panic 過就放棄收攤。
+fn lock_liveness() -> std::sync::MutexGuard<'static, Vec<ChildStdin>> {
+    LIVENESS_HANDLES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// 取第一個可用的後端執行 app；全部不可用時彙整每個後端的名稱與原因報錯。
@@ -277,6 +306,33 @@ mod tests {
 
     fn backend_names(list: &[Box<dyn ExecBackend>]) -> Vec<&'static str> {
         list.iter().map(|backend| backend.name()).collect()
+    }
+
+    /// helper 的防孤兒契約：liveness 寫端一被 [`close_liveness_handles`] 關掉，讀端就拿到
+    /// EOF 並自我了結——不必等 runtime 行程死亡。這裡用 `cat`（讀 stdin 到 EOF 就結束）代打
+    /// helper，直接驗「關閉 → 子行程結束」這條因果。
+    #[cfg(unix)]
+    #[test]
+    fn closing_liveness_handles_gives_the_child_eof() {
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn cat");
+        hold_liveness_handle(child.stdin.take().expect("piped stdin"));
+
+        // 寫端還握著 → cat 應該還在等輸入。
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "child exited while the liveness handle was still held"
+        );
+
+        close_liveness_handles();
+        let status = child.wait().expect("wait");
+        assert!(status.success(), "child exited abnormally: {status:?}");
     }
 
     #[cfg(not(target_os = "windows"))]
