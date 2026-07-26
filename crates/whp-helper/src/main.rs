@@ -2839,6 +2839,12 @@ mod whp_api {
             let val = rax as u8;
             if super::serial::SerialPort::handles(port) {
                 serial.write(port, val);
+                // 寫 THR（送完一個 byte）或寫 IER 開 THRI 都會讓 THR-empty 中斷成立。
+                // 這條線是 userspace stdout 唯一的出路——Linux 的 8250 tty 靠 THRE IRQ
+                // 續傳，不拉就一個 byte 都送不出來（見 serial.rs 模組說明）。
+                if serial.irq_pending() {
+                    pic1.request_irq(super::serial::COM1_IRQ);
+                }
             } else if port == 0x70 {
                 *cmos_addr = val & 0x7F;
             } else if port == super::pic::PIC1_CMD {
