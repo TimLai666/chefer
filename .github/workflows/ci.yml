@@ -73,8 +73,11 @@ jobs:
       - name: Build each crate on its own (feature-unification guard)
         shell: bash
         run: |
+          # tr -d '\r'：Windows runner 的 python stdout 是文字模式，會把 \n 寫成 \r\n，
+          # 不清掉的話每個名字尾巴都黏一個 CR（cargo 會抱怨 invalid character in package name）。
           for p in $(cargo metadata --no-deps --format-version 1 \
-              | python3 -c "import json,sys; print('\n'.join(p['name'] for p in json.load(sys.stdin)['packages']))"); do
+              | python3 -c "import json,sys; print('\n'.join(p['name'] for p in json.load(sys.stdin)['packages']))" \
+              | tr -d '\r'); do
             echo "::group::cargo build -p $p"
             cargo build -p "$p" || { echo "::error::cargo build -p $p failed"; exit 1; }
             echo "::endgroup::"
