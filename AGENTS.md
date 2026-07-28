@@ -67,4 +67,4 @@ Validation rules live in `crates/appcipe-spec/src/validate.rs`; it collects **al
 
 ## Follow-ups
 
-- **WHP 上 app 執行滿 300 秒就被 helper 砍掉**：`whp_util::helper_invocation` 預設 `timeout_secs = 300`，而 helper 的 vCPU 迴圈把它當成**整段執行**的上限（`crates/whp-helper/src/main.rs` 的 `start.elapsed() > timeout`），時間到就以 `Guest boot timed out after 300 seconds` 結束——錯誤訊息寫 boot，實際上連已經跑很久的常駐服務也一起砍。等於 Windows-without-WSL 的 app 五分鐘就會無故中止（`CHEFER_WHP_TIMEOUT` 可蓋過，但使用者不會知道要設）。2026-07-28 於實機發現（`scripts/whp-smoke.ps1` 的常駐服務檢查撞到，該腳本目前自行把上限拉到 900 秒繞開）。修法方向：逾時只該保護「開機到 guest 回報就緒（`CHEFER_GUEST_IP`／首次 guest-agent 輸出）」，之後就解除；順便把訊息改成講得出是哪個階段逾時。vz 後端沒有對應的上限，行為也不一致。
+（目前無。）

@@ -106,10 +106,10 @@ function Build-App {
 }
 
 $env:CHEFER_BACKEND = "whp"
-# The helper caps the whole VM run, not just boot (default 300s, see
-# whp_util::helper_invocation). The long-running check below needs more headroom
-# than that -- see the "WHP 5-minute cap" follow-up in AGENTS.md.
-$env:CHEFER_WHP_TIMEOUT = "900"
+# Deliberately tiny: --timeout is a *boot* watchdog that disarms once the guest
+# reaches userspace. If it ever regresses back into a whole-run cap, the dwell in
+# check 2 below will outlive it and the script fails.
+$env:CHEFER_WHP_TIMEOUT = "20"
 
 Note "2/4 check 1: exit-code propagation (fail_fast non-zero -> single file exits with the same code)"
 $exitExe = Build-App -Name "whp-exit" -Yaml @"
@@ -213,7 +213,17 @@ try {
         Start-Sleep -Seconds 1
     }
     if (-not $sawPort) { Fail "TCP port forwarding failed (127.0.0.1:18080 unreachable); log: $runLog" }
-    Note "check 2 passed: guest userspace stdout, service stays up, TCP forward"
+
+    # Outlive the boot watchdog on purpose: CHEFER_WHP_TIMEOUT is 20s above, so a
+    # helper that still treats --timeout as a whole-run cap kills the VM here.
+    $dwell = 40
+    Note "dwelling ${dwell}s to prove the boot watchdog disarmed (CHEFER_WHP_TIMEOUT=$env:CHEFER_WHP_TIMEOUT)"
+    Start-Sleep -Seconds $dwell
+    if ($app.HasExited) {
+        Get-Content $runLog -Tail 20 | Write-Host
+        Fail "the app died while idling past the boot watchdog; --timeout is capping the whole run again, not just boot"
+    }
+    Note "check 2 passed: guest userspace stdout, service stays up past the watchdog, TCP forward"
 
     Note "4/4 check 3: helper anti-orphan (hard-kill the runtime; only the Job Object can save us)"
     if (-not (Get-Process -Id $helperId -ErrorAction SilentlyContinue)) {
