@@ -105,6 +105,15 @@ impl Pic {
         }
     }
 
+    /// 目前「已提出且未被遮罩」的 IRQ 線（bit0..bit7）。
+    ///
+    /// 呼叫端用它決定要不要再補一條 timer tick：[`take_pending_vector`] 每次只送一條、
+    /// 且由小到大挑，所以無條件每輪都補 IRQ 0 會讓編號較大的裝置永遠輪不到（實機實測
+    /// 會餓死 COM1 的 IRQ 4，見 main.rs 的 HLT 分支）。
+    pub fn pending_unmasked(&self) -> u8 {
+        self.irr & !self.imr
+    }
+
     /// 讓外部裝置提出一條 PIC IRQ 線。
     pub fn request_irq(&mut self, irq: u8) {
         if irq < 8 {
@@ -268,6 +277,39 @@ pub fn pit_handles(port: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_unmasked_reports_requested_and_unmasked_lines() {
+        let mut pic = Pic::new();
+        pic.write_data(0x00); // 解除全部遮罩
+        pic.request_irq(4);
+        assert_eq!(pic.pending_unmasked(), 1 << 4);
+        pic.write_data(1 << 4); // 遮罩 IRQ 4
+        assert_eq!(pic.pending_unmasked(), 0);
+    }
+
+    /// 回歸測試（實機 2026-07-28 卡死）：take_pending_vector 由小到大挑、每次只送一條，
+    /// 所以只要還有裝置 IRQ 在等，呼叫端就**不能**再補一條 timer IRQ 0——否則編號較大的
+    /// 線永遠輪不到。實機症狀是 guest 送完服務輸出後停在 HLT 等 COM1 的 THRE，timer 每輪
+    /// 都贏，CHEFER_GUEST_EXIT 永遠印不出來、helper 逾時。
+    #[test]
+    fn a_timer_tick_added_every_round_would_starve_higher_numbered_irqs() {
+        let mut pic = Pic::new();
+        pic.write_data(0x00);
+        pic.request_irq(4);
+        assert_ne!(
+            pic.pending_unmasked(),
+            0,
+            "呼叫端要據此判斷「還有東西在等，先別補 timer」"
+        );
+
+        pic.request_irq(0); // 若呼叫端照舊無條件補 timer tick……
+        assert_eq!(
+            pic.take_pending_vector(),
+            Some(0),
+            "……IRQ 0 一定先出線，IRQ 4 被壓在後面"
+        );
+    }
 
     #[test]
     fn pic_init_sequence() {
