@@ -125,6 +125,10 @@ pub fn whp_availability() -> Availability {
 static LIVENESS_HANDLES: Mutex<Vec<ChildStdin>> = Mutex::new(Vec::new());
 
 /// 交出 helper stdin 寫端由本模組保管，直到行程結束或 [`close_liveness_handles`] 被呼叫。
+///
+/// 只有會 spawn helper 的 VM 後端（macOS `vz`、Windows `whp`）用得到；Linux 的 `namespaces`
+/// 後端是 in-process 呼叫 guest-agent，沒有 helper 行程可登記——故該平台只有單元測試會用到。
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 pub(crate) fn hold_liveness_handle(handle: ChildStdin) {
     lock_liveness().push(handle);
 }
