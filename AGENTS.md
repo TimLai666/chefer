@@ -67,4 +67,6 @@ Validation rules live in `crates/appcipe-spec/src/validate.rs`; it collects **al
 
 ## Follow-ups
 
+- **`cargo test -p vmm-backend` 在 Windows 上單獨跑會編不過**：`error[E0432]: unresolved import windows_sys::Win32::System::JobObjects::CreateJobObjectW`（`crates/vmm-backend/src/whp.rs:19`）。`cargo build --workspace` / `cargo test --workspace` 都正常，CI 也綠——單獨指定 `-p` 時 windows-sys 的 feature 聯集不同（`Win32_System_JobObjects` 已在 `crates/vmm-backend/Cargo.toml` 宣告，但單包解析下這個符號仍不見），2026-07-26 於工作區乾淨、重跑仍穩定重現。影響的是本檔 Commands 節寫的「`cargo test -p <crate>` 跑單一 crate」用法，不影響產品。查清楚 feature 到底少在哪再修（可能要補宣告，或是 windows-sys 0.61 的 API 分組變動）。
+
 - **WHP 的 guest console 沒有自動化端到端保護**：8250 THRE 中斷（userspace stdout 的唯一出路，見 DESIGN §6 whp ④）只由 `serial.rs` 的單元測試鎖住狀態機；「guest 服務的 stdout 真的會到 host」目前只能在實體 Windows（WHP）手動驗——QEMU E2E 走 virtio-console/hvc0，覆蓋不到這條路徑，GitHub 的 windows runner 也開不了巢狀虛擬化。若之後有自架 WHP runner，補一支 whp-smoke（對照 `scripts/vz-smoke.sh`）把「`[svc]` 前綴輸出出現在 host」變成斷言。
