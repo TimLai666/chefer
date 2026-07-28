@@ -28,9 +28,6 @@ pub struct SerialPort {
     scr: u8,
     dll: u8,
     dlh: u8,
-    /// THR 已空、尚未被 guest 讀 IIR 認掉的中斷。本模擬的 TX 即時完成，所以只要
-    /// guest 開了 THRI 或剛送完一個 byte，THR 就是空的。
-    thre_pending: bool,
     output: Vec<u8>,
 }
 
@@ -43,21 +40,29 @@ impl SerialPort {
             scr: 0,
             dll: 0,
             dlh: 0,
-            thre_pending: false,
             output: Vec::new(),
         }
     }
 
-    /// 現在是否該對 PIC 拉 COM1 的 IRQ（guest 開了 THRI 且有未認的 THR-empty）。
+    /// 現在是否該對 PIC 拉 COM1 的 IRQ。
+    ///
+    /// THRE 是**準位**訊號不是邊緣：只要 guest 開著 THRI，而 THR 是空的，線就一直拉著。
+    /// 本模擬的 TX 即時完成 → THR 恆空 → 條件等同「THRI 開著」。實機教訓：曾經把它做成
+    /// 「讀 IIR 就清掉」的一次性旗標，結果 Linux 只要讀到一次 IIR 卻沒接著寫 THR/IER
+    /// （例如那次中斷被判定為 spurious），這條線就再也拉不起來——driver 的 `ier` 快取裡
+    /// THRI 仍是開的，於是 `serial8250_start_tx` 不會重寫 IER、也就永遠沒有新的 IO exit
+    /// 可以觸發中斷，guest 卡在等一個不會來的 THRE 上（實機 2026-07-28：VM 開完機、服務
+    /// 跑完，卻停在 `CHEFER_GUEST_EXIT` 之前不動，helper 逾時）。Linux 沒東西要送時會自己
+    /// 清掉 THRI（`__stop_tx`），所以持續拉線不會變成中斷風暴——真硬體也是這個行為。
     pub fn irq_pending(&self) -> bool {
-        self.ier & IER_THRI != 0 && self.thre_pending
+        self.ier & IER_THRI != 0
     }
 
     pub fn handles(port: u16) -> bool {
         (COM1_BASE..=COM1_END).contains(&port)
     }
 
-    pub fn read(&mut self, port: u16) -> u8 {
+    pub fn read(&self, port: u16) -> u8 {
         match port - COM1_BASE {
             0 => {
                 if self.dlab() {
@@ -74,9 +79,8 @@ impl SerialPort {
                 }
             }
             2 => {
-                // 讀 IIR = guest 認掉這次中斷（真硬體同語意）。
+                // IIR 照實回報目前的準位，讀取不改變狀態（見 irq_pending 的說明）。
                 if self.irq_pending() {
-                    self.thre_pending = false;
                     IIR_THR_EMPTY
                 } else {
                     IIR_NO_PENDING
@@ -96,12 +100,8 @@ impl SerialPort {
             0 => {
                 if self.dlab() {
                     self.dll = value;
-                } else {
-                    if self.output.len() < MAX_SERIAL_OUTPUT {
-                        self.output.push(value);
-                    }
-                    // TX 即時完成 → THR 立刻又是空的，該通知 guest 續傳下一個 byte。
-                    self.thre_pending = true;
+                } else if self.output.len() < MAX_SERIAL_OUTPUT {
+                    self.output.push(value);
                 }
             }
             1 => {
@@ -109,10 +109,6 @@ impl SerialPort {
                     self.dlh = value;
                 } else {
                     self.ier = value;
-                    if value & IER_THRI != 0 {
-                        // guest 剛開啟 TX 中斷，而 THR 本來就是空的——立刻給它第一次踢。
-                        self.thre_pending = true;
-                    }
                 }
             }
             2 => {}
@@ -158,13 +154,13 @@ mod tests {
 
     #[test]
     fn lsr_reports_tx_ready() {
-        let mut sp = SerialPort::new();
+        let sp = SerialPort::new();
         assert_eq!(sp.read(COM1_BASE + 5), 0x60);
     }
 
     #[test]
     fn iir_no_pending_interrupt() {
-        let mut sp = SerialPort::new();
+        let sp = SerialPort::new();
         assert_eq!(sp.read(COM1_BASE + 2), 0x01);
     }
 
@@ -179,22 +175,19 @@ mod tests {
         sp.write(COM1_BASE + 1, 0x02); // IER: THRI on
         assert!(sp.irq_pending());
         assert_eq!(sp.read(COM1_BASE + 2), 0x02); // IIR: THR empty
-        assert!(!sp.irq_pending(), "讀 IIR 應清掉本次中斷");
-        assert_eq!(sp.read(COM1_BASE + 2), 0x01);
     }
 
+    /// 回歸測試（實機 2026-07-28 卡死）：THRE 是準位不是邊緣。讀 IIR **不會**把線清掉，
+    /// 否則 Linux 讀到一次 IIR 卻沒接著寫 THR/IER 時，driver 的 ier 快取裡 THRI 仍開著、
+    /// 不會重寫 IER，也就再也沒有 IO exit 能重新拉線——guest 永遠等不到下一次 THRE。
     #[test]
-    fn transmitting_re_arms_thre() {
+    fn reading_iir_does_not_drop_the_line() {
         let mut sp = SerialPort::new();
         sp.write(COM1_BASE + 1, 0x02);
-        sp.read(COM1_BASE + 2); // 清掉開啟中斷那次
-
-        sp.write(COM1_BASE, b'X'); // TX 即時完成 → THR 又空了
-        assert!(
-            sp.irq_pending(),
-            "送完一個 byte 要再拉一次中斷，否則續傳會停住"
-        );
-        assert_eq!(sp.read(COM1_BASE + 2), 0x02);
+        for _ in 0..3 {
+            assert_eq!(sp.read(COM1_BASE + 2), 0x02);
+            assert!(sp.irq_pending(), "THRI 還開著，這條線就不該掉");
+        }
     }
 
     #[test]

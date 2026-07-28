@@ -2661,7 +2661,18 @@ mod whp_api {
                         }
                     }
                     if rflags & 0x200 != 0 {
-                        pic1.request_irq(0);
+                        // COM1 的 THRE 是準位訊號：guest 在 HLT 等 TX 續傳中斷時不會有
+                        // 任何 IO exit，只在這裡重新拉線才不會卡死（見 serial.rs）。
+                        if serial.irq_pending() {
+                            pic1.request_irq(super::serial::COM1_IRQ);
+                        }
+                        // timer tick 只在沒有別的裝置 IRQ 在等時才補。deliver 每次只送
+                        // 一條、由小到大挑，無條件每輪補 IRQ 0 會讓 IRQ 4 永遠輪不到
+                        // ——實機實測就是這樣把序列埠餓死：guest 送完服務輸出後停在
+                        // HLT 等 THRE，timer 一直贏，CHEFER_GUEST_EXIT 永遠印不出來。
+                        if pic1.pending_unmasked() == 0 {
+                            pic1.request_irq(0);
+                        }
                         let _ = deliver_pending_pic_irq(api, partition, pic1);
                     }
                 }
