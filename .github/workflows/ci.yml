@@ -66,6 +66,20 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # workspace 建置會把同一個 crate 的 feature 做聯集，因此某個 crate 少宣告的
+      # feature 會被別人補上、直到有人單獨 `cargo build -p <crate>` 才爆（實際發生過：
+      # vmm-backend 少了 windows-sys 的 Win32_Security，CreateJobObjectW 找不到）。
+      # AGENTS.md 明寫單 crate 建置是支援用法，這裡逐包建一次把它鎖住。
+      - name: Build each crate on its own (feature-unification guard)
+        shell: bash
+        run: |
+          for p in $(cargo metadata --no-deps --format-version 1 \
+              | python3 -c "import json,sys; print('\n'.join(p['name'] for p in json.load(sys.stdin)['packages']))"); do
+            echo "::group::cargo build -p $p"
+            cargo build -p "$p" || { echo "::error::cargo build -p $p failed"; exit 1; }
+            echo "::endgroup::"
+          done
+
   vz-helper:
     name: vz-helper (swiftc compile-check)
     runs-on: macos-latest
