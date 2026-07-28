@@ -18,6 +18,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
     # WHP helper 防孤兒：KILL_ON_JOB_CLOSE Job Object（whp.rs，DESIGN §6「Helper 生命週期」）。
     "Win32_System_JobObjects",
+    # CreateJobObjectW 的第一個參數是 SECURITY_ATTRIBUTES，windows-sys 因此把它額外
+    # gate 在 Win32_Security 上。少了這條，`cargo build -p vmm-backend` 單獨建會
+    # E0432；workspace 建置時被其他 crate 的 feature 聯集蓋過去而看不出來。
+    "Win32_Security",
 ] }
 
 [dev-dependencies]
