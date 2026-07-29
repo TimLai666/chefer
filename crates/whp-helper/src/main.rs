@@ -347,6 +347,8 @@ mod whp_api {
     // ── Console markers ──
 
     const GUEST_EXIT_MARKER: &str = "CHEFER_GUEST_EXIT=";
+    /// appliance init 在交棒給 guest-agent 前印出；用來解除開機看門狗。
+    const GUEST_IP_MARKER: &str = "CHEFER_GUEST_IP=";
 
     // ── Function pointer types ──
 
@@ -2544,12 +2546,17 @@ mod whp_api {
         let mut last_reason = EXIT_NONE;
         let mut last_rip = 0u64;
         let mut exit_trace_seq = 0u64;
+        // `timeout` 是**開機**看門狗，不是整段執行的上限：guest 一進 userspace 就解除，
+        // 之後常駐服務要跑多久都行（macOS vz 後端本來就沒有上限，這樣兩邊才一致）。
+        // 解除條件見 guest_reached_userspace；設在下方 HALT 分支——那裡本來就已經把
+        // console 輸出取出來解析標記，不必為此在熱迴圈裡多抓一次字串。
+        let mut booted = false;
 
         loop {
-            if start.elapsed() > timeout {
+            if !booted && start.elapsed() > timeout {
                 flush_serial(serial, last_printed);
                 return Err(format!(
-                    "Guest boot timed out after {} seconds (last exit={} 0x{last_reason:04X}, RIP=0x{last_rip:016X}, counts: io={} mem={} halt={} canceled={} other={})",
+                    "Guest boot timed out after {} seconds — the VM never reached userspace (no CHEFER_GUEST_IP / guest-agent output). Raise it with CHEFER_WHP_TIMEOUT if this machine just boots slowly. (last exit={} 0x{last_reason:04X}, RIP=0x{last_rip:016X}, counts: io={} mem={} halt={} canceled={} other={})",
                     timeout.as_secs(),
                     exit_reason_name(last_reason),
                     exit_stats.io,
@@ -2623,6 +2630,9 @@ mod whp_api {
                     }
                     flush_serial(serial, last_printed);
                     let output = serial.output_str();
+                    if !booted && guest_reached_userspace(&output) {
+                        booted = true;
+                    }
                     if let Some(code) = parse_guest_exit(&output) {
                         if code != 0 {
                             return Err(format!("Guest exited with code {code}"));
@@ -2928,6 +2938,16 @@ mod whp_api {
         }
     }
 
+    /// guest 是否已經走完開機、進到 userspace——`--timeout` 這個**開機**看門狗的解除條件。
+    ///
+    /// 兩個標記任一出現即算數：`CHEFER_GUEST_IP=`（appliance init 交棒給 guest-agent 前印，
+    /// 走 /dev/kmsg，舊 appliance 也有）或 guest-agent 自己的 `[guest-agent]` 前綴輸出。
+    /// 看門狗只保護「VM 開不起來／init 卡住」，**不是**整段執行的上限——曾經誤用成後者，
+    /// WHP 上的常駐 app 一律跑滿 300 秒就被砍（實機 2026-07-28 發現）。
+    fn guest_reached_userspace(output: &str) -> bool {
+        output.contains(GUEST_IP_MARKER) || output.contains("[guest-agent]")
+    }
+
     fn parse_guest_exit(output: &str) -> Option<i32> {
         for line in output.lines().rev() {
             if let Some(rest) = line.strip_prefix(GUEST_EXIT_MARKER) {
@@ -2984,6 +3004,22 @@ mod whp_api {
         fn whv_register_value_matches_sdk_alignment() {
             assert_eq!(std::mem::size_of::<WhvRegisterValue>(), 16);
             assert_eq!(std::mem::align_of::<WhvRegisterValue>(), 16);
+        }
+
+        /// 開機看門狗的解除條件。timeout 只該保護「開機到 guest 進 userspace」那一段——
+        /// 曾經拿它當整段執行的上限，結果 WHP 上的 app 一律跑滿 300 秒就被砍，錯誤訊息還
+        /// 寫 boot timed out（實機 2026-07-28 發現）。
+        #[test]
+        fn guest_readiness_disarms_the_boot_watchdog() {
+            assert!(!guest_reached_userspace(
+                "[    0.000000] Linux version 6.6.32\n[    0.3] i8042: Can't read CTR"
+            ));
+            assert!(guest_reached_userspace(
+                "[    0.7] CHEFER_GUEST_IP=10.0.2.15\n"
+            ));
+            assert!(guest_reached_userspace(
+                "boot log\n[guest-agent] rootfs via overlayfs\n"
+            ));
         }
 
         #[test]
