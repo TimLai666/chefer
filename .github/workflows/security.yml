@@ -36,7 +36,7 @@ jobs:
 
       # 以預編二進位安裝 cargo-audit（免現場編譯，數秒完成）
       - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@v2.85.5
         with:
           tool: cargo-audit
 
