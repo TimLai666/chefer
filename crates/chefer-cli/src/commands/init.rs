@@ -31,7 +31,7 @@ services:
     # Required: container image source. Three forms:
     #   ./images/app.tar             — local tar from `docker save -o images/app.tar <image>`
     #   redis:7.2-alpine             — pull from registry at build time (must pin tag or @sha256)
-    #   image:                       — build from Dockerfile (needs docker/podman/nerdctl on PATH)
+    #   image:                       — build from Dockerfile (needs docker/podman/nerdctl/container, or wslc on Windows)
     #     source: dockerfile
     #     file: ./Dockerfile
     #     context: .

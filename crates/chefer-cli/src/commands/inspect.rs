@@ -270,7 +270,7 @@ fn render_manifest_summary(
 
     // ── Services ───────────────────────────────────────────────
     let mut t = Table::new();
-    t.load_preset(UTF8_BORDERS_ONLY)
+    t.load_style(UTF8_BORDERS_ONLY)
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_width(ui::term_width())
         .set_constraints(vec![

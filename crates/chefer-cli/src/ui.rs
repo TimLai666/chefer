@@ -16,7 +16,7 @@ pub fn term_width() -> u16 {
 /// 建立雙欄 key-value 表格（欄寬以百分比指定），header 為 Key/Value。
 pub fn kv_table(key_pct: u16, val_pct: u16) -> Table {
     let mut t = Table::new();
-    t.load_preset(UTF8_BORDERS_ONLY)
+    t.load_style(UTF8_BORDERS_ONLY)
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_width(term_width())
         .set_constraints(vec![
@@ -73,7 +73,7 @@ pub fn render_summary_table(app: &appcipe_spec::AppCipe) {
     /* ===== App 概覽（兩欄，比例 24/76；允許單格換行；加點顏色） ===== */
     let mut header = Table::new();
     header
-        .load_preset(UTF8_BORDERS_ONLY)
+        .load_style(UTF8_BORDERS_ONLY)
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_width(cols)
         .set_constraints(vec![
@@ -125,7 +125,7 @@ pub fn render_summary_table(app: &appcipe_spec::AppCipe) {
 
     /* ===== Services（百分比分配；單格換行；彩色；含 Depends；Service 間插入空白列） ===== */
     let mut t = Table::new();
-    t.load_preset(UTF8_BORDERS_ONLY)
+    t.load_style(UTF8_BORDERS_ONLY)
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_width(cols)
         .set_constraints(vec![
