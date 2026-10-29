@@ -81,7 +81,11 @@ impl Fixture {
         std::fs::create_dir(&tools).unwrap();
         // Windows searches the CLI directory before inherited PATH and System32 can contain Docker.
         // Shadow every builder there; disabled stubs fail before logging any calls.
-        std::fs::copy(env!("CARGO_BIN_EXE_chefer-cli"), tools.join("chefer-cli.exe")).unwrap();
+        std::fs::copy(
+            env!("CARGO_BIN_EXE_chefer-cli"),
+            tools.join("chefer-cli.exe"),
+        )
+        .unwrap();
         for tool in ["docker", "podman", "nerdctl", "wslc", "container"] {
             std::fs::copy(
                 fake_builder().join("builder.exe"),
