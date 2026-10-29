@@ -23,7 +23,7 @@ docker build / docker pull  →  docker save -o x.tar <image>   # 取得 image t
 寫 appcipe.yml（image 指向那些 tar）
 chefer build appcipe.yml --out dist                            # 產出單檔
 ```
-image 來源可為 **tar**（`docker save`/OCI archive）、**registry ref**（釘版 tag 或 `@sha256`；公開 image 匿名拉取，**私有 registry** 用 `docker login` 的明文 `auths` 憑證或 `CHEFER_REGISTRY_AUTH=user:pass`——外部 credential helper 不支援）或 **Dockerfile**（打包機需有 docker/podman/nerdctl）。
+image 來源可為 **tar**（`docker save`/OCI archive）、**registry ref**（釘版 tag 或 `@sha256`；公開 image 匿名拉取，**私有 registry** 用 `docker login` 的明文 `auths` 憑證或 `CHEFER_REGISTRY_AUTH=user:pass`——外部 credential helper 不支援）或 **Dockerfile**（打包機需有 docker/podman/nerdctl/Apple container，Windows 另可用 WSL Containers 的 wslc）。
 
 ## 最小可用範例
 
@@ -64,7 +64,7 @@ service 名規則：`[a-z][a-z0-9_]*`，≤32。
       format: docker-archive      # auto | docker-archive | oci-archive（**用連字號**，非底線；僅 source=tar 有意義）
       platform: linux/amd64       # linux/amd64 | linux/arm64（windows/amd64 不支援執行）
     ```
-  - `source: dockerfile` 另可加 `context:`（build context 目錄，省略 = Dockerfile 所在目錄）與 `build_args: { K: V }`。**需打包機上有 docker/podman/nerdctl**；不保證可重現（要可重現用 `source: image` 釘 `@sha256` digest）。執行期仍不需 Docker。
+  - `source: dockerfile` 另可加 `context:`（build context 目錄，省略 = Dockerfile 所在目錄）與 `build_args: { K: V }`。**需打包機上有 docker/podman/nerdctl/Apple container，Windows 另支援 wslc**。Windows 可先 `wsl --update`，再設 `$env:CHEFER_DOCKERFILE_BUILDER="wslc"` 明確指定，免安裝 Docker。WSLC 僅建置 Windows 原生架構，要求其他 `image.platform` 時會在建置前報錯，需改用其他 builder；不保證可重現（要可重現用 `source: image` 釘 `@sha256` digest）。執行期仍不需 Docker。
 - **`cmd`**：字串或陣列，覆蓋映像的 **CMD（不覆蓋 ENTRYPOINT）**。有效命令 = entrypoint + (cmd 或 image CMD)。
 - **`workdir`**：容器內工作目錄。
 - **`env`**：`key: value`；key 須符合 `[A-Za-z_][A-Za-z0-9_]*`。會覆蓋映像自帶的同名 env。

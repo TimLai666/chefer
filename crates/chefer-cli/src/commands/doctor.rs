@@ -460,9 +460,9 @@ fn check_dockerfile_builder() -> DoctorCheck {
         ),
         None => DoctorCheck::warn(
             "Dockerfile builder",
-            "No container builder (docker/podman/nerdctl/container) found on PATH.",
-            "Install one to use `source: dockerfile` in appcipe.yml. \
-             `source: tar` and `source: image` work without a builder.",
+            "No supported container builder found on PATH.",
+            "Install docker/podman/nerdctl or Apple's container; on Windows, update WSL for wslc. \
+             Use CHEFER_DOCKERFILE_BUILDER=wslc to select it explicitly. `source: tar` and `source: image` work without a builder.",
         ),
     }
 }
@@ -543,7 +543,7 @@ fn probe_writable_dir(root: &std::path::Path) -> Result<()> {
 fn render_report(report: &DoctorReport) {
     let mut table = Table::new();
     table
-        .load_preset(comfy_table::presets::UTF8_BORDERS_ONLY)
+        .load_style(comfy_table::presets::UTF8_BORDERS_ONLY)
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_width(ui::term_width())
         .set_constraints(vec![

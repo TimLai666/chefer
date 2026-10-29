@@ -1,7 +1,7 @@
-//! `source: dockerfile` —— 在**打包機**上以既有的 container builder 建置成 docker-archive
-//! tar，之後完全併入 `source: tar` 的解析路徑（見 docs/DESIGN.md「Dockerfile build」）。
+//! `source: dockerfile` —— 在**打包機**上以既有的 container builder 建置成 image
+//! archive，之後完全併入 `source: tar` 的解析路徑（見 docs/DESIGN.md「Dockerfile build」）。
 //!
-//! chefer 本身不建 image：偵測並呼叫 host 上的 docker / podman / nerdctl（CLI 相容）。
+//! chefer 本身不建 image：偵測並呼叫 host 上既有的 container builder（Windows 另支援 WSL Containers）。
 //! 執行期一如往常不需 Docker——builder 只在打包時用到。
 
 use std::collections::{BTreeMap, HashMap};
@@ -15,9 +15,13 @@ use anyhow::{Context, Result, bail};
 ///   macOS 上的 **OrbStack / Docker Desktop** 都提供 drop-in `docker` CLI，故直接走這條。
 /// - `container`（Apple 開源 container 工具）：`build` 旗標相容，但 save 是
 ///   `container image save -o`（產出 OCI archive，chefer 解析端兩種格式都吃）。
+// Windows 的 wslc 與 Apple container 同樣以 `image save` 匯出。
+#[cfg(windows)]
+const BUILDERS: &[&str] = &["docker", "podman", "nerdctl", "wslc", "container"];
+#[cfg(not(windows))]
 const BUILDERS: &[&str] = &["docker", "podman", "nerdctl", "container"];
 
-/// 以 host builder 建置 Dockerfile 成 docker-archive tar，回傳 tar 路徑（位於 `out_dir`）。
+/// 以 host builder 建置 Dockerfile 成 image archive，回傳 tar 路徑（位於 `out_dir`）。
 pub(crate) fn build_image_tar(
     name: &str,
     dockerfile: &str,
@@ -49,6 +53,17 @@ pub(crate) fn build_image_tar(
     }
 
     let builder = detect_builder()?;
+    let wslc = cfg!(windows) && matches!(builder, "wslc" | "container");
+    #[cfg(windows)]
+    if wslc {
+        let native = wslc_native_platform()?;
+        if platform != native {
+            bail!(
+                "Chefer currently supports `{builder}` builds only for the native platform {native}, but service `{name}` requests {platform}. \
+                 Use docker/podman/nerdctl for cross-platform builds, or set image.platform to {native}."
+            );
+        }
+    }
     let tag = format!("chefer-build-{name}:{}", std::process::id());
 
     eprintln!(
@@ -57,7 +72,11 @@ pub(crate) fn build_image_tar(
 
     // build —— stdio 直通，讓使用者看到建置過程。
     let mut cmd = Command::new(builder);
-    cmd.arg("build").arg("--platform").arg(platform);
+    cmd.arg("build");
+    // WSLC 3.0.3 的 build 沒有 --platform，僅建置 Windows 原生架構。
+    if !wslc {
+        cmd.arg("--platform").arg(platform);
+    }
     // build_args 依 key 排序，讓相同輸入的命令列固定（雖然 Dockerfile build 本身不保證可重現）。
     let sorted: BTreeMap<&String, &String> = build_args.iter().collect();
     for (k, v) in sorted {
@@ -74,21 +93,15 @@ pub(crate) fn build_image_tar(
         );
     }
 
-    // save → image tar（docker/podman/nerdctl: docker-archive；Apple container: OCI archive）。
-    // Apple container 的 save 在 `image` 子命令下（`container image save`），其餘為 `<tool> save`。
+    // save → image archive。Apple container 與 WSL Containers 用 `image save`。
     let tar = out_dir.join("image.tar");
     let mut save_cmd = Command::new(builder);
-    if builder == "container" {
+    if matches!(builder, "container" | "wslc") {
         save_cmd.arg("image").arg("save");
     } else {
         save_cmd.arg("save");
     }
-    let save = save_cmd
-        .arg("-o")
-        .arg(&tar)
-        .arg(&tag)
-        .output()
-        .with_context(|| format!("failed to run `{builder} save` for service `{name}`"))?;
+    let save = save_cmd.arg("-o").arg(&tar).arg(&tag).output();
 
     // best-effort 清掉建置用的暫時 image（不影響成敗）。
     let _ = Command::new(builder)
@@ -98,6 +111,8 @@ pub(crate) fn build_image_tar(
         .arg(&tag)
         .output();
 
+    let save =
+        save.with_context(|| format!("failed to run `{builder} save` for service `{name}`"))?;
     if !save.status.success() {
         bail!(
             "`{builder} save` failed for service `{name}`: {}",
@@ -116,7 +131,8 @@ fn detect_builder() -> Result<&'static str> {
             let Some(&b) = BUILDERS.iter().find(|b| **b == forced) else {
                 bail!(
                     "CHEFER_DOCKERFILE_BUILDER=`{forced}` is not a supported builder \
-                     (expected one of docker/podman/nerdctl/container)"
+                     (expected one of {})",
+                    BUILDERS.join("/")
                 );
             };
             if runnable(b) {
@@ -132,8 +148,9 @@ fn detect_builder() -> Result<&'static str> {
     }
     bail!(
         "source: dockerfile needs a container builder on this machine, but none of \
-         docker/podman/nerdctl/container were found on PATH. Install one (e.g. Docker, OrbStack, \
-         or Apple's `container`), or pre-build the image and use source: tar / source: image."
+         {} were found on PATH. Install a supported builder (on Windows, update WSL for `wslc`), \
+         or pre-build the image and use source: tar / source: image.",
+        BUILDERS.join("/")
     )
 }
 
@@ -151,6 +168,40 @@ pub fn available_builder() -> Option<&'static str> {
         }
     }
     BUILDERS.iter().copied().find(|b| runnable(b))
+}
+
+/// WSLC 使用 Windows 原生架構；模擬執行的 CLI 架構與環境變數不能作為判斷依據。
+#[cfg(windows)]
+fn wslc_native_platform() -> Result<&'static str> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn IsWow64Process2(
+            process: *mut std::ffi::c_void,
+            process_machine: *mut u16,
+            native_machine: *mut u16,
+        ) -> i32;
+    }
+    let (mut process_machine, mut native_machine) = (0u16, 0u16);
+    // SAFETY: GetCurrentProcess 提供有效的目前程序 handle，兩個輸出指標均指向有效 u16。
+    let ok = unsafe {
+        IsWow64Process2(
+            GetCurrentProcess(),
+            &mut process_machine,
+            &mut native_machine,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to detect the native Windows architecture for WSL Containers");
+    }
+    match native_machine {
+        0x8664 => Ok("linux/amd64"), // IMAGE_FILE_MACHINE_AMD64
+        0xaa64 => Ok("linux/arm64"), // IMAGE_FILE_MACHINE_ARM64
+        _ => bail!(
+            "WSL Containers native machine architecture is unsupported: {native_machine:#06x}"
+        ),
+    }
 }
 
 fn runnable(builder: &str) -> bool {

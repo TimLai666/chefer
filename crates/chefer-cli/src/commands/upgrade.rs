@@ -1,7 +1,7 @@
 //! `chefer upgrade` — 從 GitHub Releases 更新完整 runtime kit（不依賴 cargo）。
 //!
 //! release workflow 上傳的是 `chefer_<tag>_<target>.zip|tar.gz`，內含 host CLI
-//! 與完整 `kit/`；因此不能使用 self_update 的單一 binary 替換流程。
+//! 與完整 `kit/`；下載、驗證與替換由此處一併處理。
 
 use std::ffi::OsStr;
 use std::fs::{self, File};
@@ -12,19 +12,31 @@ use anyhow::{Context, Result, bail};
 use flate2::read::GzDecoder;
 use owo_colors::OwoColorize;
 use reqwest::header;
-use self_update::cargo_crate_version;
-use self_update::update::{Release, ReleaseAsset};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::{BIN_NAME, HOST_TARGET, REPO_NAME, REPO_OWNER};
 
+#[derive(Clone, Debug, Deserialize)]
+struct ReleaseAsset {
+    name: String,
+    #[serde(rename = "url")]
+    download_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct Release {
+    #[serde(rename = "tag_name")]
+    version: String,
+    assets: Vec<ReleaseAsset>,
+}
+
 pub fn cmd_upgrade(channel: &str, to: Option<&str>, check_only: bool) -> Result<()> {
-    let current = cargo_crate_version!();
+    let current = env!("CARGO_PKG_VERSION");
     let release = fetch_release(channel, to)?;
     let archive = select_kit_asset(&release, HOST_TARGET)?;
     let checksum = select_checksum_asset(&release, &archive.name)?;
-    let newer = self_update::version::bump_is_greater(current, &release.version)
-        .unwrap_or(release.version != current);
+    let newer = is_newer_release(current, &release.version);
 
     if check_only {
         if newer {
@@ -146,30 +158,52 @@ pub fn cmd_upgrade(channel: &str, to: Option<&str>, check_only: bool) -> Result<
 }
 
 fn fetch_release(channel: &str, to: Option<&str>) -> Result<Release> {
-    use self_update::backends::github::Update;
+    let url = release_url(channel, to)?;
+    let response = reqwest::blocking::Client::new()
+        .get(url.clone())
+        .header(header::USER_AGENT, BIN_NAME)
+        .header(header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .with_context(|| format!("failed to look up GitHub Release: {url}"))?;
+    let bytes = response
+        .bytes()
+        .context("failed to read GitHub Release response")?;
+    parse_release(&bytes)
+}
 
-    let mut builder = Update::configure();
-    builder
-        .repo_owner(REPO_OWNER)
-        .repo_name(REPO_NAME)
-        .bin_name(BIN_NAME)
-        .show_download_progress(true)
-        .current_version(cargo_crate_version!());
+fn release_url(channel: &str, to: Option<&str>) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(&format!(
+        "https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases"
+    ))?;
+    {
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("GitHub API URL cannot be a base URL"))?;
+        if let Some(tag) = to.or_else(|| (channel != "stable").then_some(channel)) {
+            path.push("tags").push(tag);
+        } else {
+            path.push("latest");
+        }
+    }
+    Ok(url)
+}
 
-    let updater = builder.build()?;
-    if let Some(ver) = to {
-        return updater
-            .get_release_version(ver)
-            .with_context(|| format!("failed to look up GitHub Release tag `{ver}`"));
+fn parse_release(bytes: &[u8]) -> Result<Release> {
+    let mut release: Release =
+        serde_json::from_slice(bytes).context("failed to parse GitHub Release response")?;
+    release.version = release.version.trim_start_matches('v').to_owned();
+    Ok(release)
+}
+
+fn is_newer_release(current: &str, other: &str) -> bool {
+    match (
+        semver::Version::parse(current),
+        semver::Version::parse(other),
+    ) {
+        (Ok(current), Ok(other)) => other > current,
+        _ => other != current,
     }
-    if channel != "stable" {
-        return updater
-            .get_release_version(channel)
-            .with_context(|| format!("failed to look up GitHub Release tag `{channel}`"));
-    }
-    updater
-        .get_latest_release()
-        .context("failed to look up the latest GitHub Release")
 }
 
 fn select_kit_asset(release: &Release, target: &str) -> Result<ReleaseAsset> {
@@ -255,7 +289,7 @@ fn is_safe_asset_filename(name: &str) -> bool {
 
 fn download_asset(asset: &ReleaseAsset, dest: &Path) -> Result<()> {
     let client = reqwest::blocking::ClientBuilder::new()
-        .use_rustls_tls()
+        .tls_backend_rustls()
         .build()
         .context("failed to build HTTPS client")?;
     let mut resp = client
@@ -387,7 +421,11 @@ fn extract_zip(archive: &Path, dest: &Path) -> Result<()> {
     let mut zip = zip::ZipArchive::new(f).context("failed to read zip contents")?;
     for i in 0..zip.len() {
         let mut entry = zip.by_index(i).context("failed to read zip entry")?;
-        let rel = sanitize_archive_name(entry.name())?;
+        let name = entry
+            .name()
+            .context("failed to decode zip entry name")?
+            .into_owned();
+        let rel = sanitize_archive_name(&name)?;
         let out = dest.join(&rel);
         if entry.is_dir() {
             fs::create_dir_all(&out)
@@ -395,17 +433,14 @@ fn extract_zip(archive: &Path, dest: &Path) -> Result<()> {
             continue;
         }
         if entry.is_symlink() {
-            bail!(
-                "release kit zip contains an unsupported symlink: {}",
-                entry.name()
-            );
+            bail!("release kit zip contains an unsupported symlink: {}", name);
         }
         if let Some(mode) = entry.unix_mode() {
             let kind = mode & 0o170000;
             if kind != 0 && kind != 0o100000 {
                 bail!(
                     "release kit zip contains an unsupported entry mode {mode:o}: {}",
-                    entry.name()
+                    name
                 );
             }
         }
@@ -584,12 +619,63 @@ mod tests {
 
     fn release(assets: Vec<ReleaseAsset>) -> Release {
         Release {
-            name: "v-test".into(),
             version: "test".into(),
-            date: "2026-01-01T00:00:00Z".into(),
-            body: None,
             assets,
         }
+    }
+
+    #[test]
+    fn release_urls_preserve_channel_and_explicit_tag_selection() {
+        let base = format!("https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}/releases");
+        assert_eq!(
+            release_url("stable", None).unwrap().as_str(),
+            format!("{base}/latest")
+        );
+        assert_eq!(
+            release_url("nightly", None).unwrap().as_str(),
+            format!("{base}/tags/nightly")
+        );
+        assert_eq!(
+            release_url("nightly", Some("v1.2.3")).unwrap().as_str(),
+            format!("{base}/tags/v1.2.3")
+        );
+        assert_eq!(
+            release_url("stable", Some("feature/test?#"))
+                .unwrap()
+                .as_str(),
+            format!("{base}/tags/feature%2Ftest%3F%23")
+        );
+    }
+
+    #[test]
+    fn parses_numeric_and_named_release_tags_without_losing_asset_urls() {
+        for (tag, expected) in [("v1.2.3", "1.2.3"), ("nightly", "nightly")] {
+            let body = serde_json::json!({
+                "tag_name": tag,
+                "assets": [{"name": "kit.zip", "url": "https://api.github.com/assets/42"}]
+            });
+            let release = parse_release(&serde_json::to_vec(&body).unwrap()).unwrap();
+            assert_eq!(release.version, expected);
+            assert_eq!(release.assets[0].name, "kit.zip");
+            assert_eq!(
+                release.assets[0].download_url,
+                "https://api.github.com/assets/42"
+            );
+        }
+        for bad in [b"{}".as_slice(), br#"{"tag_name":"v1.2.3"}"#, b"not json"] {
+            assert!(parse_release(bad).is_err());
+        }
+    }
+
+    #[test]
+    fn compares_release_versions_with_named_tag_fallback() {
+        assert!(is_newer_release("1.2.3", "1.2.4"));
+        assert!(!is_newer_release("1.2.3", "1.2.3"));
+        assert!(!is_newer_release("1.2.3", "1.2.2"));
+        assert!(is_newer_release("1.2.3", "1.2.4-beta.1"));
+        assert!(!is_newer_release("1.2.3", "1.2.3-beta.1"));
+        assert!(is_newer_release("1.2.3", "nightly"));
+        assert!(!is_newer_release("nightly", "nightly"));
     }
 
     #[test]

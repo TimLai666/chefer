@@ -32,7 +32,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.1
 
       # 以預編二進位安裝 cargo-audit（免現場編譯，數秒完成）
       - name: Install cargo-audit

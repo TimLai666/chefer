@@ -4,22 +4,22 @@ version = "0.5.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1"
-hex = "0.4"
-tempfile = "3"
-zstd = "0.13"
-tar = "0.4"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt"] }
-clap = { version = "4.0", features = ["derive"] }
-fs-err = "3.3.0"
-sha2 = "0.11.0"
+anyhow = "1.0.104"
+hex = "0.4.3"
+tempfile = "3.27.0"
+zstd = "0.14.3"
+tar = "0.4.46"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["fmt"] }
+clap = { version = "4.6.7", features = ["derive"] }
+fs-err = "3.3.2"
+sha2 = "0.11.1"
 ctrlc = "3.5.2"
 chefer-bundle = { version = "0.5.0", path = "../chefer-bundle" }
 vmm-backend = { version = "0.5.0", path = "../vmm-backend" }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = [
+windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_System_Console",
     "Win32_UI_WindowsAndMessaging",

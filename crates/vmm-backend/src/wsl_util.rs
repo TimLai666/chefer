@@ -76,7 +76,9 @@ pub fn agent_distro_name(agent_bytes: &[u8]) -> String {
 pub fn decode_wsl_output(bytes: &[u8]) -> String {
     if bytes.contains(&0) {
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         String::from_utf16_lossy(&units)

@@ -180,7 +180,7 @@ bundle/
   - `depends_on`：必須指向存在的 service；不得有循環；不得指向自己。
   - `healthcheck`（選填，見「健康檢查」節）：有則 `test` 非空；`interval`/`timeout` 須能解析且 > 0；`retries` ≥ 1；`start_period` 能解析且 ≥ 0。`test` 接受字串或字串陣列（`CMD`/`CMD-SHELL` 前綴比照 Docker）。
   - env key：`[A-Za-z_][A-Za-z0-9_]*`。
-  - `image.source` 支援 `tar`（本機 docker save / OCI archive）與 `image`（建置時從 registry 拉取）；`dockerfile` 仍回報「尚未支援」。`source: image` 的 `file` 是 registry reference，**必須釘版**：明確且非 `latest` 的 tag，或 `@<algo>:<hex>` digest（`check_image_reference`）；未標記/`latest` 一律拒絕（可重現性）。
+  - `image.source` 支援 `tar`（本機 docker save / OCI archive）與 `image`（建置時從 registry 拉取）；`dockerfile` 在打包機呼叫既有 builder 建置（見「Dockerfile build」）。`source: image` 的 `file` 是 registry reference，**必須釘版**：明確且非 `latest` 的 tag，或 `@<algo>:<hex>` digest（`check_image_reference`）；未標記/`latest` 一律拒絕（可重現性）。
 - **簡寫 `image: <字串>` 的判別（`appcipe-normalize::looks_like_image_ref`）**：非路徑徵兆（不以 `.`/`/`/`\`/`~` 開頭、非 Windows 磁碟代號、非 `.tar`/`.tgz`/`.tar.gz`、且檔案不存在）且帶 `@digest` 或「最後一段含 `:tag`」→ 轉成 `source: image`（compose 風格）；否則維持 tar 路徑。tag 合法性仍由 `validate()` 把關。
 - `AppCipe` 衍生 `Clone`。
 
@@ -437,15 +437,15 @@ services:
 ```
 
 **做法（chefer-pack `dockerfile` 模組）**：chefer 本身不建 image——在**打包機**上偵測並呼叫既有的 container builder：
-1. **偵測 builder**：依序試 `docker` → `podman` → `nerdctl` → `container`（首個可執行者；以 `--version` 探測）。前三者的 `build`/`save` CLI 相容（docker-archive）；macOS 上的 **OrbStack / Docker Desktop** 都提供 drop-in `docker` CLI，故直接走 `docker` 那條、無需特別處理。**Apple `container`**（開源 container 工具）：`build` 旗標相容（`-t`/`-f`/`--platform os/arch`/context），但 save 在 `image` 子命令下（`container image save -o`，產出 **OCI archive**——chefer 的 image 解析端 docker-archive 與 OCI archive 兩種都吃）。找不到任何一個 → 可行動錯誤，列出支援的 builder。
-2. **build**：`<tool> build --platform <platform> [--build-arg K=V …] -f <dockerfile> -t <暫時 tag> <context>`，stdio 直通讓使用者看到建置過程；非零 → 透傳 builder 錯誤。
-3. **save**：`<tool> save -o <tmp>/image.tar <暫時 tag>`（docker-archive）。
+1. **偵測 builder**：Windows 依序試 `docker` → `podman` → `nerdctl` → `wslc` → `container`；其他平台維持 `docker` → `podman` → `nerdctl` → `container`（首個可執行者；以 `--version` 探測）。`wslc` 是新版 WSL 內建的 WSL Containers CLI，免安裝 Docker；使用 `wslc build` 與 `wslc image save -o`。`CHEFER_DOCKERFILE_BUILDER=wslc` 可在 Windows 明確指定它，指定但不可執行時報錯，不退回其他 builder。`--version` 只確認 CLI 可執行，不檢查 Docker daemon 或 WSLC 服務狀態。前三者的 `build`/`save` CLI 相容（docker-archive）；macOS 上的 **OrbStack / Docker Desktop** 都提供 drop-in `docker` CLI，故直接走 `docker` 那條、無需特別處理。**Apple `container`**（開源 container 工具）：`build` 旗標相容（`-t`/`-f`/`--platform os/arch`/context），但 save 在 `image` 子命令下（`container image save -o`，產出 **OCI archive**——chefer 的 image 解析端 docker-archive 與 OCI archive 兩種都吃）。找不到任何一個 → 可行動錯誤，列出支援的 builder。
+2. **build**：`<tool> build --platform <platform> [--build-arg K=V …] -f <dockerfile> -t <暫時 tag> <context>`。Windows WSLC（`wslc` 與 `container` 別名）沒有 `--platform` 選項，故省略該參數；以 `IsWow64Process2` 的 native machine 檢查 `image.platform`，僅允許 Windows 原生架構（含 CLI 在模擬環境執行的情況）。要求其他架構時，在 build 前提示改用 docker/podman/nerdctl 或調整 platform。stdio 直通讓使用者看到建置過程；非零 → 透傳 builder 錯誤。
+3. **save**：docker/podman/nerdctl 使用 `<tool> save -o <tmp>/image.tar <暫時 tag>`；Apple `container` 與 Windows `wslc` 使用 `<tool> image save -o <tmp>/image.tar <暫時 tag>`。以內容自動辨識 docker-archive／OCI archive。
 4. **接既有路徑**：把該 tar 當 `source: tar` 解析（`archive::extract_tar_to_dir` + `image::resolve_image`）→ 共用 repack。
-5. best-effort `<tool> image rm <暫時 tag>` 清掉暫時 image。
+5. build 成功後，無論 save 成功、非零或無法啟動，都 best-effort `<tool> image rm -f <暫時 tag>` 清掉暫時 image；清理失敗不覆蓋建置／匯出的結果。
 
 **權衡（明示）**：`source: dockerfile` **不保證可重現**（Dockerfile 內 `apt`/`pip` 等每次拉到的版本可能不同；對齊 Docker 的本質）。要可重現請用 `source: image` 釘 digest。`--platform` 跨架構需 builder 端的 emulation（buildx/qemu binfmt）；建原生架構則免。執行期一如往常**不需** Docker——builder 只在打包時用到（與 `source: tar` 需要你先 `docker save` 的前提一致）。
 
-**驗證**：`appcipe-spec` 接受 `source: dockerfile`（檢查 `file` 非空）；不適用 `check_image_reference`（那是 registry ref 專用）。
+**驗證**：`appcipe-spec` 接受 `source: dockerfile`（檢查 `file` 非空）；不適用 `check_image_reference`（那是 registry ref 專用）。Windows 的 `crates/chefer-cli/tests/dockerfile_builder_e2e.rs` 隔離 PATH，以真 CLI 驗證 WSLC 偵測、指定、參數、匯出、失敗與清理；`scripts/windows-wslc-e2e.ps1` 在實機以 WSLC 建置真正映像，再打包與執行，檢查 guest stdout 和持久化輸出。
 
 ### 健康檢查（depends_on wait-until-ready）— 設計
 
