@@ -36,6 +36,7 @@ fn fake_builder() -> &'static Path {
         std::fs::write(&src, r#"
 use std::{env, fs::{self, OpenOptions}, io::Write, process};
 fn main() {
+    if !env::current_exe().unwrap().with_extension("enabled").is_file() { process::exit(127); }
     let mut args: Vec<String> = env::args().skip(1).collect();
     let tool = env::current_exe().unwrap().file_stem().unwrap().to_string_lossy().into_owned();
     let mut record = vec![tool]; record.extend(args.clone());
@@ -78,12 +79,18 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         let tools = dir.path().join("tools");
         std::fs::create_dir(&tools).unwrap();
-        for tool in builders {
+        // Windows searches the CLI directory before inherited PATH and System32 can contain Docker.
+        // Shadow every builder there; disabled stubs fail before logging any calls.
+        std::fs::copy(env!("CARGO_BIN_EXE_chefer-cli"), tools.join("chefer-cli.exe")).unwrap();
+        for tool in ["docker", "podman", "nerdctl", "wslc", "container"] {
             std::fs::copy(
                 fake_builder().join("builder.exe"),
                 tools.join(format!("{tool}.exe")),
             )
             .unwrap();
+        }
+        for tool in builders {
+            std::fs::write(tools.join(format!("{tool}.enabled")), b"").unwrap();
         }
         let ctx = dir.path().join("context with spaces");
         std::fs::create_dir(&ctx).unwrap();
@@ -128,7 +135,7 @@ impl Fixture {
         Self { dir, tools, log }
     }
     fn command(&self) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_chefer-cli"));
+        let mut cmd = Command::new(self.tools.join("chefer-cli.exe"));
         cmd.current_dir(self.dir.path())
             .env("PATH", &self.tools)
             .env_remove("CHEFER_DOCKERFILE_BUILDER")
